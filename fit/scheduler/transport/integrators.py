@@ -1,9 +1,5 @@
-import numpy as np
-import torch as th
-import torch.nn as nn
+import torch
 from torchdiffeq import odeint
-from functools import partial
-from tqdm import tqdm
 
 class sde:
     """SDE solver class"""
@@ -20,28 +16,28 @@ class sde:
         assert t0 < t1, "SDE sampler has to be in forward time"
 
         self.num_timesteps = num_steps
-        self.t = th.linspace(t0, t1, num_steps)
+        self.t = torch.linspace(t0, t1, num_steps)
         self.dt = self.t[1] - self.t[0]
         self.drift = drift
         self.diffusion = diffusion
         self.sampler_type = sampler_type
 
     def __Euler_Maruyama_step(self, x, mean_x, t, model, **model_kwargs):
-        w_cur = th.randn(x.size()).to(x)
-        t = th.ones(x.size(0)).to(x) * t
-        dw = w_cur * th.sqrt(self.dt)
+        w_cur = torch.randn(x.size()).to(x)
+        t = torch.ones(x.size(0)).to(x) * t
+        dw = w_cur * torch.sqrt(self.dt)
         drift = self.drift(x, t, model, **model_kwargs)
         diffusion = self.diffusion(x, t)
         mean_x = x + drift * self.dt
-        x = mean_x + th.sqrt(2 * diffusion) * dw
+        x = mean_x + torch.sqrt(2 * diffusion) * dw
         return x, mean_x
     
     def __Heun_step(self, x, _, t, model, **model_kwargs):
-        w_cur = th.randn(x.size()).to(x)
-        dw = w_cur * th.sqrt(self.dt)
-        t_cur = th.ones(x.size(0)).to(x) * t
+        w_cur = torch.randn(x.size()).to(x)
+        dw = w_cur * torch.sqrt(self.dt)
+        t_cur = torch.ones(x.size(0)).to(x) * t
         diffusion = self.diffusion(x, t_cur)
-        xhat = x + th.sqrt(2 * diffusion) * dw
+        xhat = x + torch.sqrt(2 * diffusion) * dw
         K1 = self.drift(xhat, t_cur, model, **model_kwargs)
         xp = xhat + self.dt * K1
         K2 = self.drift(xp, t_cur + self.dt, model, **model_kwargs)
@@ -68,7 +64,7 @@ class sde:
         samples = []
         sampler = self.__forward_fn()
         for ti in self.t[:-1]:
-            with th.no_grad():
+            with torch.no_grad():
                 x, mean_x = sampler(x, mean_x, ti, model, **model_kwargs)
                 samples.append(x)
 
@@ -90,7 +86,7 @@ class ode:
         assert t0 < t1, "ODE sampler has to be in forward time"
 
         self.drift = drift
-        self.t = th.linspace(t0, t1, num_steps)
+        self.t = torch.linspace(t0, t1, num_steps)
         self.atol = atol
         self.rtol = rtol
         self.sampler_type = sampler_type
@@ -99,7 +95,7 @@ class ode:
         
         device = x[0].device if isinstance(x, tuple) else x.device
         def _fn(t, x):
-            t = th.ones(x[0].size(0)).to(device) * t if isinstance(x, tuple) else th.ones(x.size(0)).to(device) * t
+            t = torch.ones(x[0].size(0)).to(device) * t if isinstance(x, tuple) else torch.ones(x.size(0)).to(device) * t
             model_output = self.drift(x, t, model, **model_kwargs)
             return model_output
 

@@ -1,16 +1,12 @@
 import torch
 import math
-import numpy as np
 import torch.nn.functional as F
-from torch import nn, Tensor
-from torch.jit import Final
+from torch import nn
 from timm.layers.mlp import SwiGLU, Mlp  
-from typing import Any, Callable, Dict, List, Optional, Union, Tuple
+from typing import Callable, Optional
 from fit.model.rope import rotate_half
 from fit.model.utils import modulate
 from fit.model.norms import create_norm
-from functools import partial
-from einops import rearrange, repeat
 
 #################################################################################
 #           Embedding Layers for Patches, Timesteps and Class Labels            #

@@ -1,15 +1,13 @@
 import torch
 import torch.nn as nn
-from functools import partial
 from typing import Optional
-from einops import rearrange, repeat
+from einops import rearrange
 from fit.model.modules import (
     PatchEmbedder, TimestepEmbedder, LabelEmbedder,
     FiTBlock, FinalLayer
 )
 from fit.model.utils import get_parameter_dtype
 from fit.utils.eval_utils import init_from_ckpt
-from fit.model.sincos import get_2d_sincos_pos_embed_from_grid
 from fit.model.rope import VisionRotaryEmbedding
 
 #################################################################################

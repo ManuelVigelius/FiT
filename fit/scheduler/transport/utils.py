@@ -1,4 +1,4 @@
-import torch as th
+import torch
 
 class EasyDict:
 
@@ -13,7 +13,7 @@ def mean_flat(x):
     """
     Take the mean over all non-batch dimensions.
     """
-    return th.mean(x, dim=list(range(1, len(x.size()))))
+    return torch.mean(x, dim=list(range(1, len(x.size()))))
 
 def log_state(state):
     result = []
@@ -28,12 +28,7 @@ def log_state(state):
     
     return '\n'.join(result)
 
-
-
-
-
-
-def get_flexible_mask_and_ratio(model_kwargs: dict, x: th.Tensor):
+def get_flexible_mask_and_ratio(model_kwargs: dict, x: torch.Tensor):
     '''
     sequential case (fit): 
         x: (B, N, C)
@@ -44,8 +39,8 @@ def get_flexible_mask_and_ratio(model_kwargs: dict, x: th.Tensor):
         model_kwargs: {y: (B,)}
         mask: (B, C) -> (B, C, 1, 1)
     '''
-    mask = model_kwargs.get('mask', th.ones(x.shape[:2]))    # (B, N) or (B, C)
-    ratio = float(mask.shape[-1]) / th.count_nonzero(mask, dim=-1)  # (B,)
+    mask = model_kwargs.get('mask', torch.ones(x.shape[:2]))    # (B, N) or (B, C)
+    ratio = float(mask.shape[-1]) / torch.count_nonzero(mask, dim=-1)  # (B,)
     if len(x.shape) == 3:               # sequential x: (B, N, C)
         mask = mask[..., None]         # (B, N) -> (B, N, 1)
     elif len(x.shape) == 4:             # spatial x: (B, C, H, W)

@@ -1,4 +1,6 @@
 import importlib
+from collections import OrderedDict
+from inspect import isfunction
 
 import torch
 
@@ -38,6 +40,10 @@ def update_ema(ema_model, model, decay=0.9999):
         # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
+
+
+def exists(val):
+    return val is not None
 
 
 def default(val, d):

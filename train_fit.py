@@ -3,32 +3,19 @@ import torch
 import argparse
 import datetime
 import time
-import torchvision
-import wandb
 import logging
-import math
 import shutil
-import accelerate
 import torch
-import torch.utils.checkpoint
 import diffusers
-import numpy as np
-import torch.nn.functional as F
 
-from functools import partial
-from torch.cuda import amp
 from omegaconf import OmegaConf
-from accelerate import Accelerator, skip_first_batches
+from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.state import AcceleratorState
-from accelerate.utils import ProjectConfiguration, set_seed, save, FullyShardedDataParallelPlugin
+from accelerate.utils import ProjectConfiguration, set_seed, FullyShardedDataParallelPlugin
 from tqdm.auto import tqdm
-from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler
-from safetensors import safe_open
-from safetensors.torch import load_file
 from copy import deepcopy
 from einops import rearrange
-from fit.schedulers.improved_diffusion import create_diffusion
+from fit.scheduler.improved_diffusion import create_diffusion
 from fit.utils.utils import (
     instantiate_from_config,
     default,
@@ -176,16 +163,6 @@ def main():
     diffusion_cfg = config.diffusion
     data_cfg = config.data
     grad_accu_steps = accelerate_cfg.gradient_accumulation_steps
-    
-    train_strtg_cfg = getattr(config, 'training_strategy', None)
-    if train_strtg_cfg != None:
-        warp_pos_idx = hasattr(train_strtg_cfg, 'warp_pos_idx')
-        if warp_pos_idx:
-            warp_pos_idx_fn = partial(warp_pos_idx_from_grid, 
-                shift=train_strtg_cfg.warp_pos_idx.shift, 
-                scale=train_strtg_cfg.warp_pos_idx.scale,
-                max_len=train_strtg_cfg.warp_pos_idx.max_len
-            )
 
     accelerator_project_cfg = ProjectConfiguration(project_dir=workdirnow, logging_dir=logging_dir)
     

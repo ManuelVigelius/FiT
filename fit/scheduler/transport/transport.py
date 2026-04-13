@@ -1,11 +1,10 @@
-import torch as th
+import torch
 import numpy as np
-import logging
 
 import enum
 
 from . import path
-from .utils import EasyDict, log_state, mean_flat, get_flexible_mask_and_ratio
+from .utils import mean_flat, get_flexible_mask_and_ratio
 from .integrators import ode, sde
 
 class ModelType(enum.Enum):
@@ -72,10 +71,10 @@ class Transport:
             Standard multivariate normal prior
             Assume z is batched
         '''
-        shape = th.tensor(z.size())
-        N = th.prod(shape[1:])
-        _fn = lambda x: -N / 2. * np.log(2 * np.pi) - th.sum(x ** 2) / 2.
-        return th.vmap(_fn)(z)
+        shape = torch.tensor(z.size())
+        N = torch.prod(shape[1:])
+        _fn = lambda x: -N / 2. * np.log(2 * np.pi) - torch.sum(x ** 2) / 2.
+        return torch.vmap(_fn)(z)
     
 
     def check_interval(
@@ -114,14 +113,14 @@ class Transport:
             x1 - data point; [batch, *dim]
         """
         
-        x0 = th.randn_like(x1)
+        x0 = torch.randn_like(x1)
         t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
         
         if self.snr_type == SNRType.UNIFORM:
-            t = th.rand((x1.shape[0],)) * (t1 - t0) + t0
+            t = torch.rand((x1.shape[0],)) * (t1 - t0) + t0
         elif self.snr_type == SNRType.LOGNORM:
-            u = th.normal(mean=0.0, std=1.0, size=(x1.shape[0],))
-            t = 1 / (1 + th.exp(-u)) * (t1 - t0) + t0
+            u = torch.normal(mean=0.0, std=1.0, size=(x1.shape[0],))
+            t = 1 / (1 + torch.exp(-u)) * (t1 - t0) + t0
         else:
             raise ValueError(f"Unknown snr type: {self.snr_type}")
         
@@ -345,7 +344,7 @@ class Sampler:
 
         def _sample(init, model, **model_kwargs):
             xs = _sde.sample(init, model, **model_kwargs)
-            ts = th.ones(init.size(0), device=init.device) * t1
+            ts = torch.ones(init.size(0), device=init.device) * t1
             x = last_step_fn(xs[-1], ts, model, **model_kwargs)
             xs.append(x)
 
@@ -375,7 +374,7 @@ class Sampler:
         - reverse: whether solving the ODE in reverse (data to noise); default to False
         """
         if reverse:
-            drift = lambda x, t, model, **kwargs: self.drift(x, th.ones_like(t) * (1 - t), model, **kwargs)
+            drift = lambda x, t, model, **kwargs: self.drift(x, torch.ones_like(t) * (1 - t), model, **kwargs)
         else:
             drift = self.drift
 
@@ -420,12 +419,12 @@ class Sampler:
         """
         def _likelihood_drift(x, t, model, **model_kwargs):
             x, _ = x
-            eps = th.randint(2, x.size(), dtype=th.float, device=x.device) * 2 - 1
-            t = th.ones_like(t) * (1 - t)
-            with th.enable_grad():
+            eps = torch.randint(2, x.size(), dtype=torch.float, device=x.device) * 2 - 1
+            t = torch.ones_like(t) * (1 - t)
+            with torch.enable_grad():
                 x.requires_grad = True
-                grad = th.autograd.grad(th.sum(self.drift(x, t, model, **model_kwargs) * eps), x)[0]
-                logp_grad = th.sum(grad * eps, dim=tuple(range(1, len(x.size()))))
+                grad = torch.autograd.grad(torch.sum(self.drift(x, t, model, **model_kwargs) * eps), x)[0]
+                logp_grad = torch.sum(grad * eps, dim=tuple(range(1, len(x.size()))))
                 drift = self.drift(x, t, model, **model_kwargs)
             return (-drift, logp_grad)
         
@@ -449,7 +448,7 @@ class Sampler:
         )
 
         def _sample_fn(x, model, **model_kwargs):
-            init_logp = th.zeros(x.size(0)).to(x)
+            init_logp = torch.zeros(x.size(0)).to(x)
             input = (x, init_logp)
             drift, delta_logp = _ode.sample(input, model, **model_kwargs)
             drift, delta_logp = drift[-1], delta_logp[-1]
