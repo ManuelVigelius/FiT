@@ -311,9 +311,16 @@ def main():
 
     get_train_dataloader = instantiate_from_config(data_cfg)
     train_len = get_train_dataloader.train_len()
+    # packed=True enables greedy token-threshold packing with FlexAttention document masking.
+    # max_tokens and pad_to_multiple can be tuned via the data config or left at defaults.
+    packed_cfg = getattr(data_cfg.params.train, 'packed', None)
+    use_packed = packed_cfg is not None and getattr(packed_cfg, 'enabled', False)
     train_dataloader = get_train_dataloader.train_dataloader(
-        global_batch_size=total_batch_size, max_steps=accelerate_cfg.max_train_steps, 
-        resume_step=global_steps, seed=args.seed
+        global_batch_size=total_batch_size, max_steps=accelerate_cfg.max_train_steps,
+        resume_step=global_steps, seed=args.seed,
+        packed=use_packed,
+        max_tokens=getattr(packed_cfg, 'max_tokens', 512) if use_packed else 512,
+        pad_to_multiple=getattr(packed_cfg, 'pad_to_multiple', 128) if use_packed else 128,
     )
 
     # Setup optimizer and lr_scheduler
@@ -408,16 +415,27 @@ def main():
         x = batch['feature']        # (B, N, C)
         grid = batch['grid']        # (B, 2, N)
         mask = batch['mask']        # (B, N)
-        y = batch['label']          # (B, 1)
-        size = batch['size']        # (B, N_pack, 2), order: h, w. When pack is not used, N_pack=1.
+        y = batch['label']          # (B, 1) unpacked  or  (B, max_n_pack) packed
+        size = batch['size']        # (B, N_pack, 2), order: h, w.
+        doc_ids = batch.get('doc_ids', None)   # (B, N_total) or None in unpacked mode
+        n_pack = batch.get('n_pack', None)     # (B,) or None in unpacked mode
         with accelerator.accumulate(model):
-            # save memory for x, grid, mask
+            # trim trailing padding to the longest valid sequence in this batch
             N_batch = int(torch.max(torch.sum(size[..., 0] * size[..., 1], dim=-1)))
-            x, grid, mask = x[:, : N_batch], grid[..., : N_batch], mask[:, : N_batch]
-            
+            x, grid, mask = x[:, :N_batch], grid[..., :N_batch], mask[:, :N_batch]
+            if doc_ids is not None:
+                doc_ids = doc_ids[:, :N_batch]
+
             # prepare other parameters
-            y = y.squeeze(dim=-1).to(torch.int)
-            model_kwargs = dict(y=y, grid=grid.long(), mask=mask, size=size)
+            if doc_ids is not None:
+                # Packed mode: y is already (B, max_n_pack); keep as-is for the model.
+                # Replace padding slots (-1) with 0 so LabelEmbedder doesn't get OOB indices;
+                # those tokens are masked out and don't contribute to loss.
+                y = y.to(torch.int).clamp(min=0)
+            else:
+                y = y.squeeze(dim=-1).to(torch.int)
+            model_kwargs = dict(y=y, grid=grid.long(), mask=mask, size=size,
+                                doc_ids=doc_ids, n_pack=n_pack)
             # forward model and compute loss
             with accelerator.autocast():
                 loss_dict = transport.training_losses(model, x, model_kwargs)

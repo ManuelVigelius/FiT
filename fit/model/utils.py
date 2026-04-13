@@ -4,7 +4,13 @@ from typing import List, Tuple
 
 
 def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    # shift and scale can be (B, D) or already (B, N, D) / (B, 1, D).
+    # Only unsqueeze when they are strictly 2-D so that the packed path
+    # (where shift/scale are already (B, N, D)) is handled correctly.
+    if shift.dim() == 2:
+        shift = shift.unsqueeze(1)
+        scale = scale.unsqueeze(1)
+    return x * (1 + scale) + shift
 
 
 def get_parameter_dtype(parameter: torch.nn.Module):

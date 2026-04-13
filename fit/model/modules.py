@@ -152,11 +152,12 @@ class Attention(nn.Module):
         
         
 
-    def forward(self, 
-        x: torch.Tensor, 
-        mask: Optional[torch.Tensor] = None, 
-        freqs_cos: Optional[torch.Tensor] = None, 
-        freqs_sin: Optional[torch.Tensor] = None, 
+    def forward(self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        freqs_cos: Optional[torch.Tensor] = None,
+        freqs_sin: Optional[torch.Tensor] = None,
+        doc_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -168,34 +169,37 @@ class Attention(nn.Module):
                 v = v * freqs_cos + rotate_half(v) * freqs_sin
             q = q * freqs_cos + rotate_half(q) * freqs_sin
             k = k * freqs_cos + rotate_half(k) * freqs_sin
-        
-        attn_mask = mask[:, None, None, :]  # (B, N) -> (B, 1, 1, N)
-        attn_mask = (attn_mask == attn_mask.transpose(-2, -1))  # (B, 1, 1, N) x (B, 1, N, 1) -> (B, 1, N, N)
-        mask = torch.not_equal(mask, torch.zeros_like(mask)).to(mask)   # (B, N) -> (B, N)
-        
-        
-        if x.device.type == "cpu":
-            x = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask,
-                dropout_p=self.attn_drop.p if self.training else 0.,
-            )
+
+        if doc_ids is not None:
+            # Packed / document-masking path via FlexAttention.
+            # Each image only attends to tokens belonging to the same image
+            # (same doc_id). Padding positions have doc_id == -1 and are
+            # excluded because -1 != any non-negative doc_id.
+            from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+            _doc_ids = doc_ids  # capture for closure
+            def doc_mask_mod(b, h, q_idx, kv_idx):
+                return _doc_ids[b, q_idx] == _doc_ids[b, kv_idx]
+            block_mask = create_block_mask(doc_mask_mod, B, None, N, N, device=x.device)
+            x = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
         else:
-            with torch.backends.cuda.sdp_kernel(enable_flash=True):
-                '''
-                F.scaled_dot_product_attention is the efficient implementation equivalent to the following:
-                    attn_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0) if is_causal else attn_mask
-                    attn_mask = attn_mask.masked_fill(not attn_mask, -float('inf')) if attn_mask.dtype==torch.bool else attn_mask
-                    attn_weight = torch.softmax((Q @ K.transpose(-2, -1) / math.sqrt(Q.size(-1))) + attn_mask, dim=-1)
-                    attn_weight = torch.dropout(attn_weight, dropout_p)
-                    return attn_weight @ V
-                In conclusion:
-                    boolean attn_mask will mask the attention matrix where attn_mask is False
-                    non-boolean attn_mask will be directly added to Q@K.T
-                '''
+            # Original padding-mask path (used when doc_ids is not provided,
+            # e.g. during inference with a single image).
+            attn_mask = mask[:, None, None, :]  # (B, N) -> (B, 1, 1, N)
+            attn_mask = (attn_mask == attn_mask.transpose(-2, -1))  # (B, 1, N, N)
+
+            if x.device.type == "cpu":
                 x = F.scaled_dot_product_attention(
                     q, k, v, attn_mask=attn_mask,
                     dropout_p=self.attn_drop.p if self.training else 0.,
                 )
+            else:
+                with torch.backends.cuda.sdp_kernel(enable_flash=True):
+                    x = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask,
+                        dropout_p=self.attn_drop.p if self.training else 0.,
+                    )
+
+        mask = torch.not_equal(mask, torch.zeros_like(mask)).to(mask)   # (B, N) -> (B, N)
         x = x.transpose(1, 2).reshape(B, N, C)
         x = x * mask[..., None] # mask: (B, N) -> (B, N, 1)
         x = self.proj(x)
@@ -263,10 +267,18 @@ class FiTBlock(nn.Module):
                 in_features=hidden_size, hidden_features=(hidden_size//4)*3, out_features=6*hidden_size, bias=adaln_bias
             )
 
-    def forward(self, x, c, mask, freqs_cos, freqs_sin, global_adaln=0.0):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.adaLN_modulation(c) + global_adaln).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), mask, freqs_cos, freqs_sin)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+    def forward(self, x, c, mask, freqs_cos, freqs_sin, global_adaln=0.0, doc_ids=None):
+        if c.dim() == 2:
+            # Standard (unpacked) path: c is (B, D), one vector per batch element.
+            mods = (self.adaLN_modulation(c) + global_adaln).chunk(6, dim=1)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [m.unsqueeze(1) for m in mods]
+        else:
+            # Packed path: c is (B, N, D), one vector per token.
+            # global_adaln is broadcast-compatible (scalar 0.0 or (B, 1, 6*D)).
+            mods = (self.adaLN_modulation(c) + global_adaln).chunk(6, dim=-1)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mods
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), mask, freqs_cos, freqs_sin, doc_ids)
+        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
 class FinalLayer(nn.Module):
@@ -286,7 +298,12 @@ class FinalLayer(nn.Module):
             )
         
     def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        if c.dim() == 2:
+            # Standard path: c is (B, D); modulate() will unsqueeze to (B, 1, D).
+            shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        else:
+            # Packed path: c is (B, N, D); modulate() uses it as-is.
+            shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x

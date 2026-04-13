@@ -182,50 +182,99 @@ class FiT(nn.Module):
             x = rearrange(x, "b (c p1 p2) h w -> b c (h p1) (w p2)", p1=p, p2=p) # (B, 16, h//2, w//2) -> (B, h, w, 4)
         return x
 
-    def forward(self, x, t, y, grid, mask, size=None):
+    def forward(self, x, t, y, grid, mask, size=None, doc_ids=None):
         """
         Forward pass of FiT.
-        x: (B, p**2 * C_in, N), tensor of sequential inputs (flattened latent features of images, N=H*W/(p**2))
-        t: (B,), tensor of diffusion timesteps
-        y: (B,), tensor of class labels
-        grid: (B, 2, N), tensor of height and weight indices that spans a grid
-        mask: (B, N), tensor of the mask for the sequence
-        size: (B, n, 2), tensor of the height and width, n is the number of the packed iamges
-        --------------------------------------------------------------------------------------------
-        return: (B, p**2 * C_out, N), where C_out=2*C_in if leran_sigma, C_out=C_in otherwise.
+
+        Unpacked mode (original):
+            x:       (B, p**2*C_in, N) or (B, N, p**2*C_in) depending on use_sit
+            t:       (B,)
+            y:       (B,)
+            grid:    (B, 2, N)
+            mask:    (B, N)   — 1 for valid tokens, 0 for padding
+            size:    (B, 1, 2)
+            doc_ids: None
+
+        Packed mode (document-masking):
+            x:       same shape but N = N_total (concatenated images, padded to multiple of 128)
+            t:       (B, max_n_pack) — one timestep per image in the pack
+            y:       (B, max_n_pack) — one label per image in the pack
+            grid:    (B, 2, N_total)
+            mask:    (B, N_total)
+            size:    (B, max_n_pack, 2)
+            doc_ids: (B, N_total)  — image index within sequence, -1 for padding
+
+        return: same shape as x.
         """
-        
-        t = torch.clamp(self.time_shifting * t / (1  + (self.time_shifting - 1) * t), max=1.0)        
-        t = t.float().to(x.dtype)
+        B = x.shape[0]
+        D = self.hidden_size
+
         if not self.use_sit:
-            x = rearrange(x, 'B C N -> B N C')          # (B, C, N) -> (B, N, C), where C = p**2 * C_in
-        x = self.x_embedder(x)                          # (B, N, C) -> (B, N, D)  
-        t = self.t_embedder(t)                          # (B, D)
-        y = self.y_embedder(y, self.training)           # (B, D)
-        c = t + y                                       # (B, D)
-        
-        # get RoPE frequences in advance, then calculate attention.
-        if self.online_rope:    
+            x = rearrange(x, 'B C N -> B N C')
+        x = self.x_embedder(x)                          # (B, N, D)
+
+        if doc_ids is not None:
+            # ---- Packed path ------------------------------------------------
+            # t and y are (B, max_n_pack); embed each, then expand to per-token.
+            max_n_pack = t.shape[1]
+            t_flat = t.reshape(B * max_n_pack)
+            y_flat = y.reshape(B * max_n_pack).to(torch.int)
+
+            t_flat = torch.clamp(
+                self.time_shifting * t_flat / (1 + (self.time_shifting - 1) * t_flat), max=1.0
+            ).float().to(x.dtype)
+
+            t_emb = self.t_embedder(t_flat).reshape(B, max_n_pack, D)   # (B, P, D)
+            y_emb = self.y_embedder(y_flat, self.training).reshape(B, max_n_pack, D)
+            c_pack = t_emb + y_emb                                        # (B, P, D)
+
+            # Expand conditioning to per-token: each token inherits the
+            # embedding of the image it belongs to. Padding tokens (doc_id=-1)
+            # are zeroed out via the mask below.
+            safe_ids = doc_ids.clamp(min=0)                               # (B, N)
+            c = c_pack[torch.arange(B, device=x.device)[:, None], safe_ids]  # (B, N, D)
+            c = c * (doc_ids >= 0).to(c.dtype).unsqueeze(-1)              # zero padding
+
+            if self.global_adaLN_modulation is not None:
+                # global_adaln needs to be (B, N, 6*D) in packed mode
+                global_adaln = self.global_adaLN_modulation(c)            # (B, N, 6*D)
+            else:
+                global_adaln = 0.0
+        else:
+            # ---- Original (unpacked) path -----------------------------------
+            t = torch.clamp(
+                self.time_shifting * t / (1 + (self.time_shifting - 1) * t), max=1.0
+            ).float().to(x.dtype)
+            t_emb = self.t_embedder(t)                                    # (B, D)
+            y_emb = self.y_embedder(y, self.training)                     # (B, D)
+            c = t_emb + y_emb                                             # (B, D)
+
+            if self.global_adaLN_modulation is not None:
+                global_adaln = self.global_adaLN_modulation(c)            # (B, 6*D)
+            else:
+                global_adaln = 0.0
+
+        # get RoPE frequencies in advance, then calculate attention.
+        if self.online_rope:
             freqs_cos, freqs_sin = self.rel_pos_embed.online_get_2d_rope_from_grid(grid, size)
             freqs_cos, freqs_sin = freqs_cos.unsqueeze(1), freqs_sin.unsqueeze(1)
         else:
             freqs_cos, freqs_sin = self.rel_pos_embed.get_cached_2d_rope_from_grid(grid)
             freqs_cos, freqs_sin = freqs_cos.unsqueeze(1), freqs_sin.unsqueeze(1)
-        if self.global_adaLN_modulation != None:
-            global_adaln = self.global_adaLN_modulation(c)
-        else: 
-            global_adaln = 0.0
-        
+
         if not self.use_checkpoint:
-            for block in self.blocks:                   # (B, N, D)
-                x = block(x, c, mask, freqs_cos, freqs_sin, global_adaln) 
+            for block in self.blocks:
+                x = block(x, c, mask, freqs_cos, freqs_sin, global_adaln, doc_ids)
         else:
             for block in self.blocks:
-                x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, c, mask, freqs_cos, freqs_sin, global_adaln)  
-        x = self.final_layer(x, c)                      # (B, N, p ** 2 * C_out), where C_out=2*C_in if leran_sigma, C_out=C_in otherwise.
-        x = x * mask[..., None]                         # mask the padding tokens
+                x = torch.utils.checkpoint.checkpoint(
+                    self.ckpt_wrapper(block), x, c, mask, freqs_cos, freqs_sin, global_adaln, doc_ids
+                )
+
+        x = self.final_layer(x, c)                      # (B, N, p**2 * C_out)
+        x = x * mask[..., None]                         # zero out padding tokens
         if not self.use_sit:
-            x = rearrange(x, 'B N C -> B C N')          # (B, N, C) -> (B, C, N), where C = p**2 * C_out
+            x = rearrange(x, 'B N C -> B C N')
         return x
     
     

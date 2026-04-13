@@ -129,9 +129,9 @@ class Transport:
     
 
     def training_losses(
-        self, 
-        model,  
-        x1, 
+        self,
+        model,
+        x1,
         model_kwargs=None
     ):
         """Loss for training the score model
@@ -140,37 +140,92 @@ class Transport:
         - x1: datapoint
         - model_kwargs: additional arguments for the model
         """
-        if model_kwargs == None:
+        if model_kwargs is None:
             model_kwargs = {}
-        
-        t, x0, x1 = self.sample(x1)
-        t, xt, ut = self.path_sampler.plan(t, x0, x1)
-        model_output = model(xt, t, **model_kwargs)
+
+        doc_ids = model_kwargs.get('doc_ids', None)
+
+        if doc_ids is not None:
+            # ---- Packed path ------------------------------------------------
+            # x1: (B, N_total, C)
+            # Each image in the pack needs its own noise level t.
+            # doc_ids: (B, N_total), values in [0, max_n_pack-1], -1 for padding.
+            B = x1.shape[0]
+            n_pack_per_elem = model_kwargs['n_pack']          # (B,)
+            max_n_pack = int(n_pack_per_elem.max())
+
+            t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
+            if self.snr_type == SNRType.UNIFORM:
+                t_per_image = torch.rand((B, max_n_pack), device=x1.device) * (t1 - t0) + t0
+            elif self.snr_type == SNRType.LOGNORM:
+                u = torch.normal(mean=0.0, std=1.0, size=(B, max_n_pack), device=x1.device)
+                t_per_image = 1 / (1 + torch.exp(-u)) * (t1 - t0) + t0
+            else:
+                raise ValueError(f"Unknown snr type: {self.snr_type}")
+            t_per_image = t_per_image.to(x1)                  # (B, max_n_pack)
+
+            # Expand t to per-token: each token gets the t of its image.
+            safe_ids = doc_ids.clamp(min=0)                   # (B, N_total)
+            t_per_token = t_per_image[
+                torch.arange(B, device=x1.device)[:, None], safe_ids
+            ]                                                  # (B, N_total)
+            # Zero t for padding tokens so they don't affect xt/ut computation.
+            t_per_token = t_per_token * (doc_ids >= 0).to(x1)
+
+            x0 = torch.randn_like(x1)
+
+            # Compute xt and ut using per-token t.
+            # compute_mu_t / compute_xt / compute_ut all call expand_t_like_x
+            # which does t.view(B, 1) — we bypass that by expanding ourselves.
+            t_expanded = t_per_token.unsqueeze(-1)             # (B, N_total, 1)
+            alpha_t = t_expanded                               # ICPlan: alpha_t = t
+            sigma_t = 1 - t_expanded                          # ICPlan: sigma_t = 1-t
+            xt = alpha_t * x1 + sigma_t * x0
+            ut = x1 - x0                                      # ICPlan: d_alpha=1, d_sigma=-1
+
+            # Pass per-image t (not per-token) to the model for timestep embedding.
+            model_output = model(xt, t_per_image, **model_kwargs)
+
+        else:
+            # ---- Original (unpacked) path -----------------------------------
+            t, x0, x1 = self.sample(x1)
+            t, xt, ut = self.path_sampler.plan(t, x0, x1)
+            model_output = model(xt, t, **model_kwargs)
+
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
         mask, ratio = get_flexible_mask_and_ratio(model_kwargs, x1)
-        
+
         terms = {}
         terms['pred'] = model_output
         if self.model_type == ModelType.VELOCITY:
-            terms['loss'] = mean_flat((((model_output - ut)*mask) ** 2)) * ratio
-        else: 
-            _, drift_var = self.path_sampler.compute_drift(xt, t)
-            sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))
+            terms['loss'] = mean_flat((((model_output - ut) * mask) ** 2)) * ratio
+        else:
+            if doc_ids is not None:
+                # ICPlan-specific: alpha_t=t, sigma_t=1-t, d_alpha=1, d_sigma=-1.
+                # drift_var = alpha_ratio*(sigma²) - sigma*d_sigma = (1/t)*(1-t)² + (1-t) ≈ t_expanded
+                # for the weight computation. Only ICPlan (LINEAR path) is supported in packed mode.
+                assert hasattr(self.path_sampler, 'sigma') and not hasattr(self.path_sampler, 'sigma_min'), \
+                    "Packed mode with non-VELOCITY model type only supports ICPlan (LINEAR path)."
+                drift_var_expanded = t_expanded
+                sigma_t_val = sigma_t
+            else:
+                _, drift_var_expanded = self.path_sampler.compute_drift(xt, t)
+                sigma_t_val, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))
             if self.loss_type in [WeightType.VELOCITY]:
-                weight = (drift_var / sigma_t) ** 2
+                weight = (drift_var_expanded / sigma_t_val) ** 2
             elif self.loss_type in [WeightType.LIKELIHOOD]:
-                weight = drift_var / (sigma_t ** 2)
+                weight = drift_var_expanded / (sigma_t_val ** 2)
             elif self.loss_type in [WeightType.NONE]:
                 weight = 1
             else:
                 raise NotImplementedError()
-            
+
             if self.model_type == ModelType.NOISE:
-                terms['loss'] = mean_flat(weight * (((model_output - x0)*mask) ** 2)) * ratio
+                terms['loss'] = mean_flat(weight * (((model_output - x0) * mask) ** 2)) * ratio
             else:
-                terms['loss'] = mean_flat(weight * (((model_output * sigma_t + x0)*mask) ** 2)) * ratio
-                
+                terms['loss'] = mean_flat(weight * (((model_output * sigma_t_val + x0) * mask) ** 2)) * ratio
+
         return terms
     
 
