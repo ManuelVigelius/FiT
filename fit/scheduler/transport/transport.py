@@ -1,7 +1,9 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 
 import enum
+from einops import rearrange
 
 from . import path
 from .utils import mean_flat, get_flexible_mask_and_ratio
@@ -50,7 +52,8 @@ class Transport:
         loss_type,
         train_eps,
         sample_eps,
-        snr_type
+        snr_type,
+        multires_loss: str = 'A',
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -63,8 +66,8 @@ class Transport:
         self.path_sampler = path_options[path_type]()
         self.train_eps = train_eps
         self.sample_eps = sample_eps
-        
         self.snr_type = snr_type
+        self.multires_loss = multires_loss  # 'A' = velocity loss, 'B' = upsample loss
 
     def prior_logp(self, z):
         '''
@@ -127,6 +130,34 @@ class Transport:
         t = t.to(x1)
         return t, x0, x1
     
+
+    def _sample_synchronized_noise(self, x1_lr, x1_fr, size_lr, size_fr):
+        """
+        Sample a Farey-consistent noise pair (x0_lr, x0_fr) via sample_noise_pair_2d,
+        such that x0_lr is the spatial block-sum of x0_fr (same Gaussian basis).
+
+        Args:
+            x1_lr   : (B, N_lr, 16)
+            x1_fr   : (B, N_fr, 16)
+            size_lr : (B, 1, 2)   [H_lr, W_lr]
+            size_fr : (B, 1, 2)   [H_fr, W_fr]
+
+        Returns:
+            x0_lr : (B, N_lr, 16)
+            x0_fr : (B, N_fr, 16)
+        """
+        from fit.utils.noise_field import sample_noise_pair_2d
+        p = 2; C = 4
+        B = x1_lr.shape[0]
+        H_lr = int(size_lr[0, 0, 0]); W_lr = int(size_lr[0, 0, 1])
+        H_fr = int(size_fr[0, 0, 0]); W_fr = int(size_fr[0, 0, 1])
+        sp_lr = H_lr * p;  sp_fr = H_fr * p
+        noise_dict = sample_noise_pair_2d(sp_lr, sp_fr, d=C, b=B)
+        x0_lr_sp = noise_dict[sp_lr].to(device=x1_lr.device, dtype=x1_lr.dtype)
+        x0_fr_sp = noise_dict[sp_fr].to(device=x1_fr.device, dtype=x1_fr.dtype)
+        x0_lr = rearrange(x0_lr_sp, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=p, p2=p)
+        x0_fr = rearrange(x0_fr_sp, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=p, p2=p)
+        return x0_lr, x0_fr
 
     def training_losses(
         self,
@@ -194,10 +225,92 @@ class Transport:
 
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
-        mask, ratio = get_flexible_mask_and_ratio(model_kwargs, x1)
 
         terms = {}
         terms['pred'] = model_output
+
+        # ---- Loss B: upsample predicted clean image and compare to full-res ----
+        x1_fullres = model_kwargs.get('x1_fullres', None)
+        if self.multires_loss == 'B' and x1_fullres is not None and doc_ids is None:
+            p = 2; C_in = 4
+            # For ICPlan: x1_hat = xt + (1-t) * v_pred
+            t_exp = t.view(-1, 1, 1)
+            x1_hat = xt + (1 - t_exp) * model_output             # (B, N_lr, 16)
+            size_lr = model_kwargs['size']                        # (B, 1, 2)
+            size_fr = model_kwargs['size_fullres']                # (B, 1, 2)
+            H_lr = int(size_lr[0, 0, 0]); W_lr = int(size_lr[0, 0, 1])
+            H_fr = int(size_fr[0, 0, 0]); W_fr = int(size_fr[0, 0, 1])
+            # Unpatchify → bilinear upsample → re-patchify
+            x1_sp = rearrange(x1_hat, 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
+                              h=H_lr, w=W_lr, p1=p, p2=p, c=C_in)
+            x1_up = F.interpolate(x1_sp.float(), size=(H_fr * p, W_fr * p),
+                                  mode='bilinear', align_corners=True).to(x1_hat.dtype)
+            x1_hat_fr = rearrange(x1_up, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',
+                                  p1=p, p2=p)                    # (B, N_fr, 16)
+            mask_fr, ratio_fr = get_flexible_mask_and_ratio(
+                {'mask': model_kwargs['mask_fullres']}, x1_fullres
+            )
+            terms['loss'] = mean_flat(((x1_hat_fr - x1_fullres) * mask_fr) ** 2) * ratio_fr
+            return terms
+
+        # ---- Loss C: synchronized noise, low-res FiT → ResNet → full-res velocity ----
+        if self.multires_loss == 'C' and x1_fullres is not None and doc_ids is None:
+            p = 2; C_in = 4
+            size_lr = model_kwargs['size']          # (B, 1, 2)
+            size_fr = model_kwargs['size_fullres']  # (B, 1, 2)
+            H_lr = int(size_lr[0, 0, 0]); W_lr = int(size_lr[0, 0, 1])
+            H_fr = int(size_fr[0, 0, 0]); W_fr = int(size_fr[0, 0, 1])
+
+            # 1. Synchronized noise pair (Farey-consistent)
+            x0_lr, x0_fr = self._sample_synchronized_noise(x1, x1_fullres, size_lr, size_fr)
+
+            # 2. Shared timestep
+            t_c, _, _ = self.sample(x1)             # (B,); discard the iid x0 from sample()
+            t_exp = t_c.view(-1, 1, 1)
+
+            # 3. Noisy observations at both resolutions (ICPlan: xt = t*x1 + (1-t)*x0)
+            xt_lr = t_exp * x1          + (1 - t_exp) * x0_lr   # (B, N_lr, 16)
+            xt_fr = t_exp * x1_fullres  + (1 - t_exp) * x0_fr   # (B, N_fr, 16)
+
+            # 4. FiT transformer at low resolution
+            lr_kwargs = {k: v for k, v in model_kwargs.items()
+                         if k not in ('x1_fullres', 'mask_fullres', 'size_fullres')}
+            model_out_lr = model(xt_lr, t_c, **lr_kwargs)        # (B, N_lr, 16)
+
+            # 5. Recover predicted clean latent and convert to spatial
+            x1_lr_hat = xt_lr + (1 - t_exp) * model_out_lr      # (B, N_lr, 16)
+            x1_lr_sp  = rearrange(x1_lr_hat,
+                                  'b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
+                                  h=H_lr, w=W_lr, p1=p, p2=p, c=C_in)
+
+            # 6. Bilinear upsample to full-res spatial size
+            x1_lr_up = F.interpolate(x1_lr_sp.float(), size=(H_fr * p, W_fr * p),
+                                     mode='bilinear', align_corners=True).to(xt_lr.dtype)
+
+            # 7. Full-res xt in spatial form
+            xt_fr_sp = rearrange(xt_fr,
+                                 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
+                                 h=H_fr, w=W_fr, p1=p, p2=p, c=C_in)
+
+            # 8. ResNet predicts full-res velocity (spatial)
+            v_fr_sp = model.upsampler(x1_lr_up, xt_fr_sp)        # (B, 4, sp_fr, sp_fr)
+
+            # 9. Re-patchify to token sequence
+            v_fr = rearrange(v_fr_sp, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',
+                             p1=p, p2=p)                          # (B, N_fr, 16)
+
+            # 10. Velocity target at full-res
+            ut_fr = x1_fullres - x0_fr                           # (B, N_fr, 16)
+
+            # 11. MSE loss over valid full-res tokens
+            mask_fr, ratio_fr = get_flexible_mask_and_ratio(
+                {'mask': model_kwargs['mask_fullres']}, x1_fullres
+            )
+            terms['loss'] = mean_flat(((v_fr - ut_fr) * mask_fr) ** 2) * ratio_fr
+            return terms
+
+        # ---- Loss A (default): standard velocity / noise / score loss --------
+        mask, ratio = get_flexible_mask_and_ratio(model_kwargs, x1)
         if self.model_type == ModelType.VELOCITY:
             terms['loss'] = mean_flat((((model_output - ut) * mask) ** 2)) * ratio
         else:

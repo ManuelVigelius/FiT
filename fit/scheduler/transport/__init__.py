@@ -7,6 +7,7 @@ def create_transport(
     train_eps=None,
     sample_eps=None,
     snr_type='uniform',
+    multires_loss='A',
 ):
     """function for creating Transport object
     **Note**: model prediction defaults to velocity
@@ -67,6 +68,7 @@ def create_transport(
         train_eps=train_eps,
         sample_eps=sample_eps,
         snr_type=snr_type,
+        multires_loss=multires_loss,
     )
     
     return state

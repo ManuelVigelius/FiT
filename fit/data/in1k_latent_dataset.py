@@ -2,6 +2,7 @@ import os
 import os.path as osp
 import math
 import torch
+import torch.nn.functional as F
 import random
 from functools import partial
 from torch.utils.data import DataLoader, Dataset
@@ -11,12 +12,15 @@ from einops import rearrange
 
 
 class IN1kLatentDataset(Dataset):
-    def __init__(self, root_dir, target_len=256, random='random'):
+    def __init__(self, root_dir, target_len=256, random='random',
+                 resize_range=None, return_fullres=False):
         super().__init__()
         self.RandomHorizontalFlipProb = 0.5
         self.root_dir = root_dir
         self.target_len = target_len
         self.random = random
+        self.resize_range = resize_range      # (min_grid, max_grid) or None
+        self.return_fullres = return_fullres  # if True, also return full-res feature
         self.files = []
         files_1 = os.listdir(osp.join(root_dir, f'from_16_to_{target_len}'))
         files_2 = os.listdir(osp.join(root_dir, f'greater_than_{target_len}_resize'))
@@ -48,23 +52,75 @@ class IN1kLatentDataset(Dataset):
             path = self.files[idx][-1]  # only crop
         data = load_file(path)
         dtype = data['feature'].dtype
-        
-        feature = torch.zeros((self.target_len, 16), dtype=dtype)
-        grid = torch.zeros((2, self.target_len), dtype=dtype)
-        mask = torch.zeros((self.target_len), dtype=torch.uint8)
-        size = torch.zeros(2, dtype=torch.int32)
-        
-        
-        seq_len = data['grid'].shape[-1]
+        p = 2   # patch_size (matches model)
+        C = 4   # VAE latent channels
+
+        # Pick flip variant
         if torch.rand(1) < self.RandomHorizontalFlipProb:
-            feature[0: seq_len] = rearrange(data['feature'][0], 'h w c -> (h w) c')
+            feat_hw = data['feature'][0]   # (H_g, W_g, 16)
         else:
-            feature[0: seq_len] = rearrange(data['feature'][1], 'h w c -> (h w) c')
-        grid[:, 0: seq_len] = data['grid']
-        mask[0: seq_len] = 1
-        size = data['size'][None, :]
+            feat_hw = data['feature'][1]
+
+        H_g, W_g = feat_hw.shape[0], feat_hw.shape[1]
+
+        # Stash full-res before any resize (only when needed)
+        feat_hw_fullres = feat_hw if self.return_fullres else None
+
+        # Optional random bilinear resize to a smaller even grid size
+        if self.resize_range is not None:
+            min_g, max_g = self.resize_range
+            valid = list(range(min_g, max_g + 1, 2))
+            new_g = random.choice(valid)
+            if new_g != H_g:
+                # Unpatchify: (H_g, W_g, p²C) → (H_g*p, W_g*p, C)
+                feat_latent = rearrange(feat_hw.float(),
+                                        'h w (p1 p2 c) -> (h p1) (w p2) c',
+                                        p1=p, p2=p, c=C)
+                # Bilinear resize at latent level
+                feat_t = feat_latent.permute(2, 0, 1).unsqueeze(0)  # (1, C, H_l, W_l)
+                feat_t = F.interpolate(feat_t, size=(new_g * p, new_g * p),
+                                       mode='bilinear', align_corners=True)
+                feat_latent = feat_t.squeeze(0).permute(1, 2, 0).to(dtype)
+                # Re-patchify: (H_l', W_l', C) → (H_g', W_g', p²C)
+                feat_hw = rearrange(feat_latent,
+                                    '(h p1) (w p2) c -> h w (p1 p2 c)',
+                                    p1=p, p2=p)
+                H_g, W_g = new_g, new_g
+
+        seq_len = H_g * W_g
+
+        # Build padded output tensors
+        feature = torch.zeros((self.target_len, 16), dtype=dtype)
+        grid    = torch.zeros((2, self.target_len), dtype=dtype)
+        mask    = torch.zeros((self.target_len,), dtype=torch.uint8)
+
+        feature[:seq_len] = feat_hw.reshape(seq_len, 16)
+
+        # Recompute integer grid for the current resolution
+        hs = torch.arange(H_g, dtype=dtype)
+        ws = torch.arange(W_g, dtype=dtype)
+        gh, gw = torch.meshgrid(hs, ws, indexing='ij')
+        grid[:, :seq_len] = torch.stack([gh.reshape(-1), gw.reshape(-1)])
+
+        mask[:seq_len] = 1
+        size  = torch.tensor([[H_g, W_g]], dtype=torch.int32)
         label = data['label']
-        return dict(feature=feature, grid=grid, mask=mask, label=label, size=size)
+
+        result = dict(feature=feature, grid=grid, mask=mask, label=label, size=size)
+
+        if self.return_fullres:
+            seq_fr = int(data['grid'].shape[-1])
+            feat_fr = torch.zeros((self.target_len, 16), dtype=dtype)
+            mask_fr = torch.zeros((self.target_len,), dtype=torch.uint8)
+            feat_fr[:seq_fr] = feat_hw_fullres.reshape(seq_fr, 16)
+            mask_fr[:seq_fr] = 1
+            H_fr = int(data['size'][0])
+            W_fr = int(data['size'][1])
+            result['feature_fullres'] = feat_fr
+            result['mask_fullres']    = mask_fr
+            result['size_fullres']    = torch.tensor([[H_fr, W_fr]], dtype=torch.int32)
+
+        return result
         
        
 
@@ -195,7 +251,11 @@ class INLatentLoader():
         self.shuffle = self.train_config.loader.shuffle
 
         self.train_dataset = IN1kLatentDataset(
-            self.train_config.data_path, self.train_config.target_len, self.train_config.random
+            self.train_config.data_path,
+            self.train_config.target_len,
+            self.train_config.random,
+            resize_range=getattr(self.train_config, 'resize_range', None),
+            return_fullres=getattr(self.train_config, 'return_fullres', False),
         )
         
         

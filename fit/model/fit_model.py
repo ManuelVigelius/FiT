@@ -3,8 +3,8 @@ import torch.nn as nn
 from typing import Optional
 from einops import rearrange
 from fit.model.modules import (
-    PatchEmbedder, TimestepEmbedder, LabelEmbedder,
-    FiTBlock, FinalLayer
+    PatchEmbedder, TimestepEmbedder, LabelEmbedder, SizeEmbedder,
+    ResNetUpsampler, FiTBlock, FinalLayer
 )
 from fit.model.utils import get_parameter_dtype
 from fit.utils.eval_utils import init_from_ckpt
@@ -58,6 +58,8 @@ class FiT(nn.Module):
         ignore_keys: list = None,
         finetune: str = None,
         time_shifting: int = 1,
+        use_size_cond: bool = False,
+        use_upsampler: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -82,9 +84,14 @@ class FiT(nn.Module):
         self.x_embedder = PatchEmbedder(in_channels * patch_size**2, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        
-        
-        
+        self.use_size_cond = use_size_cond
+        if use_size_cond:
+            self.size_embedder = SizeEmbedder(hidden_size)
+        self.use_upsampler = use_upsampler
+        if use_upsampler:
+            self.upsampler = ResNetUpsampler()
+
+
         self.rel_pos_embed = VisionRotaryEmbedding(
             head_dim=hidden_size//num_heads, theta=rope_theta, custom_freqs=custom_freqs, online_rope=online_rope,
             max_pe_len_h=max_pe_len_h, max_pe_len_w=max_pe_len_w, decouple=decouple, ori_max_pe_len=ori_max_pe_len,
@@ -162,7 +169,18 @@ class FiT(nn.Module):
         ignore_keys = list(set(ignore_keys))
         if pretrain_ckpt != None:
             init_from_ckpt(self, pretrain_ckpt, ignore_keys, verbose=True)
-        
+
+        # Zero-init size embedder output projection so conditioning starts as a no-op.
+        # Must run after init_from_ckpt so checkpoint weights don't overwrite the zeros.
+        if self.use_size_cond:
+            nn.init.constant_(self.size_embedder.mlp[2].weight, 0)
+            nn.init.constant_(self.size_embedder.mlp[2].bias, 0)
+
+        # Zero-init upsampler output projection so it starts as a no-op.
+        if self.use_upsampler:
+            nn.init.constant_(self.upsampler.output_proj.weight, 0)
+            nn.init.constant_(self.upsampler.output_proj.bias, 0)
+
 
     def unpatchify(self, x, hw):
         """
@@ -228,6 +246,13 @@ class FiT(nn.Module):
             y_emb = self.y_embedder(y_flat, self.training).reshape(B, max_n_pack, D)
             c_pack = t_emb + y_emb                                        # (B, P, D)
 
+            if self.use_size_cond and size is not None:
+                # size: (B, max_n_pack, 2); encode height grid dim as pixel resolution
+                size_flat = size.reshape(B * max_n_pack, 2)[:, 0]
+                size_px = (size_flat * self.patch_size * 8).to(x.dtype)   # (B*P,)
+                size_emb = self.size_embedder(size_px).reshape(B, max_n_pack, D)
+                c_pack = c_pack + size_emb
+
             # Expand conditioning to per-token: each token inherits the
             # embedding of the image it belongs to. Padding tokens (doc_id=-1)
             # are zeroed out via the mask below.
@@ -248,6 +273,11 @@ class FiT(nn.Module):
             t_emb = self.t_embedder(t)                                    # (B, D)
             y_emb = self.y_embedder(y, self.training)                     # (B, D)
             c = t_emb + y_emb                                             # (B, D)
+
+            if self.use_size_cond and size is not None:
+                # size: (B, 1, 2); encode height grid dim as pixel resolution
+                size_px = (size[:, 0, 0] * self.patch_size * 8).to(x.dtype)  # (B,)
+                c = c + self.size_embedder(size_px)
 
             if self.global_adaLN_modulation is not None:
                 global_adaln = self.global_adaLN_modulation(c)            # (B, 6*D)

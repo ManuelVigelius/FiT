@@ -436,6 +436,13 @@ def main():
                 y = y.squeeze(dim=-1).to(torch.int)
             model_kwargs = dict(y=y, grid=grid.long(), mask=mask, size=size,
                                 doc_ids=doc_ids, n_pack=n_pack)
+            if 'feature_fullres' in batch:
+                N_batch_fr = int(torch.max(
+                    batch['size_fullres'][..., 0] * batch['size_fullres'][..., 1]
+                ))
+                model_kwargs['x1_fullres']   = batch['feature_fullres'][:, :N_batch_fr].to(device=device)
+                model_kwargs['mask_fullres'] = batch['mask_fullres'].to(device=device)
+                model_kwargs['size_fullres'] = batch['size_fullres'].to(device=device)
             # forward model and compute loss
             with accelerator.autocast():
                 loss_dict = transport.training_losses(model, x, model_kwargs)

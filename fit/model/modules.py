@@ -102,6 +102,93 @@ class LabelEmbedder(nn.Module):
         return embeddings
 
 
+class SizeEmbedder(nn.Module):
+    """
+    Encodes a scalar pixel resolution (e.g. 256) into a hidden-size vector.
+    Follows the same design as TimestepEmbedder. The output projection is
+    zero-initialized in FiT.initialize_weights() so that size conditioning
+    starts as a no-op when fine-tuning from a pretrained checkpoint.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def size_embedding(s, dim, max_period=10000):
+        """
+        Sinusoidal embedding for scalar size values.
+        s: (N,) float tensor of size values (pixel resolution, e.g. 64..256)
+        """
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=s.device)
+        args = s[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding.to(dtype=s.dtype)
+
+    def forward(self, s):
+        # s: (N,) flat tensor of pixel resolutions
+        s_freq = self.size_embedding(s, self.frequency_embedding_size)
+        return self.mlp(s_freq)
+
+
+
+
+class ResBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.GroupNorm(8, channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.GroupNorm(8, channels),
+        )
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.act(x + self.net(x))
+
+
+class ResNetUpsampler(nn.Module):
+    """
+    Lightweight convolutional residual network for Loss C.
+
+    Takes the concatenation of:
+      - upsampled low-res transformer output  (B, C_vae, H_fr_sp, W_fr_sp)
+      - full-res noisy input xt_fr            (B, C_vae, H_fr_sp, W_fr_sp)
+    and predicts the full-res velocity field  (B, C_vae, H_fr_sp, W_fr_sp).
+
+    Operates in the *latent spatial* domain (after unpatchify), so spatial dims
+    are H_grid * patch_size (e.g. 32x32 for a 16x16 grid with patch_size=2).
+    The output_proj is zero-initialized in FiT.initialize_weights() so the
+    upsampler starts as a no-op when loading from a pretrained checkpoint.
+    """
+    def __init__(self, in_channels: int = 8, hidden_channels: int = 128,
+                 out_channels: int = 4, num_blocks: int = 3):
+        super().__init__()
+        self.input_proj  = nn.Conv2d(in_channels, hidden_channels, 3, padding=1)
+        self.blocks      = nn.Sequential(*[ResBlock(hidden_channels) for _ in range(num_blocks)])
+        self.output_proj = nn.Conv2d(hidden_channels, out_channels, 1)
+
+    def forward(self, x_lr_up: torch.Tensor, xt_fr: torch.Tensor) -> torch.Tensor:
+        """
+        x_lr_up : (B, C_vae, H_sp, W_sp)  — upsampled low-res latent
+        xt_fr   : (B, C_vae, H_sp, W_sp)  — full-res noisy observation
+        returns : (B, C_vae, H_sp, W_sp)  — predicted full-res velocity
+        """
+        x = torch.cat([x_lr_up, xt_fr], dim=1)
+        x = self.input_proj(x)
+        x = self.blocks(x)
+        return self.output_proj(x)
 
 
 #################################################################################
