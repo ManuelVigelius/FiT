@@ -38,6 +38,9 @@ fi
 
 # --- Launch training ---
 cd "$REPO_DIR"
+# Persist the torch.compile / Inductor kernel cache across sessions to avoid
+# re-paying the max-autotune warmup cost each time.
+export TORCHINDUCTOR_CACHE_DIR="$DRIVE_BASE/inductor_cache"
 torchrun --nnodes 1 --nproc_per_node 1 \
   train_fitv2.py \
     --project_name "$PROJECT" \

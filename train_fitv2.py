@@ -282,7 +282,11 @@ def main():
         ema_model = accelerator.prepare_model(ema_model, device_placement=False)
     else:
         model = accelerator.prepare_model(model, device_placement=False)
-        
+
+    model = torch.compile(model, dynamic=True, mode="max-autotune")
+    if args.use_ema:
+        ema_model = torch.compile(ema_model, dynamic=True, mode="max-autotune")
+
     # In SiT, we use transport instead of diffusion
     transport = create_transport(**OmegaConf.to_container(diffusion_cfg.transport))  # default: velocity; 
     # schedule_sampler = create_named_schedule_sampler()
@@ -419,6 +423,7 @@ def main():
         size = batch['size']        # (B, N_pack, 2), order: h, w.
         doc_ids = batch.get('doc_ids', None)   # (B, N_total) or None in unpacked mode
         n_pack = batch.get('n_pack', None)     # (B,) or None in unpacked mode
+        optimizer.zero_grad(set_to_none=True)
         with accelerator.accumulate(model):
             # trim trailing padding to the longest valid sequence in this batch
             N_batch = int(torch.max(torch.sum(size[..., 0] * size[..., 1], dim=-1)))
@@ -448,7 +453,6 @@ def main():
                 loss_dict = transport.training_losses(model, x, model_kwargs)
             loss = loss_dict["loss"].mean()
             # Backpropagate
-            optimizer.zero_grad()
             accelerator.backward(loss)
             if accelerator.sync_gradients and accelerate_cfg.max_grad_norm > 0.:
                 all_norm = accelerator.clip_grad_norm_(

@@ -65,7 +65,7 @@ data:
         pad_to_multiple: 128
       loader:
         batch_size: 4
-        num_workers: 2
+        num_workers: 4
         shuffle: True
 
 
