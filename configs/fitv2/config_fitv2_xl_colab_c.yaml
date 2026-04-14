@@ -42,11 +42,11 @@ diffusion:
       k_norm: layernorm
       qk_norm_weight: false
       rel_pos_embed: rope
-      online_rope: true        # required for variable-resolution RoPE
+      online_rope: true
       abs_pos_embed: null
       adaln_type: lora
       adaln_lora_dim: 288
-      use_size_cond: true      # SizeEmbedder conditioning
+      use_size_cond: true
       use_upsampler: true      # ResNetUpsampler for Loss C
       pretrain_ckpt: checkpoints/fitv2_xl.safetensors
 
@@ -56,16 +56,16 @@ data:
     train:
       data_path: datasets/imagenet1k_latents_256_sd_vae_ft_ema
       target_len: 256
-      random: 'crop'           # crop-only 256px square images
-      resize_range: [8, 16]    # random grid size 8x8 to 16x16 (step 2)
+      random: 'crop'
+      resize_range: [8, 16]
       return_fullres: true     # required for Loss C
       packed:
         enabled: true
         max_tokens: 512
         pad_to_multiple: 128
       loader:
-        batch_size: 16
-        num_workers: 4
+        batch_size: 4
+        num_workers: 2
         shuffle: True
 
 
