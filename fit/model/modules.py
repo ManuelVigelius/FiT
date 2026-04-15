@@ -244,29 +244,24 @@ class Attention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         freqs_cos: Optional[torch.Tensor] = None,
         freqs_sin: Optional[torch.Tensor] = None,
-        doc_ids: Optional[torch.Tensor] = None,
+        block_mask=None,
     ) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0) # (B, n_h, N, D_h)
-        q, k = self.q_norm(q), self.k_norm(k)
+        q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
 
         if self.rel_pos_embed in ['rope', 'xpos']:  # multiplicative rel_pos_embed
             if self.add_rel_pe_to_v:
                 v = v * freqs_cos + rotate_half(v) * freqs_sin
-            q = q * freqs_cos + rotate_half(q) * freqs_sin
-            k = k * freqs_cos + rotate_half(k) * freqs_sin
+            q = (q * freqs_cos + rotate_half(q) * freqs_sin).to(v.dtype)
+            k = (k * freqs_cos + rotate_half(k) * freqs_sin).to(v.dtype)
 
-        if doc_ids is not None:
+        if block_mask is not None:
             # Packed / document-masking path via FlexAttention.
-            # Each image only attends to tokens belonging to the same image
-            # (same doc_id). Padding positions have doc_id == -1 and are
-            # excluded because -1 != any non-negative doc_id.
-            from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-            _doc_ids = doc_ids  # capture for closure
-            def doc_mask_mod(b, h, q_idx, kv_idx):
-                return _doc_ids[b, q_idx] == _doc_ids[b, kv_idx]
-            block_mask = create_block_mask(doc_mask_mod, B, None, N, N, device=x.device)
+            # block_mask is precomputed outside the compiled region to avoid
+            # triggering Inductor recompilations on variable sequence lengths.
+            from torch.nn.attention.flex_attention import flex_attention
             x = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
         else:
             # Original padding-mask path (used when doc_ids is not provided,
@@ -354,7 +349,7 @@ class FiTBlock(nn.Module):
                 in_features=hidden_size, hidden_features=(hidden_size//4)*3, out_features=6*hidden_size, bias=adaln_bias
             )
 
-    def forward(self, x, c, mask, freqs_cos, freqs_sin, global_adaln=0.0, doc_ids=None):
+    def forward(self, x, c, mask, freqs_cos, freqs_sin, global_adaln=0.0, block_mask=None):
         if c.dim() == 2:
             # Standard (unpacked) path: c is (B, D), one vector per batch element.
             mods = (self.adaLN_modulation(c) + global_adaln).chunk(6, dim=1)
@@ -364,7 +359,7 @@ class FiTBlock(nn.Module):
             # global_adaln is broadcast-compatible (scalar 0.0 or (B, 1, 6*D)).
             mods = (self.adaLN_modulation(c) + global_adaln).chunk(6, dim=-1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mods
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), mask, freqs_cos, freqs_sin, doc_ids)
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), mask, freqs_cos, freqs_sin, block_mask)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 

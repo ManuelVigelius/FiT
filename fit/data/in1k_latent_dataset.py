@@ -22,20 +22,23 @@ class IN1kLatentDataset(Dataset):
         self.resize_range = resize_range      # (min_grid, max_grid) or None
         self.return_fullres = return_fullres  # if True, also return full-res feature
         self.files = []
-        files_1 = os.listdir(osp.join(root_dir, f'from_16_to_{target_len}'))
-        files_2 = os.listdir(osp.join(root_dir, f'greater_than_{target_len}_resize'))
-        files_3 = os.listdir(osp.join(root_dir, f'greater_than_{target_len}_crop'))
+        dir_1 = osp.join(root_dir, f'from_16_to_{target_len}')
+        dir_2 = osp.join(root_dir, f'greater_than_{target_len}_resize')
+        dir_3 = osp.join(root_dir, f'greater_than_{target_len}_crop')
+        files_1 = os.listdir(dir_1) if osp.isdir(dir_1) else []
+        files_2 = os.listdir(dir_2) if osp.isdir(dir_2) else []
+        files_3 = os.listdir(dir_3) if osp.isdir(dir_3) else []
         files_23 = list(set(files_2) - set(files_3))    # files_3 in files_2
         self.files.extend([
-            [osp.join(root_dir, f'from_16_to_{target_len}', file)] for file in files_1
+            [osp.join(dir_1, file)] for file in files_1
         ])
         self.files.extend([
-            [osp.join(root_dir, f'greater_than_{target_len}_resize', file)] for file in files_23
+            [osp.join(dir_2, file)] for file in files_23
         ])
         self.files.extend([
             [
-                osp.join(root_dir, f'greater_than_{target_len}_resize', file), 
-                osp.join(root_dir, f'greater_than_{target_len}_crop', file)
+                osp.join(dir_2, file),
+                osp.join(dir_3, file)
             ] for file in files_3
         ])
         

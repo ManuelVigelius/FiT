@@ -170,7 +170,9 @@ class Transport:
         ut = x1 - x0                                      # ICPlan: d_alpha=1, d_sigma=-1
 
         # Pass per-image t (not per-token) to the model for timestep embedding.
-        model_output = model(xt, t_per_image, **model_kwargs)
+        # n_pack is consumed by the transport layer; strip it before forwarding.
+        model_kwargs_fwd = {k: v for k, v in model_kwargs.items() if k != 'n_pack'}
+        model_output = model(xt, t_per_image, **model_kwargs_fwd)
         return xt, ut, model_output, t_expanded, sigma_t, x0
 
     def _forward_unpacked(self, model, x1, model_kwargs):

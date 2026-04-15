@@ -124,12 +124,22 @@ class VisionRotaryEmbedding(nn.Module):
 
     def get_1d_rope_freqs(self, theta, dim, max_pe_len, ori_max_pe_len):
         # scaling operations for extrapolation
-        assert isinstance(ori_max_pe_len, int)
+        if self.custom_freqs == 'normal':
+            # No scaling; ori_max_pe_len not needed.
+            # Return (B, dim//2) so the caller can do freqs[:, None, :] correctly.
+            device = max_pe_len.device if isinstance(max_pe_len, torch.Tensor) else None
+            freqs_1d = 1. / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))  # (dim//2,)
+            if isinstance(max_pe_len, torch.Tensor) and max_pe_len.dim() >= 1:
+                return freqs_1d.unsqueeze(0).expand(max_pe_len.shape[0], -1)     # (B, dim//2)
+            return freqs_1d
+
+        if not isinstance(ori_max_pe_len, int):
+            raise TypeError(f"ori_max_pe_len must be an int, got {type(ori_max_pe_len)}")
         # scale = max_pe_len / ori_max_pe_len
         if not isinstance(max_pe_len, torch.Tensor):
             max_pe_len = torch.tensor(max_pe_len)
         scale = torch.clamp_min(max_pe_len / ori_max_pe_len, 1.0)   # dynamic scale
-        
+
         if self.custom_freqs == 'linear': # equal to position interpolation
             freqs = 1. / torch.einsum('..., f -> ... f', scale, theta ** (torch.arange(0, dim, 2).float() / dim))
         elif self.custom_freqs == 'ntk-aware' or self.custom_freqs == 'ntk-aware-pro1' or self.custom_freqs == 'ntk-aware-pro2':
@@ -192,7 +202,7 @@ class VisionRotaryEmbedding(nn.Module):
                     [0. 0. 0. 0. 1. 1. 1. 1. 2. 2. 2. 2.]
         size: (B, 1, 2), h goes first and w goes last
         '''
-        size = size.squeeze()   # (B, 1, 2) -> (B, 2)
+        size = size.squeeze(1)   # (B, 1, 2) -> (B, 2)
         if self.decouple:
             size_h = size[:, 0]
             size_w = size[:, 1]

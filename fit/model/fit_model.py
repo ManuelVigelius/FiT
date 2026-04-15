@@ -200,7 +200,7 @@ class FiT(nn.Module):
             x = rearrange(x, "b (c p1 p2) h w -> b c (h p1) (w p2)", p1=p, p2=p) # (B, 16, h//2, w//2) -> (B, h, w, 4)
         return x
 
-    def forward(self, x, t, y, grid, mask, size=None, doc_ids=None):
+    def forward(self, x, t, y, grid, mask, size=None, doc_ids=None, block_mask=None):
         """
         Forward pass of FiT.
 
@@ -212,6 +212,7 @@ class FiT(nn.Module):
             mask:    (B, N)   — 1 for valid tokens, 0 for padding
             size:    (B, 1, 2)
             doc_ids: None
+            block_mask: None
 
         Packed mode (document-masking):
             x:       same shape but N = N_total (concatenated images, padded to multiple of 128)
@@ -221,6 +222,7 @@ class FiT(nn.Module):
             mask:    (B, N_total)
             size:    (B, max_n_pack, 2)
             doc_ids: (B, N_total)  — image index within sequence, -1 for padding
+            block_mask: precomputed FlexAttention BlockMask (built outside the compiled region)
 
         return: same shape as x.
         """
@@ -286,7 +288,14 @@ class FiT(nn.Module):
 
         # get RoPE frequencies in advance, then calculate attention.
         if self.online_rope:
-            freqs_cos, freqs_sin = self.rel_pos_embed.online_get_2d_rope_from_grid(grid, size)
+            # online_get_2d_rope_from_grid expects size (B, 1, 2).
+            # In packed mode size is (B, max_n_pack, 2); use the per-batch max
+            # so the RoPE scale covers the largest image in each pack.
+            if size is not None and size.dim() == 3 and size.shape[1] > 1:
+                rope_size = size.max(dim=1, keepdim=True).values  # (B, 1, 2)
+            else:
+                rope_size = size
+            freqs_cos, freqs_sin = self.rel_pos_embed.online_get_2d_rope_from_grid(grid, rope_size)
             freqs_cos, freqs_sin = freqs_cos.unsqueeze(1), freqs_sin.unsqueeze(1)
         else:
             freqs_cos, freqs_sin = self.rel_pos_embed.get_cached_2d_rope_from_grid(grid)
@@ -294,11 +303,11 @@ class FiT(nn.Module):
 
         if not self.use_checkpoint:
             for block in self.blocks:
-                x = block(x, c, mask, freqs_cos, freqs_sin, global_adaln, doc_ids)
+                x = block(x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask)
         else:
             for block in self.blocks:
                 x = torch.utils.checkpoint.checkpoint(
-                    self.ckpt_wrapper(block), x, c, mask, freqs_cos, freqs_sin, global_adaln, doc_ids
+                    self.ckpt_wrapper(block), x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask
                 )
 
         x = self.final_layer(x, c)                      # (B, N, p**2 * C_out)

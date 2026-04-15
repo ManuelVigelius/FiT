@@ -283,9 +283,9 @@ def main():
     else:
         model = accelerator.prepare_model(model, device_placement=False)
 
-    model = torch.compile(model, dynamic=True, mode="max-autotune")
+    model = torch.compile(model, dynamic=True, mode="reduce-overhead")
     if args.use_ema:
-        ema_model = torch.compile(ema_model, dynamic=True, mode="max-autotune")
+        ema_model = torch.compile(ema_model, dynamic=True, mode="reduce-overhead")
 
     # In SiT, we use transport instead of diffusion
     transport = create_transport(**OmegaConf.to_container(diffusion_cfg.transport))  # default: velocity; 
@@ -439,8 +439,21 @@ def main():
                 y = y.to(torch.int).clamp(min=0)
             else:
                 y = y.squeeze(dim=-1).to(torch.int)
+
+            # Build the FlexAttention block mask outside the compiled model so
+            # create_block_mask never appears inside an Inductor graph, which
+            # caused BackendCompilerFailed on variable-length sequences.
+            block_mask = None
+            if doc_ids is not None:
+                from torch.nn.attention.flex_attention import create_block_mask
+                B_bm, N_bm = doc_ids.shape
+                _doc_ids = doc_ids
+                def doc_mask_mod(b, h, q_idx, kv_idx):
+                    return _doc_ids[b, q_idx] == _doc_ids[b, kv_idx]
+                block_mask = create_block_mask(doc_mask_mod, B_bm, None, N_bm, N_bm, device=doc_ids.device)
+
             model_kwargs = dict(y=y, grid=grid.long(), mask=mask, size=size,
-                                doc_ids=doc_ids, n_pack=n_pack)
+                                doc_ids=doc_ids, n_pack=n_pack, block_mask=block_mask)
             if 'feature_fullres' in batch:
                 N_batch_fr = int(torch.max(
                     batch['size_fullres'][..., 0] * batch['size_fullres'][..., 1]
