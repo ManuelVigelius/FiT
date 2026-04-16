@@ -288,9 +288,9 @@ def main():
     # (pattern_matcher.py:2291) present in PyTorch 2.10 nightlies where the joint
     # forward+backward graph partition pass produces a cycle the sort can't resolve.
     torch._inductor.config.joint_graph_constant_folding = False
-    model = torch.compile(model, dynamic=True, mode="reduce-overhead")
+    model = torch.compile(model, dynamic=True, mode="default")
     if args.use_ema:
-        ema_model = torch.compile(ema_model, dynamic=True, mode="reduce-overhead")
+        ema_model = torch.compile(ema_model, dynamic=True, mode="default")
 
     # In SiT, we use transport instead of diffusion
     transport = create_transport(**OmegaConf.to_container(diffusion_cfg.transport))  # default: velocity; 
@@ -422,7 +422,7 @@ def main():
     _profiling_active = False
 
     model.train()
-    train_loss = 0.0
+    train_loss = None  # accumulated as tensor to defer CPU-GPU sync to logging
     for step, batch in enumerate(train_dataloader, start=global_steps):
         # --- nsys profiler window ---
         if accelerator.is_main_process:
@@ -499,7 +499,8 @@ def main():
                 lr_scheduler.step()
             # Gather the losses across all processes for logging (if we use distributed training).
             avg_loss = accelerator.gather(loss.repeat(data_cfg.params.train.loader.batch_size)).mean()
-            train_loss += avg_loss.item() / grad_accu_steps
+            avg_loss_scaled = avg_loss.detach() / grad_accu_steps
+            train_loss = avg_loss_scaled if train_loss is None else train_loss + avg_loss_scaled
             
         # Checks if the accelerator has performed an optimization step behind the scenes; Check gradient accumulation
         if accelerator.sync_gradients: 
@@ -510,11 +511,11 @@ def main():
             progress_bar.update(1)
             global_steps += 1
             if getattr(accelerate_cfg, 'logger', 'wandb') != None:
-                accelerator.log({"train_loss": train_loss}, step=global_steps)
+                accelerator.log({"train_loss": train_loss.item() if train_loss is not None else 0.0}, step=global_steps)
                 accelerator.log({"lr": lr_scheduler.get_last_lr()[0]}, step=global_steps)
                 if accelerate_cfg.max_grad_norm != 0.0:
                     accelerator.log({"grad_norm": all_norm.item()}, step=global_steps)
-            train_loss = 0.0
+            train_loss = None
             if global_steps % accelerate_cfg.checkpointing_steps == 0:
                 if accelerate_cfg.checkpoints_total_limit is not None:
                     checkpoints = os.listdir(ckptdir)
@@ -550,10 +551,10 @@ def main():
                 logger.info(f"Saved state to {save_path}")
                 accelerator.wait_for_everyone()
             
-        logs = {"step_loss": loss.detach().item(), 
-                "lr": lr_scheduler.get_last_lr()[0]}
-        progress_bar.set_postfix(**logs)
         if global_steps % accelerate_cfg.logging_steps == 0:
+            logs = {"step_loss": loss.detach().item(),
+                    "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
             if accelerator.is_main_process:
                 logger.info("step="+str(global_steps)+" / total_step="+str(accelerate_cfg.max_train_steps)+", step_loss="+str(logs["step_loss"])+', lr='+str(logs["lr"]))
 
