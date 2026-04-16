@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 import random
 from functools import partial
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, BatchSampler
 from safetensors.torch import load_file
 from einops import rearrange
 
@@ -127,89 +127,110 @@ class IN1kLatentDataset(Dataset):
         
        
 
-def packed_collate_fn(samples, max_tokens: int = 512, pad_to_multiple: int = 128):
-    """
-    Greedy token-threshold collate function for packed / varlen attention training.
+class TokenBudgetBatchSampler(BatchSampler):
+    """Yield index batches such that the total valid tokens per batch stays
+    within *max_tokens*.
 
-    Groups samples greedily: keeps adding images to the current sequence until
-    the next image would push the total token count over `max_tokens`, then
-    closes the group. This produces sequences with a roughly uniform number of
-    valid tokens regardless of individual image size — much better for GPU
-    utilisation than a fixed number of images per sequence.
+    Token counts are pre-computed without touching the dataset files: each
+    sample's sequence length is drawn from the same uniform distribution used
+    in IN1kLatentDataset.__getitem__ (resize_range → H_g*W_g), seeded
+    deterministically so the lengths are reproducible across restarts.
 
     Args:
-        samples: flat list of dicts from IN1kLatentDataset.__getitem__, each with
+        sampler:        A flat sequence of dataset indices (pre-shuffled by
+                        get_train_sampler).  Consumed in order.
+        resize_range:   (min_grid, max_grid) passed to the dataset.  If None,
+                        every sample is assumed to be target_len tokens.
+        target_len:     Per-sample capacity used when resize_range is None.
+        max_tokens:     Token budget per batch.
+        pad_to_multiple: Ignored here (handled by collate); kept for symmetry.
+        seed:           RNG seed for the length pre-computation.
+    """
+
+    def __init__(self, sampler, resize_range=None, target_len=256,
+                 max_tokens=1024, pad_to_multiple=128, seed=42):
+        # Don't call super().__init__() — it expects (sampler, batch_size, drop_last)
+        # and we don't have a fixed batch_size.
+        self.sampler = sampler          # list of indices
+        self.max_tokens = max_tokens
+        self.pad_to_multiple = pad_to_multiple
+
+        # Pre-compute a seq_len for every position in the sampler list.
+        if resize_range is not None:
+            min_g, max_g = resize_range
+            valid = list(range(min_g, max_g + 1, 2))
+            rng = random.Random(seed)
+            self._lengths = [rng.choice(valid) ** 2 for _ in sampler]
+        else:
+            self._lengths = [target_len] * len(sampler)
+
+    def __iter__(self):
+        batch, total = [], 0
+        for idx, length in zip(self.sampler, self._lengths):
+            if batch and total + length > self.max_tokens:
+                yield batch
+                batch, total = [], 0
+            batch.append(idx)
+            total += length
+        if batch:
+            yield batch
+
+    def __len__(self):
+        # Approximate — actual number of batches depends on sampled lengths.
+        avg = sum(self._lengths) / max(len(self._lengths), 1)
+        return math.ceil(len(self.sampler) * avg / self.max_tokens)
+
+
+def packed_collate_fn(samples, pad_to_multiple: int = 128):
+    """
+    Collate a pre-grouped list of samples into a single packed sequence.
+
+    Grouping is handled upstream by TokenBudgetBatchSampler, so all samples
+    here belong to one sequence.  We just concatenate, assign doc_ids, and
+    pad N_total to the nearest multiple of pad_to_multiple.
+
+    Args:
+        samples: list of dicts from IN1kLatentDataset.__getitem__, each with
             keys feature (target_len, 16), grid (2, target_len), mask (target_len,),
             label (), size (1, 2).
-        max_tokens: maximum total valid tokens per packed sequence.
-        pad_to_multiple: pad N_total up to the next multiple of this value (must
-            match FlexAttention's block size, typically 128).
+        pad_to_multiple: pad N_total to this multiple for FlexAttention block size.
 
-    Returns a batched dict with:
-        feature  (B, N_total, 16)
-        grid     (B, 2, N_total)
-        mask     (B, N_total)         — 1 for valid tokens, 0 for padding
-        doc_ids  (B, N_total)         — image index within sequence, -1 for padding
-        label    (B, max_n_pack)      — class labels, -1 for unused slots
-        size     (B, max_n_pack, 2)   — (h, w) per image, 0 for unused slots
-        n_pack   (B,)                 — number of images actually packed per element
+    Returns a batched dict with shape (1, N_total, ...) where B=1:
+        feature  (1, N_total, 16)
+        grid     (1, 2, N_total)
+        mask     (1, N_total)         — 1 for valid tokens, 0 for padding
+        doc_ids  (1, N_total)         — image index within sequence, -1 for padding
+        label    (1, n_pack)          — class labels
+        size     (1, n_pack, 2)       — (h, w) per image
+        n_pack   (1,)                 — number of images packed
     """
     def _seq_len(s):
         return int(s['mask'].sum())
 
-    # ------------------------------------------------------------------ #
-    # 1. Greedy grouping                                                   #
-    # ------------------------------------------------------------------ #
-    groups = []
-    current_group = []
-    current_len = 0
-    for s in samples:
-        slen = _seq_len(s)
-        if current_group and current_len + slen > max_tokens:
-            groups.append(current_group)
-            current_group = [s]
-            current_len = slen
-        else:
-            current_group.append(s)
-            current_len += slen
-    if current_group:
-        groups.append(current_group)
-
-    B = len(groups)
-    max_n_pack = max(len(g) for g in groups)
+    n_pack = len(samples)
     dtype_feat = samples[0]['feature'].dtype
     dtype_grid = samples[0]['grid'].dtype
 
-    # ------------------------------------------------------------------ #
-    # 2. Determine shared N_total (pad to multiple)                        #
-    # ------------------------------------------------------------------ #
-    raw_lens = [sum(_seq_len(s) for s in g) for g in groups]
-    max_raw = max(raw_lens)
-    N_total = math.ceil(max_raw / pad_to_multiple) * pad_to_multiple
+    raw_len = sum(_seq_len(s) for s in samples)
+    N_total = math.ceil(raw_len / pad_to_multiple) * pad_to_multiple
 
-    # ------------------------------------------------------------------ #
-    # 3. Build per-group tensors and stack                                 #
-    # ------------------------------------------------------------------ #
-    feat_batch   = torch.zeros(B, N_total, 16, dtype=dtype_feat)
-    grid_batch   = torch.zeros(B, 2, N_total, dtype=dtype_grid)
-    mask_batch   = torch.zeros(B, N_total, dtype=torch.uint8)
-    doc_batch    = torch.full((B, N_total), -1, dtype=torch.int32)
-    label_batch  = torch.full((B, max_n_pack), -1, dtype=torch.int64)
-    size_batch   = torch.zeros(B, max_n_pack, 2, dtype=torch.int32)
-    n_pack_batch = torch.zeros(B, dtype=torch.int32)
+    feat_batch  = torch.zeros(1, N_total, 16, dtype=dtype_feat)
+    grid_batch  = torch.zeros(1, 2, N_total, dtype=dtype_grid)
+    mask_batch  = torch.zeros(1, N_total, dtype=torch.uint8)
+    doc_batch   = torch.full((1, N_total), -1, dtype=torch.int32)
+    label_batch = torch.full((1, n_pack), -1, dtype=torch.int64)
+    size_batch  = torch.zeros(1, n_pack, 2, dtype=torch.int32)
 
-    for b, group in enumerate(groups):
-        offset = 0
-        for img_idx, s in enumerate(group):
-            slen = _seq_len(s)
-            feat_batch[b, offset:offset + slen]     = s['feature'][:slen]
-            grid_batch[b, :, offset:offset + slen]  = s['grid'][:, :slen]
-            mask_batch[b, offset:offset + slen]     = 1
-            doc_batch[b, offset:offset + slen]      = img_idx
-            label_batch[b, img_idx]                 = s['label']
-            size_batch[b, img_idx]                  = s['size'].squeeze(0)
-            offset += slen
-        n_pack_batch[b] = len(group)
+    offset = 0
+    for img_idx, s in enumerate(samples):
+        slen = _seq_len(s)
+        feat_batch[0, offset:offset + slen]    = s['feature'][:slen]
+        grid_batch[0, :, offset:offset + slen] = s['grid'][:, :slen]
+        mask_batch[0, offset:offset + slen]    = 1
+        doc_batch[0, offset:offset + slen]     = img_idx
+        label_batch[0, img_idx]                = s['label']
+        size_batch[0, img_idx]                 = s['size'].squeeze(0)
+        offset += slen
 
     return dict(
         feature=feat_batch,
@@ -218,7 +239,7 @@ def packed_collate_fn(samples, max_tokens: int = 512, pad_to_multiple: int = 128
         doc_ids=doc_batch,
         label=label_batch,
         size=size_batch,
-        n_pack=n_pack_batch,
+        n_pack=torch.tensor([n_pack], dtype=torch.int32),
     )
 
 
@@ -273,31 +294,42 @@ class INLatentLoader():
         """Build the training DataLoader.
 
         Args:
-            packed: if True, use greedy token-threshold packing via packed_collate_fn
-                instead of the default padding-based batching.
-            max_tokens: maximum valid tokens per packed sequence (only used when packed=True).
-            pad_to_multiple: pad N_total to this multiple for stable FlexAttention compilation
+            packed: if True, use TokenBudgetBatchSampler + packed_collate_fn.
+                The sampler groups indices so that total valid tokens per batch
+                stays within max_tokens; batch_size from config is ignored.
+            max_tokens: token budget per packed batch (only used when packed=True).
+            pad_to_multiple: pad N_total to this multiple for FlexAttention
                 (only used when packed=True).
         """
-        sampler = get_train_sampler(
+        flat_sampler = get_train_sampler(
             self.train_dataset, global_batch_size, max_steps, resume_step, seed
         )
-        collate_fn = None
         if packed:
-            collate_fn = partial(
-                packed_collate_fn,
+            resize_range = getattr(self.train_config, 'resize_range', None)
+            batch_sampler = TokenBudgetBatchSampler(
+                sampler=flat_sampler,
+                resize_range=resize_range,
+                target_len=self.train_config.target_len,
                 max_tokens=max_tokens,
                 pad_to_multiple=pad_to_multiple,
+                seed=seed,
+            )
+            return DataLoader(
+                self.train_dataset,
+                batch_sampler=batch_sampler,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                prefetch_factor=2 if self.num_workers > 0 else None,
+                collate_fn=partial(packed_collate_fn, pad_to_multiple=pad_to_multiple),
             )
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            sampler=sampler,
+            sampler=flat_sampler,
             num_workers=self.num_workers,
             pin_memory=True,
             prefetch_factor=2 if self.num_workers > 0 else None,
             drop_last=True,
-            collate_fn=collate_fn,
         )
 
     def test_dataloader(self):

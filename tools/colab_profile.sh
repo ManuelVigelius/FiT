@@ -33,6 +33,45 @@ echo "Config       : $CONFIG"
 echo "Project      : $PROJECT"
 echo ""
 
+# --- Load data and checkpoint (tiny 1% dataset for fast profiling) ---
+# The tiny tarball lives under a different Drive name (_tiny suffix) but is
+# extracted to the same local path so configs need no changes.
+DATASET_DEST="$REPO_DIR/datasets/imagenet1k_latents_256_sd_vae_ft_ema"
+TINY_TAR="$DRIVE_BASE/datasets/imagenet1k_latents_256_sd_vae_ft_ema_tiny/greater_than_256_crop.tar.gz"
+if [ ! -d "$DATASET_DEST" ] || [ -z "$(ls -A "$DATASET_DEST" 2>/dev/null)" ]; then
+  if [ ! -f "$TINY_TAR" ]; then
+    echo "ERROR: Tiny dataset not found at $TINY_TAR"
+    echo "       Run tools/create_tiny_dataset.sh first to generate it."
+    exit 1
+  fi
+  echo "[1/3] Installing pigz..."
+  apt-get install -y pigz
+  echo "[1/3] Streaming and extracting tiny dataset from Drive..."
+  mkdir -p "$DATASET_DEST"
+  tar -xf "$TINY_TAR" -C "$DATASET_DEST" --use-compress-program=pigz
+  echo "[1/3] Dataset ready (tiny 1% subset)."
+else
+  echo "[1/3] Dataset already present, skipping extraction."
+fi
+
+CHECKPOINT="$REPO_DIR/checkpoints/fitv2_xl.safetensors"
+if [ ! -f "$CHECKPOINT" ]; then
+  echo "[2/3] Copying base checkpoint from Drive..."
+  mkdir -p "$REPO_DIR/checkpoints"
+  cp "$DRIVE_BASE/checkpoints/fitv2_xl.safetensors" "$REPO_DIR/checkpoints/"
+  echo "[2/3] Checkpoint ready."
+else
+  echo "[2/3] Checkpoint already present, skipping copy."
+fi
+
+if [ -f "$DRIVE_BASE/workdir_${PROJECT}.tar.gz" ]; then
+  echo "[3/3] Restoring previous workdir from Drive..."
+  tar -xzf "$DRIVE_BASE/workdir_${PROJECT}.tar.gz" -C "$REPO_DIR"
+  echo "[3/3] Workdir restored."
+else
+  echo "[3/3] No previous workdir found, starting fresh."
+fi
+
 # --- Install nsys if not already present ---
 NSYS="$(command -v nsys 2>/dev/null \
   || ls /usr/local/cuda-*/bin/nsys 2>/dev/null | head -1 \
@@ -40,7 +79,7 @@ NSYS="$(command -v nsys 2>/dev/null \
   || true)"
 
 if [ -z "$NSYS" ]; then
-  echo "[1/2] Installing Nsight Systems..."
+  echo "[nsys] Installing Nsight Systems..."
   CUDA_VER=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+' | head -1)
   CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
   CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
@@ -52,12 +91,12 @@ if [ -z "$NSYS" ]; then
     || ls /opt/nvidia/nsight-systems-*/bin/nsys 2>/dev/null | head -1)"
   echo "  nsys found at: $NSYS"
 else
-  echo "[1/2] nsys already available at: $NSYS"
+  echo "[nsys] nsys already available at: $NSYS"
 fi
 
 # --- Launch profiling ---
 echo ""
-echo "[2/2] Launching profiler..."
+echo "[profiler] Launching profiler..."
 echo "  Kill after seeing: [profiler] cudaProfilerStop"
 echo "  Output: $DRIVE_BASE/profile_${PROJECT}.nsys-rep"
 echo ""

@@ -297,7 +297,13 @@ def main():
     # schedule_sampler = create_named_schedule_sampler()
 
     # Setup Dataloader
-    total_batch_size = data_cfg.params.train.loader.batch_size * accelerator.num_processes * grad_accu_steps
+    # In packed mode the effective batch size per step is determined by max_tokens,
+    # not by loader.batch_size (which is ignored).  We still use loader.batch_size
+    # as the global-sampler unit so get_train_sampler draws enough indices.
+    packed_cfg = getattr(data_cfg.params.train, 'packed', None)
+    use_packed = packed_cfg is not None and getattr(packed_cfg, 'enabled', False)
+    loader_batch_size = data_cfg.params.train.loader.batch_size
+    total_batch_size = loader_batch_size * accelerator.num_processes * grad_accu_steps
     global_steps = 0
     if args.resume_from_checkpoint:
         # normal read with safety check
@@ -320,10 +326,6 @@ def main():
 
     get_train_dataloader = instantiate_from_config(data_cfg)
     train_len = get_train_dataloader.train_len()
-    # packed=True enables greedy token-threshold packing with FlexAttention document masking.
-    # max_tokens and pad_to_multiple can be tuned via the data config or left at defaults.
-    packed_cfg = getattr(data_cfg.params.train, 'packed', None)
-    use_packed = packed_cfg is not None and getattr(packed_cfg, 'enabled', False)
     train_dataloader = get_train_dataloader.train_dataloader(
         global_batch_size=total_batch_size, max_steps=accelerate_cfg.max_train_steps,
         resume_step=global_steps, seed=args.seed,
@@ -498,7 +500,7 @@ def main():
                     optimizer.step()
                 lr_scheduler.step()
             # Gather the losses across all processes for logging (if we use distributed training).
-            avg_loss = accelerator.gather(loss.repeat(data_cfg.params.train.loader.batch_size)).mean()
+            avg_loss = accelerator.gather(loss.repeat(1)).mean()
             avg_loss_scaled = avg_loss.detach() / grad_accu_steps
             train_loss = avg_loss_scaled if train_loss is None else train_loss + avg_loss_scaled
             
