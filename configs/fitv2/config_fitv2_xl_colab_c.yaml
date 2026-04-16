@@ -61,7 +61,7 @@ data:
       return_fullres: true     # required for Loss C
       packed:
         enabled: true
-        max_tokens: 512
+        max_tokens: 1024
         pad_to_multiple: 128
       loader:
         batch_size: 4

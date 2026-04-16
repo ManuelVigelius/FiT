@@ -283,6 +283,10 @@ def main():
     else:
         model = accelerator.prepare_model(model, device_placement=False)
 
+    # joint_graph_constant_folding=False works around a bug in stable_topological_sort
+    # (pattern_matcher.py:2291) present in PyTorch 2.10 nightlies where the joint
+    # forward+backward graph partition pass produces a cycle the sort can't resolve.
+    torch._inductor.config.joint_graph_constant_folding = False
     model = torch.compile(model, dynamic=True, mode="reduce-overhead")
     if args.use_ema:
         ema_model = torch.compile(ema_model, dynamic=True, mode="reduce-overhead")
@@ -425,11 +429,10 @@ def main():
         n_pack = batch.get('n_pack', None)     # (B,) or None in unpacked mode
         optimizer.zero_grad(set_to_none=True)
         with accelerator.accumulate(model):
-            # trim trailing padding to the longest valid sequence in this batch
-            N_batch = int(torch.max(torch.sum(size[..., 0] * size[..., 1], dim=-1)))
-            x, grid, mask = x[:, :N_batch], grid[..., :N_batch], mask[:, :N_batch]
-            if doc_ids is not None:
-                doc_ids = doc_ids[:, :N_batch]
+            # No trimming: tensors are already padded to a 128-multiple by the
+            # collate fn, so sequence length is always in {128, 256, 384, 512}.
+            # Removing the trim eliminates the CPU/GPU sync that caused the
+            # CUDAGraph partition, letting the full graph run as one unit.
 
             # prepare other parameters
             if doc_ids is not None:
@@ -455,10 +458,7 @@ def main():
             model_kwargs = dict(y=y, grid=grid.long(), mask=mask, size=size,
                                 doc_ids=doc_ids, n_pack=n_pack, block_mask=block_mask)
             if 'feature_fullres' in batch:
-                N_batch_fr = int(torch.max(
-                    batch['size_fullres'][..., 0] * batch['size_fullres'][..., 1]
-                ))
-                model_kwargs['x1_fullres']   = batch['feature_fullres'][:, :N_batch_fr].to(device=device)
+                model_kwargs['x1_fullres']   = batch['feature_fullres'].to(device=device)
                 model_kwargs['mask_fullres'] = batch['mask_fullres'].to(device=device)
                 model_kwargs['size_fullres'] = batch['size_fullres'].to(device=device)
             # forward model and compute loss
