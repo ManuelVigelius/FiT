@@ -22,3 +22,4 @@ batch*
 *.ipynb_checkpoints
 /test
 .venv
+.env

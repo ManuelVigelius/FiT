@@ -84,7 +84,7 @@ accelerate:
       weight_decay: 0
       eps: 1.0e-8
   lr_scheduler: constant_with_warmup
-  lr_warmup_steps: 2000
+  lr_warmup_steps: 200
   logger: wandb
   checkpointing_epochs: False
   checkpointing_steps: 4000

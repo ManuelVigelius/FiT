@@ -1,4 +1,5 @@
 import os
+import contextlib
 import torch
 import argparse
 import datetime
@@ -414,65 +415,88 @@ def main():
         # ema_model = ema_model.to(ema_dtype)
         ema_model.eval()
     # Training Loop
+    # Profiling config: capture steps [PROFILE_START, PROFILE_START + PROFILE_STEPS).
+    # Set PROFILE_START high enough to be past torch.compile warmup (typically <50 steps).
+    PROFILE_START = 20
+    PROFILE_STEPS = 30
+    _profiling_active = False
+
     model.train()
     train_loss = 0.0
     for step, batch in enumerate(train_dataloader, start=global_steps):
-        for batch_key in batch.keys():
-            if not isinstance(batch[batch_key], list):
-                batch[batch_key] = batch[batch_key].to(device=device)
-        x = batch['feature']        # (B, N, C)
-        grid = batch['grid']        # (B, 2, N)
-        mask = batch['mask']        # (B, N)
-        y = batch['label']          # (B, 1) unpacked  or  (B, max_n_pack) packed
-        size = batch['size']        # (B, N_pack, 2), order: h, w.
-        doc_ids = batch.get('doc_ids', None)   # (B, N_total) or None in unpacked mode
-        n_pack = batch.get('n_pack', None)     # (B,) or None in unpacked mode
-        optimizer.zero_grad(set_to_none=True)
-        with accelerator.accumulate(model):
-            # No trimming: tensors are already padded to a 128-multiple by the
-            # collate fn, so sequence length is always in {128, 256, 384, 512}.
-            # Removing the trim eliminates the CPU/GPU sync that caused the
-            # CUDAGraph partition, letting the full graph run as one unit.
+        # --- nsys profiler window ---
+        if accelerator.is_main_process:
+            if step == PROFILE_START:
+                torch.cuda.cudart().cudaProfilerStart()
+                _profiling_active = True
+                logger.info(f"[profiler] cudaProfilerStart at step {step}")
+            elif step == PROFILE_START + PROFILE_STEPS and _profiling_active:
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStop()
+                _profiling_active = False
+                logger.info(f"[profiler] cudaProfilerStop at step {step}")
 
-            # prepare other parameters
-            if doc_ids is not None:
-                # Packed mode: y is already (B, max_n_pack); keep as-is for the model.
-                # Replace padding slots (-1) with 0 so LabelEmbedder doesn't get OOB indices;
-                # those tokens are masked out and don't contribute to loss.
-                y = y.to(torch.int).clamp(min=0)
-            else:
-                y = y.squeeze(dim=-1).to(torch.int)
+        with torch.cuda.nvtx.range(f"step_{step}") if _profiling_active else contextlib.nullcontext():
+            with torch.cuda.nvtx.range("data_to_gpu") if _profiling_active else contextlib.nullcontext():
+                for batch_key in batch.keys():
+                    if not isinstance(batch[batch_key], list):
+                        batch[batch_key] = batch[batch_key].to(device=device)
+            x = batch['feature']        # (B, N, C)
+            grid = batch['grid']        # (B, 2, N)
+            mask = batch['mask']        # (B, N)
+            y = batch['label']          # (B, 1) unpacked  or  (B, max_n_pack) packed
+            size = batch['size']        # (B, N_pack, 2), order: h, w.
+            doc_ids = batch.get('doc_ids', None)   # (B, N_total) or None in unpacked mode
+            n_pack = batch.get('n_pack', None)     # (B,) or None in unpacked mode
+            optimizer.zero_grad(set_to_none=True)
+            with accelerator.accumulate(model):
+                # No trimming: tensors are already padded to a 128-multiple by the
+                # collate fn, so sequence length is always in {128, 256, 384, 512}.
+                # Removing the trim eliminates the CPU/GPU sync that caused the
+                # CUDAGraph partition, letting the full graph run as one unit.
 
-            # Build the FlexAttention block mask outside the compiled model so
-            # create_block_mask never appears inside an Inductor graph, which
-            # caused BackendCompilerFailed on variable-length sequences.
-            block_mask = None
-            if doc_ids is not None:
-                from torch.nn.attention.flex_attention import create_block_mask
-                B_bm, N_bm = doc_ids.shape
-                _doc_ids = doc_ids
-                def doc_mask_mod(b, h, q_idx, kv_idx):
-                    return _doc_ids[b, q_idx] == _doc_ids[b, kv_idx]
-                block_mask = create_block_mask(doc_mask_mod, B_bm, None, N_bm, N_bm, device=doc_ids.device)
+                # prepare other parameters
+                if doc_ids is not None:
+                    # Packed mode: y is already (B, max_n_pack); keep as-is for the model.
+                    # Replace padding slots (-1) with 0 so LabelEmbedder doesn't get OOB indices;
+                    # those tokens are masked out and don't contribute to loss.
+                    y = y.to(torch.int).clamp(min=0)
+                else:
+                    y = y.squeeze(dim=-1).to(torch.int)
 
-            model_kwargs = dict(y=y, grid=grid.long(), mask=mask, size=size,
-                                doc_ids=doc_ids, n_pack=n_pack, block_mask=block_mask)
-            if 'feature_fullres' in batch:
-                model_kwargs['x1_fullres']   = batch['feature_fullres'].to(device=device)
-                model_kwargs['mask_fullres'] = batch['mask_fullres'].to(device=device)
-                model_kwargs['size_fullres'] = batch['size_fullres'].to(device=device)
-            # forward model and compute loss
-            with accelerator.autocast():
-                loss_dict = transport.training_losses(model, x, model_kwargs)
-            loss = loss_dict["loss"].mean()
-            # Backpropagate
-            accelerator.backward(loss)
-            if accelerator.sync_gradients and accelerate_cfg.max_grad_norm > 0.:
-                all_norm = accelerator.clip_grad_norm_(
-                    model.parameters(), accelerate_cfg.max_grad_norm
-                )
-            optimizer.step()
-            lr_scheduler.step()
+                # Build the FlexAttention block mask outside the compiled model so
+                # create_block_mask never appears inside an Inductor graph, which
+                # caused BackendCompilerFailed on variable-length sequences.
+                block_mask = None
+                if doc_ids is not None:
+                    from torch.nn.attention.flex_attention import create_block_mask
+                    B_bm, N_bm = doc_ids.shape
+                    _doc_ids = doc_ids
+                    def doc_mask_mod(b, h, q_idx, kv_idx):
+                        return _doc_ids[b, q_idx] == _doc_ids[b, kv_idx]
+                    block_mask = create_block_mask(doc_mask_mod, B_bm, None, N_bm, N_bm, device=doc_ids.device)
+
+                model_kwargs = dict(y=y, grid=grid.long(), mask=mask, size=size,
+                                    doc_ids=doc_ids, n_pack=n_pack, block_mask=block_mask)
+                if 'feature_fullres' in batch:
+                    model_kwargs['x1_fullres']   = batch['feature_fullres'].to(device=device)
+                    model_kwargs['mask_fullres'] = batch['mask_fullres'].to(device=device)
+                    model_kwargs['size_fullres'] = batch['size_fullres'].to(device=device)
+                with torch.cuda.nvtx.range("forward") if _profiling_active else contextlib.nullcontext():
+                    # forward model and compute loss
+                    with accelerator.autocast():
+                        loss_dict = transport.training_losses(model, x, model_kwargs)
+                loss = loss_dict["loss"].mean()
+                with torch.cuda.nvtx.range("backward") if _profiling_active else contextlib.nullcontext():
+                    # Backpropagate
+                    accelerator.backward(loss)
+                if accelerator.sync_gradients and accelerate_cfg.max_grad_norm > 0.:
+                    all_norm = accelerator.clip_grad_norm_(
+                        model.parameters(), accelerate_cfg.max_grad_norm
+                    )
+                with torch.cuda.nvtx.range("optimizer") if _profiling_active else contextlib.nullcontext():
+                    optimizer.step()
+                lr_scheduler.step()
             # Gather the losses across all processes for logging (if we use distributed training).
             avg_loss = accelerator.gather(loss.repeat(data_cfg.params.train.loader.batch_size)).mean()
             train_loss += avg_loss.item() / grad_accu_steps
