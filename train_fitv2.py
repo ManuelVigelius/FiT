@@ -12,7 +12,7 @@ import diffusers
 from omegaconf import OmegaConf
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, set_seed, FullyShardedDataParallelPlugin
+from accelerate.utils import ProjectConfiguration, set_seed
 from tqdm.auto import tqdm
 from copy import deepcopy
 from fit.scheduler.transport import create_transport
@@ -20,10 +20,8 @@ from fit.utils.utils import (
     instantiate_from_config,
     default,
     get_obj_from_str,
-    update_ema,
-    
+    update_ema
 )
-from fit.utils.eval_utils import init_from_ckpt
 from fit.utils.lr_scheduler import get_scheduler
 
 logger = get_logger(__name__, log_level="INFO")
@@ -166,58 +164,9 @@ def main():
     
     accelerator_project_cfg = ProjectConfiguration(project_dir=workdirnow, logging_dir=logging_dir)
     
-    if getattr(accelerate_cfg, 'fsdp_config', None) != None:
-        import functools
-        from torch.distributed.fsdp.fully_sharded_data_parallel import (
-            BackwardPrefetch, CPUOffload, ShardingStrategy, MixedPrecision, StateDictType, FullStateDictConfig, FullOptimStateDictConfig,
-        )
-        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-        fsdp_cfg = accelerate_cfg.fsdp_config
-        if accelerate_cfg.mixed_precision == "fp16":
-            dtype = torch.float16
-        elif accelerate_cfg.mixed_precision == "bf16":
-            dtype = torch.bfloat16
-        else:
-            dtype = torch.float32   
-        fsdp_plugin = FullyShardedDataParallelPlugin(
-            sharding_strategy = {
-                'FULL_SHARD': ShardingStrategy.FULL_SHARD,
-                'SHARD_GRAD_OP': ShardingStrategy.SHARD_GRAD_OP,
-                'NO_SHARD': ShardingStrategy.NO_SHARD,
-                'HYBRID_SHARD': ShardingStrategy.HYBRID_SHARD,
-                'HYBRID_SHARD_ZERO2': ShardingStrategy._HYBRID_SHARD_ZERO2,
-            }[fsdp_cfg.sharding_strategy],
-            backward_prefetch = {
-                'BACKWARD_PRE': BackwardPrefetch.BACKWARD_PRE,
-                'BACKWARD_POST': BackwardPrefetch.BACKWARD_POST,
-            }[fsdp_cfg.backward_prefetch],
-            mixed_precision_policy = MixedPrecision(
-                param_dtype=dtype,
-                reduce_dtype=dtype,
-            ),
-            auto_wrap_policy = functools.partial(
-                size_based_auto_wrap_policy, min_num_params=fsdp_cfg.min_num_params
-            ),
-            cpu_offload = CPUOffload(offload_params=fsdp_cfg.cpu_offload),
-            state_dict_type = {
-                'FULL_STATE_DICT': StateDictType.FULL_STATE_DICT,
-                'LOCAL_STATE_DICT': StateDictType.LOCAL_STATE_DICT,
-                'SHARDED_STATE_DICT': StateDictType.SHARDED_STATE_DICT
-            }[fsdp_cfg.state_dict_type],
-            state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-            optim_state_dict_config = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
-            limit_all_gathers = fsdp_cfg.limit_all_gathers, # False
-            use_orig_params = fsdp_cfg.use_orig_params, # True
-            sync_module_states = fsdp_cfg.sync_module_states,   #True
-            forward_prefetch = fsdp_cfg.forward_prefetch,   # False
-            activation_checkpointing = fsdp_cfg.activation_checkpointing,   # False
-        )
-    else:
-        fsdp_plugin = None
     accelerator = Accelerator(
         gradient_accumulation_steps=grad_accu_steps,
         mixed_precision=accelerate_cfg.mixed_precision,
-        fsdp_plugin=fsdp_plugin,
         log_with=getattr(accelerate_cfg, 'logger', 'wandb'),
         project_config=accelerator_project_cfg,
     )
@@ -250,17 +199,42 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    packed_cfg = getattr(data_cfg.params.train, 'packed', None)
+    use_packed = packed_cfg is not None and getattr(packed_cfg, 'enabled', False)
+
     if args.scale_lr:
-        learning_rate = (
-            accelerate_cfg.learning_rate * 
-            grad_accu_steps * 
-            data_cfg.params.train.loader.batch_size *   # local batch size per device
-            accelerator.num_processes / accelerate_cfg.learning_rate_base_batch_size    # global batch size
-        )
+        if use_packed:
+            # In packed mode, tokens per step is the meaningful unit, not samples.
+            # Base token count = mean tokens per sample under the resize distribution * base_batch_size.
+            # Valid grids are even values in [min_g, max_g]; each contributes g^2 tokens.
+            resize_range = getattr(data_cfg.params.train, 'resize_range', None)
+            if resize_range is not None:
+                min_g, max_g = resize_range
+                valid_grids = torch.arange(min_g, max_g + 1, 2)
+                mean_tokens_per_sample = (valid_grids ** 2).float().mean().item()
+            else:
+                mean_tokens_per_sample = data_cfg.params.train.target_len
+            learning_rate_base_tokens = mean_tokens_per_sample * accelerate_cfg.learning_rate_base_batch_size
+            tokens_per_step = (
+                packed_cfg.max_tokens *
+                grad_accu_steps *
+                accelerator.num_processes
+            )
+            learning_rate = (
+                accelerate_cfg.learning_rate *
+                tokens_per_step / learning_rate_base_tokens
+            )
+        else:
+            learning_rate = (
+                accelerate_cfg.learning_rate *
+                grad_accu_steps *
+                data_cfg.params.train.loader.batch_size *   # local batch size per device
+                accelerator.num_processes / accelerate_cfg.learning_rate_base_batch_size    # global batch size
+            )
     else:
         learning_rate = accelerate_cfg.learning_rate
 
-    
+
     model = instantiate_from_config(diffusion_cfg.network_config).to(device=device)
     # update ema
     if args.use_ema:
@@ -269,12 +243,6 @@ def main():
             ema_model = deepcopy(model.module).to(device=device)
         else:
             ema_model = deepcopy(model).to(device=device)
-        if getattr(diffusion_cfg, 'pretrain_config', None) != None: # transfer to larger reolution
-            if getattr(diffusion_cfg.pretrain_config, 'ema_ckpt', None) != None:
-                init_from_ckpt(
-                    ema_model, checkpoint_dir=diffusion_cfg.pretrain_config.ema_ckpt, 
-                    ignore_keys=diffusion_cfg.pretrain_config.ignore_keys, verbose=True
-                )
         for p in ema_model.parameters():
             p.requires_grad = False
     
@@ -300,8 +268,7 @@ def main():
     # In packed mode the effective batch size per step is determined by max_tokens,
     # not by loader.batch_size (which is ignored).  We still use loader.batch_size
     # as the global-sampler unit so get_train_sampler draws enough indices.
-    packed_cfg = getattr(data_cfg.params.train, 'packed', None)
-    use_packed = packed_cfg is not None and getattr(packed_cfg, 'enabled', False)
+    # (packed_cfg and use_packed are already defined above for LR scaling.)
     loader_batch_size = data_cfg.params.train.loader.batch_size
     total_batch_size = loader_batch_size * accelerator.num_processes * grad_accu_steps
     global_steps = 0
@@ -338,10 +305,7 @@ def main():
     if accelerator.is_main_process:
         for name, param in model.named_parameters():
             print(name, param.requires_grad)
-    if getattr(diffusion_cfg, 'pretrain_config', None) != None: # transfer to larger reolution     
-        params = filter(lambda p: p.requires_grad, model.parameters())
-    else:
-        params = list(model.parameters())
+    params = list(model.parameters())
     optimizer_cfg = default(
         accelerate_cfg.optimizer, {"target": "torch.optim.AdamW"}
     )

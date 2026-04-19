@@ -47,6 +47,10 @@ class IN1kLatentDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
+        if isinstance(idx, tuple):
+            idx, override_g = idx
+        else:
+            override_g = None
         if self.random == 'random':
             path = random.choice(self.files[idx])
         elif self.random == 'resize':
@@ -73,7 +77,7 @@ class IN1kLatentDataset(Dataset):
         if self.resize_range is not None:
             min_g, max_g = self.resize_range
             valid = list(range(min_g, max_g + 1, 2))
-            new_g = random.choice(valid)
+            new_g = override_g if override_g is not None else random.choice(valid)
             if new_g != H_g:
                 # Unpatchify: (H_g, W_g, p²C) → (H_g*p, W_g*p, C)
                 feat_latent = rearrange(feat_hw.float(),
@@ -132,9 +136,12 @@ class TokenBudgetBatchSampler(BatchSampler):
     within *max_tokens*.
 
     Token counts are pre-computed without touching the dataset files: each
-    sample's sequence length is drawn from the same uniform distribution used
-    in IN1kLatentDataset.__getitem__ (resize_range → H_g*W_g), seeded
+    sample's grid size is drawn from the same uniform distribution used in
+    IN1kLatentDataset.__getitem__ (resize_range → H_g*W_g), seeded
     deterministically so the lengths are reproducible across restarts.
+    The pre-sampled grid size is encoded into the yielded indices as
+    (dataset_idx, grid_size) tuples so that __getitem__ uses the same draw
+    instead of re-sampling independently.
 
     Args:
         sampler:        A flat sequence of dataset indices (pre-shuffled by
@@ -155,22 +162,26 @@ class TokenBudgetBatchSampler(BatchSampler):
         self.max_tokens = max_tokens
         self.pad_to_multiple = pad_to_multiple
 
-        # Pre-compute a seq_len for every position in the sampler list.
+        # Pre-compute a grid size and seq_len for every position in the sampler list.
+        # The grid size is also encoded into the yielded index tuples so that
+        # __getitem__ uses the same draw rather than re-sampling independently.
         if resize_range is not None:
             min_g, max_g = resize_range
             valid = list(range(min_g, max_g + 1, 2))
             rng = random.Random(seed)
-            self._lengths = [rng.choice(valid) ** 2 for _ in sampler]
+            self._grid_sizes = [rng.choice(valid) for _ in sampler]
+            self._lengths = [g ** 2 for g in self._grid_sizes]
         else:
+            self._grid_sizes = [None] * len(sampler)
             self._lengths = [target_len] * len(sampler)
 
     def __iter__(self):
         batch, total = [], 0
-        for idx, length in zip(self.sampler, self._lengths):
+        for idx, grid_size, length in zip(self.sampler, self._grid_sizes, self._lengths):
             if batch and total + length > self.max_tokens:
                 yield batch
                 batch, total = [], 0
-            batch.append(idx)
+            batch.append((idx, grid_size))
             total += length
         if batch:
             yield batch
@@ -242,8 +253,6 @@ def packed_collate_fn(samples, pad_to_multiple: int = 128):
         n_pack=torch.tensor([n_pack], dtype=torch.int32),
     )
 
-
-# from https://github.com/Alpha-VLLM/LLaMA2-Accessory/blob/main/Large-DiT-ImageNet/train.py#L60
 
 # from https://github.com/Alpha-VLLM/LLaMA2-Accessory/blob/main/Large-DiT-ImageNet/train.py#L60
 def get_train_sampler(dataset, global_batch_size, max_steps, resume_steps, seed):

@@ -57,7 +57,6 @@ class FiT(nn.Module):
         pretrain_ckpt: str = None,
         ignore_keys: list = None,
         finetune: str = None,
-        time_shifting: int = 1,
         use_size_cond: bool = False,
         use_upsampler: bool = False,
         **kwargs,
@@ -79,7 +78,6 @@ class FiT(nn.Module):
         self.num_heads = num_heads
         self.adaln_type = adaln_type
         self.online_rope = online_rope
-        self.time_shifting = time_shifting
 
         self.x_embedder = PatchEmbedder(in_channels * patch_size**2, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -237,12 +235,8 @@ class FiT(nn.Module):
             # ---- Packed path ------------------------------------------------
             # t and y are (B, max_n_pack); embed each, then expand to per-token.
             max_n_pack = t.shape[1]
-            t_flat = t.reshape(B * max_n_pack)
+            t_flat = t.reshape(B * max_n_pack).to(x.dtype)
             y_flat = y.reshape(B * max_n_pack).to(torch.int)
-
-            t_flat = torch.clamp(
-                self.time_shifting * t_flat / (1 + (self.time_shifting - 1) * t_flat), max=1.0
-            ).float().to(x.dtype)
 
             t_emb = self.t_embedder(t_flat).reshape(B, max_n_pack, D)   # (B, P, D)
             y_emb = self.y_embedder(y_flat, self.training).reshape(B, max_n_pack, D)
@@ -269,9 +263,7 @@ class FiT(nn.Module):
                 global_adaln = 0.0
         else:
             # ---- Original (unpacked) path -----------------------------------
-            t = torch.clamp(
-                self.time_shifting * t / (1 + (self.time_shifting - 1) * t), max=1.0
-            ).float().to(x.dtype)
+            t = t.to(x.dtype)
             t_emb = self.t_embedder(t)                                    # (B, D)
             y_emb = self.y_embedder(y, self.training)                     # (B, D)
             c = t_emb + y_emb                                             # (B, D)
@@ -352,7 +344,6 @@ class FiT(nn.Module):
             )*1/2 # power-cos scaling 
             real_cfg_scale = (cfg_scale-1)*scale_step + 1
             real_cfg_scale = real_cfg_scale[: len(x) // 2].view(-1, 1, 1)
-        t = t / (self.time_shifting + (1 - self.time_shifting) * t)
         half_eps = uncond_eps + real_cfg_scale * (cond_eps - uncond_eps)    # (B, ...)
         eps = torch.cat([half_eps, half_eps], dim=0)    # (B, ...) -> (2B, ...)
         if self.use_sit:
