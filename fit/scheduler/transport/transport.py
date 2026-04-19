@@ -210,13 +210,54 @@ class Transport:
         model_output = model(xt, t, **model_kwargs)
         return xt, ut, t, model_output, sigma_inj
 
+    def _mean_per_image(self, sq_err, doc_ids, model_kwargs, x1):
+        """Average squared error per image, then average over images.
+
+        Unpacked (doc_ids is None): apply mask, mean_flat over (N, C) then * ratio,
+        which already normalises by the number of valid tokens per image.
+
+        Packed (doc_ids is not None): for each image in each pack slot we sum
+        the per-token errors and divide by that image's token count, giving
+        every image equal weight regardless of resolution.
+        """
+        if doc_ids is None:
+            mask_b, ratio = get_flexible_mask_and_ratio(model_kwargs, x1)
+            return mean_flat(sq_err * mask_b) * ratio
+
+        # sq_err: (B, N_total, C)  doc_ids: (B, N_total)  values: image-index or -1 for padding
+        n_pack_per_elem = model_kwargs['n_pack']          # (B,)
+        max_n_pack = int(n_pack_per_elem.max())
+        B = x1.shape[0]
+        device = x1.device
+
+        # Mean over C dim first → (B, N_total)
+        sq_err_mean_c = sq_err.mean(dim=-1)
+
+        # Accumulate sum and count per image slot using scatter_add
+        safe_ids = doc_ids.clamp(min=0)                   # (B, N_total)
+        valid = (doc_ids >= 0).float()                     # (B, N_total)
+
+        token_sum   = torch.zeros(B, max_n_pack, device=device, dtype=sq_err.dtype)
+        token_count = torch.zeros(B, max_n_pack, device=device, dtype=sq_err.dtype)
+        token_sum.scatter_add_(1, safe_ids, sq_err_mean_c * valid)
+        token_count.scatter_add_(1, safe_ids, valid)
+
+        # per-image mean; guard against empty slots (count == 0)
+        per_image = token_sum / token_count.clamp(min=1)   # (B, max_n_pack)
+
+        # Average over the valid image slots in each batch element
+        n_images = n_pack_per_elem.float().to(device)      # (B,)
+        slot_mask = (torch.arange(max_n_pack, device=device)[None] < n_images[:, None]).float()
+        loss_per_batch = (per_image * slot_mask).sum(dim=1) / n_images  # (B,)
+        return loss_per_batch
+
     def _loss_a(self, x1, x0, xt, ut, t, model_output,
                 doc_ids, t_expanded, sigma_t, model_kwargs):
         """Standard velocity / noise / score loss (all resolutions, packed and unpacked)."""
-        mask, ratio = get_flexible_mask_and_ratio(model_kwargs, x1)
         terms = {}
         if self.model_type == ModelType.VELOCITY:
-            terms['loss'] = mean_flat((((model_output - ut) * mask) ** 2)) * ratio
+            sq_err = (model_output - ut) ** 2
+            terms['loss'] = self._mean_per_image(sq_err, doc_ids, model_kwargs, x1)
         else:
             if doc_ids is not None:
                 # ICPlan-specific: alpha_t=t, sigma_t=1-t, d_alpha=1, d_sigma=-1.
@@ -238,9 +279,10 @@ class Transport:
                 raise NotImplementedError()
 
             if self.model_type == ModelType.NOISE:
-                terms['loss'] = mean_flat(weight * (((model_output - x0) * mask) ** 2)) * ratio
+                sq_err = weight * (model_output - x0) ** 2
             else:
-                terms['loss'] = mean_flat(weight * (((model_output * sigma_t_val + x0) * mask) ** 2)) * ratio
+                sq_err = weight * (model_output * sigma_t_val + x0) ** 2
+            terms['loss'] = self._mean_per_image(sq_err, doc_ids, model_kwargs, x1)
         return terms
 
     def _loss_b(self, x1_fullres, xt, t, sigma_inj, model_output, model_kwargs):
