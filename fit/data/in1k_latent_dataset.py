@@ -214,6 +214,11 @@ def packed_collate_fn(samples, pad_to_multiple: int = 128):
         label    (1, n_pack)          — class labels
         size     (1, n_pack, 2)       — (h, w) per image
         n_pack   (1,)                 — number of images packed
+    Also propagates full-res fields when present (return_fullres=True):
+        feature_fullres  (1, N_total_fr, 16)
+        mask_fullres     (1, N_total_fr)
+        doc_ids_fr       (1, N_total_fr)  — image index for full-res tokens, -1 for padding
+        size_fullres     (1, n_pack, 2)   — (H_fr, W_fr) per image
     """
     def _seq_len(s):
         return int(s['mask'].sum())
@@ -243,7 +248,7 @@ def packed_collate_fn(samples, pad_to_multiple: int = 128):
         size_batch[0, img_idx]                 = s['size'].squeeze(0)
         offset += slen
 
-    return dict(
+    result = dict(
         feature=feat_batch,
         grid=grid_batch,
         mask=mask_batch,
@@ -252,6 +257,32 @@ def packed_collate_fn(samples, pad_to_multiple: int = 128):
         size=size_batch,
         n_pack=torch.tensor([n_pack], dtype=torch.int32),
     )
+
+    # Propagate full-res fields when the dataset was built with return_fullres=True.
+    if 'feature_fullres' in samples[0]:
+        raw_len_fr = sum(int(s['mask_fullres'].sum()) for s in samples)
+        N_total_fr = math.ceil(raw_len_fr / pad_to_multiple) * pad_to_multiple
+
+        feat_fr_batch = torch.zeros(1, N_total_fr, 16, dtype=dtype_feat)
+        mask_fr_batch = torch.zeros(1, N_total_fr, dtype=torch.uint8)
+        doc_fr_batch  = torch.full((1, N_total_fr), -1, dtype=torch.int32)
+        size_fr_batch = torch.zeros(1, n_pack, 2, dtype=torch.int32)
+
+        offset_fr = 0
+        for img_idx, s in enumerate(samples):
+            slen_fr = int(s['mask_fullres'].sum())
+            feat_fr_batch[0, offset_fr:offset_fr + slen_fr] = s['feature_fullres'][:slen_fr]
+            mask_fr_batch[0, offset_fr:offset_fr + slen_fr] = 1
+            doc_fr_batch[0, offset_fr:offset_fr + slen_fr]  = img_idx
+            size_fr_batch[0, img_idx]                        = s['size_fullres'].squeeze(0)
+            offset_fr += slen_fr
+
+        result['feature_fullres'] = feat_fr_batch  # (1, N_total_fr, 16)
+        result['mask_fullres']    = mask_fr_batch  # (1, N_total_fr)
+        result['doc_ids_fr']      = doc_fr_batch   # (1, N_total_fr)
+        result['size_fullres']    = size_fr_batch  # (1, n_pack, 2)
+
+    return result
 
 
 # from https://github.com/Alpha-VLLM/LLaMA2-Accessory/blob/main/Large-DiT-ImageNet/train.py#L60

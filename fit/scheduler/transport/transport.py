@@ -9,6 +9,24 @@ from . import path
 from .utils import mean_flat, get_flexible_mask_and_ratio
 from .integrators import ode, sde
 
+
+def _spatial_resize(x, H, W, H_out, W_out, p=2, C=4):
+    """Bilinear resize of a patchified token sequence.
+
+    Args:
+        x:          (N, p²·C) token sequence
+        H, W:       input grid dims
+        H_out, W_out: output grid dims
+        p, C:       patch size and VAE channel count
+    Returns:
+        (N_out, p²·C) token sequence
+    """
+    sp = rearrange(x, '(h w) (p1 p2 c) -> 1 c (h p1) (w p2)',
+                   h=H, w=W, p1=p, p2=p, c=C)
+    sp = F.interpolate(sp.float(), size=(H_out * p, W_out * p),
+                       mode='bilinear', align_corners=True).to(x.dtype)
+    return rearrange(sp, '1 c (h p1) (w p2) -> (h w) (p1 p2 c)', p1=p, p2=p)
+
 class ModelType(enum.Enum):
     """
     Which type of output the model predicts.
@@ -280,58 +298,154 @@ class Transport:
 
         Fully self-contained: does its own sampling so xt_lr is always the
         bilinear downsample of xt_fr, eliminating any cross-resolution leakage.
+        Supports both unpacked (doc_ids is None) and packed (doc_ids is not None) modes.
         """
         p = 2; C_in = 4
-        size_lr = model_kwargs['size']          # (B, 1, 2)
-        size_fr = model_kwargs['size_fullres']  # (B, 1, 2)
-        H_lr = int(size_lr[0, 0, 0]); W_lr = int(size_lr[0, 0, 1])
-        H_fr = int(size_fr[0, 0, 0]); W_fr = int(size_fr[0, 0, 1])
+        doc_ids    = model_kwargs.get('doc_ids', None)
+        doc_ids_fr = model_kwargs.get('doc_ids_fr', None)
 
-        # 1. Sample full-res noise and timestep
-        t_c, x0_fr, _ = self.sample(x1_fullres)
-        t_exp = t_c.view(-1, 1, 1)
+        if doc_ids is None:
+            # ── Unpacked path ─────────────────────────────────────────────────
+            size_lr = model_kwargs['size']          # (B, 1, 2)
+            size_fr = model_kwargs['size_fullres']  # (B, 1, 2)
+            H_lr = int(size_lr[0, 0, 0]); W_lr = int(size_lr[0, 0, 1])
+            H_fr = int(size_fr[0, 0, 0]); W_fr = int(size_fr[0, 0, 1])
 
-        # 2. Full-res noisy sample (ICPlan: xt = t*x1 + (1-t)*x0)
-        xt_fr = t_exp * x1_fullres + (1 - t_exp) * x0_fr    # (B, N_fr, 16)
+            # 1. Sample full-res noise and timestep
+            t_c, x0_fr, _ = self.sample(x1_fullres)
+            t_exp = t_c.view(-1, 1, 1)
 
-        # 3. Low-res noisy sample by bilinearly downsampling xt_fr.
-        # This makes xt_lr = bilinear_downsample(xt_fr) an exact identity,
-        # matching inference and eliminating any exploitable statistical leakage.
-        xt_fr_sp = rearrange(xt_fr, 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
-                             h=H_fr, w=W_fr, p1=p, p2=p, c=C_in)
-        xt_lr_sp = F.interpolate(xt_fr_sp.float(), size=(H_lr * p, W_lr * p),
-                                 mode='bilinear', align_corners=True).to(xt_fr.dtype)
-        xt_lr = rearrange(xt_lr_sp, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',
-                          p1=p, p2=p)                         # (B, N_lr, 16)
+            # 2. Full-res noisy sample (ICPlan: xt = t*x1 + (1-t)*x0)
+            xt_fr = t_exp * x1_fullres + (1 - t_exp) * x0_fr    # (B, N_fr, 16)
 
-        # 4. FiT transformer at low resolution
-        lr_kwargs = {k: v for k, v in model_kwargs.items()
-                     if k not in ('x1_fullres', 'mask_fullres', 'size_fullres')}
-        model_out_lr = model(xt_lr, t_c, **lr_kwargs)        # (B, N_lr, 16)
+            # 3. Low-res noisy sample by bilinearly downsampling xt_fr.
+            xt_fr_sp = rearrange(xt_fr, 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
+                                 h=H_fr, w=W_fr, p1=p, p2=p, c=C_in)
+            xt_lr_sp = F.interpolate(xt_fr_sp.float(), size=(H_lr * p, W_lr * p),
+                                     mode='bilinear', align_corners=True).to(xt_fr.dtype)
+            xt_lr = rearrange(xt_lr_sp, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',
+                              p1=p, p2=p)                         # (B, N_lr, 16)
 
-        # 5. Recover predicted clean latent and convert to spatial
-        x1_lr_hat = xt_lr + (1 - t_exp) * model_out_lr      # (B, N_lr, 16)
-        x1_lr_sp  = rearrange(x1_lr_hat,
-                              'b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
-                              h=H_lr, w=W_lr, p1=p, p2=p, c=C_in)
+            # 4. FiT transformer at low resolution
+            lr_kwargs = {k: v for k, v in model_kwargs.items()
+                         if k not in ('x1_fullres', 'mask_fullres', 'size_fullres',
+                                      'doc_ids_fr')}
+            model_out_lr = model(xt_lr, t_c, **lr_kwargs)        # (B, N_lr, 16)
 
-        # 6. Bilinear upsample to full-res spatial size
-        x1_lr_up = F.interpolate(x1_lr_sp.float(), size=(H_fr * p, W_fr * p),
-                                 mode='bilinear', align_corners=True).to(xt_lr.dtype)
+            # 5. Recover predicted clean latent and convert to spatial
+            x1_lr_hat = xt_lr + (1 - t_exp) * model_out_lr      # (B, N_lr, 16)
+            x1_lr_sp  = rearrange(x1_lr_hat,
+                                  'b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
+                                  h=H_lr, w=W_lr, p1=p, p2=p, c=C_in)
 
-        # 7. ResNet predicts full-res velocity (spatial)
-        v_fr_sp = model.upsampler(x1_lr_up, xt_fr_sp)        # (B, 4, sp_fr, sp_fr)
+            # 6. Bilinear upsample to full-res spatial size
+            x1_lr_up = F.interpolate(x1_lr_sp.float(), size=(H_fr * p, W_fr * p),
+                                     mode='bilinear', align_corners=True).to(xt_lr.dtype)
 
-        # 8. Re-patchify to token sequence
-        v_fr = rearrange(v_fr_sp, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',
-                         p1=p, p2=p)                          # (B, N_fr, 16)
+            # 7. ResNet predicts full-res velocity (spatial)
+            v_fr_sp = model.upsampler(x1_lr_up, xt_fr_sp)        # (B, 4, sp_fr, sp_fr)
 
-        # 9. Velocity target and MSE loss over valid full-res tokens
-        ut_fr = x1_fullres - x0_fr                           # (B, N_fr, 16)
-        mask_fr, ratio_fr = get_flexible_mask_and_ratio(
-            {'mask': model_kwargs['mask_fullres']}, x1_fullres
-        )
-        return {'loss': mean_flat(((v_fr - ut_fr) * mask_fr) ** 2) * ratio_fr}
+            # 8. Re-patchify to token sequence
+            v_fr = rearrange(v_fr_sp, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',
+                             p1=p, p2=p)                          # (B, N_fr, 16)
+
+            # 9. Velocity target and MSE loss over valid full-res tokens
+            ut_fr = x1_fullres - x0_fr                           # (B, N_fr, 16)
+            mask_fr, ratio_fr = get_flexible_mask_and_ratio(
+                {'mask': model_kwargs['mask_fullres']}, x1_fullres
+            )
+            return {'loss': mean_flat(((v_fr - ut_fr) * mask_fr) ** 2) * ratio_fr}
+
+        else:
+            # ── Packed path ───────────────────────────────────────────────────
+            # B=1 always in packed mode; n_pack images are concatenated.
+            n_pack = int(model_kwargs['n_pack'][0])
+            size_lr = model_kwargs['size']          # (1, n_pack, 2)
+            size_fr = model_kwargs['size_fullres']  # (1, n_pack, 2)
+            device  = x1_fullres.device
+
+            # 1. Sample per-image timesteps (same distribution as _forward_packed)
+            t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
+            if self.snr_type == SNRType.UNIFORM:
+                t_per_image = torch.rand((1, n_pack), device=device) * (t1 - t0) + t0
+            elif self.snr_type == SNRType.LOGNORM:
+                u = torch.normal(mean=0.0, std=1.0, size=(1, n_pack), device=device)
+                t_per_image = 1 / (1 + torch.exp(-u)) * (t1 - t0) + t0
+            else:
+                raise ValueError(f"Unknown snr type: {self.snr_type}")
+            t_per_image = t_per_image.to(x1_fullres)  # (1, n_pack)
+
+            # 2. Build per-token fullres xt using per-image t
+            safe_fr      = doc_ids_fr.clamp(min=0)                 # (1, N_total_fr)
+            t_token_fr   = t_per_image[0, safe_fr[0]]              # (N_total_fr,)
+            valid_fr     = (doc_ids_fr[0] >= 0).to(x1_fullres)
+            t_exp_fr     = (t_token_fr * valid_fr).view(1, -1, 1)  # (1, N_total_fr, 1)
+
+            x0_fr  = torch.randn_like(x1_fullres)                  # (1, N_total_fr, 16)
+            xt_fr  = t_exp_fr * x1_fullres + (1 - t_exp_fr) * x0_fr
+
+            # 3. Build packed low-res xt by downsampling xt_fr per image and
+            #    placing results into the existing packed low-res sequence slots.
+            xt_lr_packed = torch.zeros_like(model_kwargs['feature']) # (1, N_total_lr, 16)
+            for i in range(n_pack):
+                H_fr_i = int(size_fr[0, i, 0]); W_fr_i = int(size_fr[0, i, 1])
+                H_lr_i = int(size_lr[0, i, 0]); W_lr_i = int(size_lr[0, i, 1])
+
+                mask_fr_i  = (doc_ids_fr[0] == i)                  # (N_total_fr,)
+                xt_fr_i    = xt_fr[0, mask_fr_i]                   # (N_fr_i, 16)
+                xt_lr_i    = _spatial_resize(xt_fr_i, H_fr_i, W_fr_i, H_lr_i, W_lr_i, p, C_in)
+
+                mask_lr_i  = (doc_ids[0] == i)                     # (N_total_lr,)
+                xt_lr_packed[0, mask_lr_i] = xt_lr_i
+
+            # 4. FiT forward in packed mode (reuses block_mask from model_kwargs)
+            lr_kwargs = {k: v for k, v in model_kwargs.items()
+                         if k not in ('x1_fullres', 'mask_fullres', 'size_fullres',
+                                      'doc_ids_fr', 'n_pack')}
+            model_out_lr = model(xt_lr_packed, t_per_image, **lr_kwargs)  # (1, N_total_lr, 16)
+
+            # 5. Per-image: recover x1_lr_hat, upsample, run ResNet, compute loss
+            losses = []
+            for i in range(n_pack):
+                H_fr_i = int(size_fr[0, i, 0]); W_fr_i = int(size_fr[0, i, 1])
+                H_lr_i = int(size_lr[0, i, 0]); W_lr_i = int(size_lr[0, i, 1])
+                t_i    = t_per_image[0, i]
+
+                mask_lr_i   = (doc_ids[0] == i)
+                xt_lr_i     = xt_lr_packed[0, mask_lr_i]            # (N_lr_i, 16)
+                v_lr_i      = model_out_lr[0, mask_lr_i]            # (N_lr_i, 16)
+                x1_lr_hat_i = xt_lr_i + (1 - t_i) * v_lr_i         # (N_lr_i, 16)
+
+                # Upsample predicted clean LR latent to full-res spatial
+                x1_lr_sp_i = rearrange(x1_lr_hat_i,
+                                       '(h w) (p1 p2 c) -> 1 c (h p1) (w p2)',
+                                       h=H_lr_i, w=W_lr_i, p1=p, p2=p, c=C_in)
+                x1_lr_up_i = F.interpolate(x1_lr_sp_i.float(), size=(H_fr_i * p, W_fr_i * p),
+                                           mode='bilinear', align_corners=True).to(xt_lr_packed.dtype)
+
+                # Full-res noisy input for ResNet conditioning
+                mask_fr_i  = (doc_ids_fr[0] == i)
+                xt_fr_i    = xt_fr[0, mask_fr_i]                    # (N_fr_i, 16)
+                xt_fr_sp_i = rearrange(xt_fr_i,
+                                       '(h w) (p1 p2 c) -> 1 c (h p1) (w p2)',
+                                       h=H_fr_i, w=W_fr_i, p1=p, p2=p, c=C_in)
+
+                # ResNet predicts full-res velocity
+                v_fr_sp_i  = model.upsampler(x1_lr_up_i, xt_fr_sp_i)  # (1, 4, H_sp, W_sp)
+                v_fr_i     = rearrange(v_fr_sp_i,
+                                       '1 c (h p1) (w p2) -> (h w) (p1 p2 c)',
+                                       p1=p, p2=p)                  # (N_fr_i, 16)
+
+                # Velocity target for this image
+                x1_fr_i = x1_fullres[0, mask_fr_i]                  # (N_fr_i, 16)
+                x0_fr_i = x0_fr[0, mask_fr_i]                       # (N_fr_i, 16)
+                ut_fr_i = x1_fr_i - x0_fr_i
+
+                losses.append((v_fr_i - ut_fr_i).pow(2).mean())
+
+            # Average over images, giving equal weight regardless of resolution.
+            # Return shape (1,) to match what training_losses expects from .mean().
+            return {'loss': torch.stack(losses).mean().unsqueeze(0)}
 
     def training_losses(self, model, x1, model_kwargs=None):
         """Loss for training the score model.
@@ -347,7 +461,8 @@ class Transport:
         x1_fullres = model_kwargs.get('x1_fullres', None)
 
         # Loss C is fully self-contained (its own sampling, no shared forward pass).
-        if self.multires_loss == 'C' and x1_fullres is not None and doc_ids is None:
+        # Handles both unpacked (doc_ids is None) and packed (doc_ids is not None) modes.
+        if self.multires_loss == 'C' and x1_fullres is not None:
             terms = self._loss_c(model, x1_fullres, model_kwargs)
             terms['pred'] = None
             return terms
