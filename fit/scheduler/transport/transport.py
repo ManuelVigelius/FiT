@@ -175,41 +175,6 @@ class Transport:
         model_output = model(xt, t_per_image, **model_kwargs_fwd)
         return xt, ut, model_output, t_expanded, sigma_t, x0
 
-    def _forward_unpacked(self, model, x1, model_kwargs):
-        """Run the standard (single-image) forward pass with optional noise correction.
-
-        Corrects noise magnitude for downsampled observations so the effective SNR
-        seen by the model after bilinear downsampling matches the sampled timestep t.
-        The formula inverts:
-            sigma_eff = r * sigma / ((1 - sigma) + r * sigma)
-        to find the injection sigma that produces the target sigma after downsampling.
-        t is still passed to the model's timestep embedding; only xt uses sigma_inj.
-
-        Returns (xt, ut, t, model_output, sigma_inj) where sigma_inj is None when
-        no correction was applied (r == 1 or no full-res counterpart present).
-        """
-        t, x0, x1 = self.sample(x1)
-
-        sigma_inj = None
-        x1_fullres = model_kwargs.get('x1_fullres', None)
-        if x1_fullres is not None and model_kwargs.get('size_fullres') is not None:
-            size_lr = model_kwargs['size']          # (B, 1, 2)
-            size_fr = model_kwargs['size_fullres']  # (B, 1, 2)
-            H_lr = int(size_lr[0, 0, 0]); H_fr = int(size_fr[0, 0, 0])
-            r = H_lr / H_fr                         # downsampling ratio (≤ 1)
-            if r < 1.0:
-                sigma     = 1.0 - t                                 # (B,) target sigma
-                sigma_inj = sigma / (r + sigma * (1.0 - r))         # (B,) injection sigma
-                xt = (1.0 - sigma_inj).view(-1, 1, 1) * x1 + sigma_inj.view(-1, 1, 1) * x0
-                ut = x1 - x0                        # velocity target unchanged
-            else:
-                t, xt, ut = self.path_sampler.plan(t, x0, x1)
-        else:
-            t, xt, ut = self.path_sampler.plan(t, x0, x1)
-
-        model_output = model(xt, t, **model_kwargs)
-        return xt, ut, t, model_output, sigma_inj
-
     def _mean_per_image(self, sq_err, doc_ids, model_kwargs, x1):
         """Average squared error per image, then average over images.
 
@@ -285,13 +250,11 @@ class Transport:
             terms['loss'] = self._mean_per_image(sq_err, doc_ids, model_kwargs, x1)
         return terms
 
-    def _loss_b(self, x1_fullres, xt, t, sigma_inj, model_output, model_kwargs):
+    def _loss_b(self, x1_fullres, xt, t, model_output, model_kwargs):
         """Loss B: predict clean low-res, upsample, compare to full-res target."""
         p = 2; C_in = 4
-        # For ICPlan: x1_hat = xt + sigma_inj * v_pred.
-        # When noise correction is active sigma_inj != 1-t, so we must use
-        # the actual noise coefficient used to form xt, not the embedding t.
-        _sigma = sigma_inj if sigma_inj is not None else (1.0 - t)
+        # For ICPlan: x1_hat = xt + (1-t) * v_pred.
+        _sigma = 1.0 - t
         x1_hat = xt + _sigma.view(-1, 1, 1) * model_output   # (B, N_lr, 16)
         size_lr = model_kwargs['size']                        # (B, 1, 2)
         size_fr = model_kwargs['size_fullres']                # (B, 1, 2)
@@ -390,13 +353,14 @@ class Transport:
             return terms
 
         # Run the appropriate forward pass.
-        t_expanded = sigma_t = sigma_inj = None
+        t_expanded = sigma_t = None
         if doc_ids is not None:
             xt, ut, model_output, t_expanded, sigma_t, x0 = self._forward_packed(model, x1, model_kwargs)
             t = None
         else:
-            xt, ut, t, model_output, sigma_inj = self._forward_unpacked(model, x1, model_kwargs)
-            x0 = None   # recovered from xt/ut when needed by _loss_a
+            t, x0, x1 = self.sample(x1)
+            t, xt, ut = self.path_sampler.plan(t, x0, x1)
+            model_output = model(xt, t, **model_kwargs)
 
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
@@ -404,13 +368,8 @@ class Transport:
         terms = {'pred': model_output}
 
         if self.multires_loss == 'B' and x1_fullres is not None and doc_ids is None:
-            terms.update(self._loss_b(x1_fullres, xt, t, sigma_inj, model_output, model_kwargs))
+            terms.update(self._loss_b(x1_fullres, xt, t, model_output, model_kwargs))
         else:
-            # Recover x0 for Loss A in the unpacked case (xt = (1-sigma)*x1 + sigma*x0
-            # → x0 = (xt - (1-sigma)*x1) / sigma, but it's simpler to re-derive from ut).
-            # In the unpacked path x0 = x1 - ut; in the packed path x0 is already available.
-            if doc_ids is None:
-                x0 = x1 - ut
             terms.update(self._loss_a(x1, x0, xt, ut, t, model_output,
                                       doc_ids, t_expanded, sigma_t, model_kwargs))
 

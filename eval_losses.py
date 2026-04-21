@@ -353,7 +353,7 @@ def evaluate_at_compression(
                 # ── Loss A/B path ────────────────────────────────────────────
                 xt_padded = torch.zeros(B, TARGET_LEN, 16, dtype=x1_lr.dtype, device=device)
                 xt_padded[:, :seq_lr] = xt_lr_valid
-                v_pred_lr = model(xt_padded, t, **model_kwargs)[:, :seq_lr, :]
+                v_pred_lr = model(xt_padded, 1 - sigma_inj, **model_kwargs)[:, :seq_lr, :]
 
                 ut_lr = x1_lr - x0_lr                                # (B, seq_lr, 16)
 
