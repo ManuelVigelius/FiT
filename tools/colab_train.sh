@@ -5,12 +5,12 @@
 
 set -e
 
-LOSS="${1:?Usage: colab_train.sh [A|B|C] [DRIVE_BASE]}"
+LOSS="${1:?Usage: colab_train.sh [A|B|C|W] [DRIVE_BASE]}"
 DRIVE_BASE="${2:-/content/drive/MyDrive/FiT}"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "=== FiT Colab Training Setup ==="
-echo "Loss variant : ${LOSS^^}"
+echo "Loss variant : ${LOSS^^}  (W = new-layers warmup before C)"
 echo "Drive base   : $DRIVE_BASE"
 echo "Repo dir     : $REPO_DIR"
 
@@ -18,7 +18,8 @@ case "${LOSS^^}" in
   A) CONFIG="configs/fitv2/config_fitv2_xl_colab_a.yaml" ;;
   B) CONFIG="configs/fitv2/config_fitv2_xl_colab_b.yaml" ;;
   C) CONFIG="configs/fitv2/config_fitv2_xl_colab_c.yaml" ;;
-  *) echo "Unknown loss variant '${LOSS}'. Must be A, B, or C."; exit 1 ;;
+  W) CONFIG="configs/fitv2/config_fitv2_xl_colab_warmup.yaml" ;;
+  *) echo "Unknown loss variant '${LOSS}'. Must be A, B, C, or W."; exit 1 ;;
 esac
 
 PROJECT="fitv2_xl_colab_${LOSS,,}"
@@ -69,6 +70,13 @@ cd "$REPO_DIR"
 # Persist the torch.compile / Inductor kernel cache across sessions to avoid
 # re-paying the max-autotune warmup cost each time.
 export TORCHINDUCTOR_CACHE_DIR="$DRIVE_BASE/inductor_cache"
+
+# W variant: only train size_embedder + upsampler, freeze the rest.
+EXTRA_FLAGS=""
+if [ "${LOSS^^}" = "W" ]; then
+  EXTRA_FLAGS="--freeze_new_layers"
+fi
+
 torchrun --nnodes 1 --nproc_per_node 1 \
   train_fitv2.py \
     --project_name "$PROJECT" \
@@ -76,7 +84,8 @@ torchrun --nnodes 1 --nproc_per_node 1 \
     --cfgdir "$CONFIG" \
     --seed 0 --scale_lr --allow_tf32 \
     --resume_from_checkpoint latest \
-    --use_ema
+    --use_ema \
+    $EXTRA_FLAGS
 
 # --- Save workdir back to Drive as compressed archive ---
 echo ""

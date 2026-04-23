@@ -111,6 +111,16 @@ def parse_args():
         help="The decay rate for ema."
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+        "--freeze_new_layers",
+        action="store_true",
+        default=False,
+        help=(
+            "Freeze all parameters except the new layers added for size conditioning "
+            "(size_embedder) and the Loss C upsampler (upsampler). Use this for a "
+            "warmup phase before full fine-tuning."
+        ),
+    )
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -301,11 +311,21 @@ def main():
         pad_to_multiple=getattr(packed_cfg, 'pad_to_multiple', 128) if use_packed else 128,
     )
 
+    # Warmup phase: freeze everything except the newly-added layers.
+    # Run this before building the optimizer so only trainable params are included.
+    if args.freeze_new_layers:
+        new_layer_names = ['size_embedder', 'upsampler']
+        unwrapped = accelerator.unwrap_model(model)
+        unwrapped.finetune(type='partial', unfreeze=new_layer_names)
+        if accelerator.is_main_process:
+            trainable = [n for n, p in unwrapped.named_parameters() if p.requires_grad]
+            logger.info(f"freeze_new_layers: training only {trainable}")
+
     # Setup optimizer and lr_scheduler
     if accelerator.is_main_process:
         for name, param in model.named_parameters():
             print(name, param.requires_grad)
-    params = list(model.parameters())
+    params = [p for p in model.parameters() if p.requires_grad]
     optimizer_cfg = default(
         accelerate_cfg.optimizer, {"target": "torch.optim.AdamW"}
     )

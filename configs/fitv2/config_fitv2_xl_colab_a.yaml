@@ -60,7 +60,7 @@ data:
       return_fullres: false
       packed:
         enabled: true
-        max_tokens: 4096
+        max_tokens: 8192
         pad_to_multiple: 128
       loader:
         batch_size: 4

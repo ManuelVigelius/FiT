@@ -7,7 +7,7 @@ diffusion:
     sample_eps: null
     train_eps: null
     snr_type: lognorm
-    multires_loss: 'B'   # bilinear upsample of low-res output → full-res velocity loss
+    multires_loss: 'C'   # FiT at low-res → ResNet upsample → full-res velocity loss
   sampler:
     mode: ODE
     sde:
@@ -47,6 +47,7 @@ diffusion:
       adaln_type: lora
       adaln_lora_dim: 288
       use_size_cond: true
+      use_upsampler: true      # ResNetUpsampler for Loss C
       pretrain_ckpt: checkpoints/fitv2_xl.safetensors
 
 data:
@@ -57,7 +58,7 @@ data:
       target_len: 256
       random: 'crop'
       resize_range: [1, 16]
-      return_fullres: true     # required for Loss B
+      return_fullres: true     # required for Loss C
       packed:
         enabled: true
         max_tokens: 8192
@@ -72,7 +73,7 @@ accelerate:
   gradient_accumulation_steps: 1
   mixed_precision: 'bf16'
   num_train_epochs:
-  max_train_steps: 200000
+  max_train_steps: 2000        # short warmup — tune as needed before switching to Loss C full training
   learning_rate: 1.0e-4
   learning_rate_base_batch_size: 256
   max_grad_norm: 1.0
@@ -83,10 +84,10 @@ accelerate:
       weight_decay: 0
       eps: 1.0e-8
   lr_scheduler: constant_with_warmup
-  lr_warmup_steps: 200
+  lr_warmup_steps: 100
   logger: wandb
   checkpointing_epochs: False
-  checkpointing_steps: 4000
-  checkpointing_steps_list: [50000, 100000, 200000]
+  checkpointing_steps: 1000
+  checkpointing_steps_list: [2000]
   checkpoints_total_limit: 2
   logging_steps: 100
