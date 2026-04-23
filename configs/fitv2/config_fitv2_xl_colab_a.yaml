@@ -56,7 +56,7 @@ data:
       data_path: datasets/imagenet1k_latents_256_sd_vae_ft_ema
       target_len: 256
       random: 'crop'
-      resize_range: [2, 16]
+      resize_range: [1, 16]
       return_fullres: false
       packed:
         enabled: true

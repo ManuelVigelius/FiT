@@ -76,7 +76,7 @@ class IN1kLatentDataset(Dataset):
         # Optional random bilinear resize to a smaller even grid size
         if self.resize_range is not None:
             min_g, max_g = self.resize_range
-            valid = list(range(min_g, max_g + 1, 2))
+            valid = list(range(min_g, max_g + 1))
             new_g = override_g if override_g is not None else random.choice(valid)
             if new_g != H_g:
                 # Unpatchify: (H_g, W_g, p²C) → (H_g*p, W_g*p, C)
@@ -167,7 +167,7 @@ class TokenBudgetBatchSampler(BatchSampler):
         # __getitem__ uses the same draw rather than re-sampling independently.
         if resize_range is not None:
             min_g, max_g = resize_range
-            valid = list(range(min_g, max_g + 1, 2))
+            valid = list(range(min_g, max_g + 1))
             rng = random.Random(seed)
             self._grid_sizes = [rng.choice(valid) for _ in sampler]
             self._lengths = [g ** 2 for g in self._grid_sizes]
