@@ -130,22 +130,25 @@ from fit.data.in1k_latent_dataset import IN1kLatentDataset
 
 def spatial_resize(x: torch.Tensor, H: int, W: int,
                    H_out: int, W_out: int,
-                   patch_size: int = 2, C_in: int = 4) -> torch.Tensor:
-    """Bilinear resize of a patchified token sequence.
+                   patch_size: int = 2, C_in: int = 4,
+                   mode: str = 'bilinear') -> torch.Tensor:
+    """Resize a patchified token sequence.
 
     Args:
         x:        (B, H*W, patch_size**2 * C_in) token sequence
         H, W:     input grid dims
         H_out, W_out: output grid dims
         patch_size, C_in: patch and channel dims (must match x)
+        mode:     interpolation mode ('bilinear' for upsampling, 'area' for downsampling)
     Returns:
         (B, H_out*W_out, patch_size**2 * C_in) token sequence
     """
     p = patch_size
     sp = rearrange(x, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
                    h=H, w=W, p1=p, p2=p, c=C_in)
+    kwargs = {} if mode == 'area' else {'align_corners': True}
     sp = F.interpolate(sp.float(), size=(H_out * p, W_out * p),
-                       mode="bilinear", align_corners=True).to(x.dtype)
+                       mode=mode, **kwargs).to(x.dtype)
     return rearrange(sp, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p)
 
 
@@ -307,73 +310,57 @@ def evaluate_at_compression(
             else:
                 sigma_inj = sigma                                  # no correction needed
 
-            # Build noisy latent using sigma_inj (ICPlan with correction).
-            x0_lr = torch.randn_like(x1_lr)
-            sigma_inj_exp = sigma_inj.view(B, 1, 1)
-            alpha_inj_exp = (1.0 - sigma_inj_exp)
-            xt_lr_valid = alpha_inj_exp * x1_lr + sigma_inj_exp * x0_lr  # (B, seq_lr, 16)
+            # Build noisy latent: start from full-res i.i.d. noise, form xt_fr
+            # with plain sigma, then downsample (area) to get xt_lr.  sigma_inj
+            # is used only as the conditioning timestep fed to the model.
+            sigma_exp = sigma.view(B, 1, 1)
+            x0_fr = torch.randn_like(x1_fr)                        # (B, N_fr, 16)
+            xt_fr = (1.0 - sigma_exp) * x1_fr + sigma_exp * x0_fr  # (B, N_fr, 16)
+            xt_lr_valid = spatial_resize(xt_fr, H_fr, W_fr, H_lr, W_lr, mode='area')  # (B, seq_lr, 16)
+
+            xt_fr_sp = rearrange(xt_fr, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+                                 h=H_fr, w=W_fr, p1=p, p2=p, c=C_in)
+            ut_fr = x1_fr - x0_fr                                        # (B, N_fr, 16)
+            x0_lr = spatial_resize(x0_fr, H_fr, W_fr, H_lr, W_lr)       # (B, seq_lr, 16)
+            ut_lr = x1_lr - x0_lr                                        # (B, seq_lr, 16)
 
             if use_resnet_upsampler:
                 # ── Loss C: mirror _loss_c exactly ──────────────────────────
-                # Full-res i.i.d. noise; xt_lr derived by downsampling xt_fr;
-                # plain sigma = 1-t (no injection correction).
-                sigma_exp = (1.0 - t).view(B, 1, 1)
-
-                x0_fr = torch.randn_like(x1_fr)                 # (B, N_fr, 16)
-                xt_fr = (1.0 - sigma_exp) * x1_fr + sigma_exp * x0_fr
-
-                xt_fr_sp = rearrange(xt_fr, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                                      h=H_fr, w=W_fr, p1=p, p2=p, c=C_in)
-                xt_lr_c = spatial_resize(xt_fr, H_fr, W_fr, H_lr, W_lr)  # downsample xt_fr
-
-                # FiT forward at low-res.
+                # FiT forward at low-res (conditioned on plain t).
                 xt_lr_c_padded = torch.zeros(B, TARGET_LEN, 16, dtype=x1_lr.dtype, device=device)
-                xt_lr_c_padded[:, :seq_lr] = xt_lr_c
+                xt_lr_c_padded[:, :seq_lr] = xt_lr_valid
                 v_pred_lr_c = model(xt_lr_c_padded, t, **model_kwargs)[:, :seq_lr, :]
 
-                x1_lr_hat_c = xt_lr_c + sigma_exp * v_pred_lr_c  # (B, N_lr, 16)
-
                 # ── metric 1 (Loss C): velocity MSE at low-res ──────────────
-                x0_lr_c = spatial_resize(x0_fr, H_fr, W_fr, H_lr, W_lr)
-                ut_lr = x1_lr - x0_lr_c
                 vel_loss_lr = ((v_pred_lr_c - ut_lr) * mask_lr).pow(2).mean(dim=[1, 2]).mean()
 
                 # ── metric 3 (Loss C): image MSE at low-res ─────────────────
+                x1_lr_hat_c = xt_lr_valid + sigma_exp * v_pred_lr_c      # (B, N_lr, 16)
                 img_mse_lr = ((x1_lr_hat_c - x1_lr) * mask_lr).pow(2).mean(dim=[1, 2]).mean()
 
-                # Upsample predicted clean LR latent and run ResNet.
-                x1_lr_up_c_sp = rearrange(x1_lr_hat_c, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                                           h=H_lr, w=W_lr, p1=p, p2=p, c=C_in)
-                x1_lr_up_c_sp = spatial_resize_sp(x1_lr_up_c_sp, H_fr, W_fr)
-                v_pred_sp_fr = model.upsampler(x1_lr_up_c_sp, xt_fr_sp)  # (B, 4, H_sp, W_sp)
-
-                ut_fr = x1_fr - x0_fr                           # (B, N_fr, 16)
-                x1_hat_sp_fr = xt_fr_sp + sigma_exp.view(B, 1, 1, 1) * v_pred_sp_fr
+                # Upsample the LR velocity prediction and run ResNet (mirrors training).
+                v_lr_sp = rearrange(v_pred_lr_c, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+                                    h=H_lr, w=W_lr, p1=p, p2=p, c=C_in)
+                v_lr_up_sp = spatial_resize_sp(v_lr_sp, H_fr, W_fr)
+                v_pred_sp_fr = model.upsampler(v_lr_up_sp, xt_fr_sp)     # (B, 4, H_sp, W_sp)
             else:
                 # ── Loss A/B path ────────────────────────────────────────────
                 xt_padded = torch.zeros(B, TARGET_LEN, 16, dtype=x1_lr.dtype, device=device)
                 xt_padded[:, :seq_lr] = xt_lr_valid
                 v_pred_lr = model(xt_padded, 1 - sigma_inj, **model_kwargs)[:, :seq_lr, :]
 
-                ut_lr = x1_lr - x0_lr                                # (B, seq_lr, 16)
-
                 # ── metric 1: velocity MSE at low-res ───────────────────────
                 vel_loss_lr = ((v_pred_lr - ut_lr) * mask_lr).pow(2).mean(dim=[1, 2]).mean()
 
                 # ── metric 3: image MSE at low-res ──────────────────────────
-                # x1_hat = xt + sigma_inj * v_pred (uses actual noise coeff, not t)
-                x1_hat_lr = xt_lr_valid + sigma_inj_exp * v_pred_lr  # (B, seq_lr, 16)
+                x1_hat_lr = xt_lr_valid + sigma_exp * v_pred_lr          # (B, seq_lr, 16)
                 img_mse_lr = ((x1_hat_lr - x1_lr) * mask_lr).pow(2).mean(dim=[1, 2]).mean()
-
-                # Approximate full-res noise by upsampling x0_lr.
-                ut_fr = x1_fr - spatial_resize(x0_lr, H_lr, W_lr, H_fr, W_fr)
 
                 v_pred_sp_fr = rearrange(spatial_resize(v_pred_lr, H_lr, W_lr, H_fr, W_fr),
                                          "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
                                          h=H_fr, w=W_fr, p1=p, p2=p, c=C_in)
-                x1_hat_sp_fr = rearrange(spatial_resize(x1_hat_lr, H_lr, W_lr, H_fr, W_fr),
-                                         "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                                         h=H_fr, w=W_fr, p1=p, p2=p, c=C_in)
+
+            x1_hat_sp_fr = xt_fr_sp + sigma.view(B, 1, 1, 1) * v_pred_sp_fr
 
             v_pred_fr = rearrange(v_pred_sp_fr,
                                   "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p)

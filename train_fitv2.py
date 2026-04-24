@@ -23,6 +23,7 @@ from fit.utils.utils import (
     update_ema
 )
 from fit.utils.lr_scheduler import get_scheduler
+from fit.utils.eval_utils import init_from_ckpt
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -246,6 +247,26 @@ def main():
 
 
     model = instantiate_from_config(diffusion_cfg.network_config).to(device=device)
+    if args.load_model_from_checkpoint:
+        # Load model weights from an accelerate checkpoint directory or a plain
+        # .bin/.safetensors file, overriding whatever pretrain_ckpt was set in config.
+        ckpt_path = os.path.abspath(args.load_model_from_checkpoint)
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(
+                f"--load_model_from_checkpoint path does not exist: {ckpt_path}"
+            )
+        if os.path.isdir(ckpt_path):
+            # Accelerate saves the unwrapped model as pytorch_model.bin inside the dir.
+            bin_path = os.path.join(ckpt_path, "pytorch_model.bin")
+            if not os.path.exists(bin_path):
+                # Sharded saves use a different name; find the first shard.
+                candidates = [f for f in os.listdir(ckpt_path) if f.endswith(".bin") or f.endswith(".safetensors")]
+                if not candidates:
+                    raise FileNotFoundError(f"No model weights found in {ckpt_path}")
+                bin_path = os.path.join(ckpt_path, sorted(candidates)[0])
+            ckpt_path = bin_path
+        logger.info(f"Loading model weights from {ckpt_path}")
+        init_from_ckpt(model, ckpt_path, ignore_keys=None, verbose=True)
     # update ema
     if args.use_ema:
         # ema_dtype = torch.float32
@@ -281,8 +302,28 @@ def main():
     # (packed_cfg and use_packed are already defined above for LR scaling.)
     loader_batch_size = data_cfg.params.train.loader.batch_size
     total_batch_size = loader_batch_size * accelerator.num_processes * grad_accu_steps
+
+    # In packed mode the sampler pre-allocates max_steps * global_batch_size flat
+    # indices. global_batch_size must reflect how many *samples* are consumed per
+    # optimizer step, not just loader.batch_size (which is 1 packed sequence).
+    # Estimate: (max_tokens * num_processes * grad_accu_steps) / mean_tokens_per_sample.
+    if use_packed:
+        _resize_range = getattr(data_cfg.params.train, 'resize_range', None)
+        if _resize_range is not None:
+            _min_g, _max_g = _resize_range
+            _valid = torch.arange(_min_g, _max_g + 1)
+            _mean_toks = (_valid ** 2).float().mean().item()
+        else:
+            _mean_toks = data_cfg.params.train.target_len
+        _tokens_per_step = (
+            packed_cfg.max_tokens * grad_accu_steps * accelerator.num_processes
+        )
+        sampler_batch_size = max(1, round(_tokens_per_step / _mean_toks))
+    else:
+        sampler_batch_size = total_batch_size
+
     global_steps = 0
-    if args.resume_from_checkpoint:
+    if args.resume_from_checkpoint and args.resume_from_checkpoint.lower() != "none":
         # normal read with safety check
         if args.resume_from_checkpoint != "latest":
             resume_from_path = os.path.basename(args.resume_from_checkpoint)
@@ -304,7 +345,7 @@ def main():
     get_train_dataloader = instantiate_from_config(data_cfg)
     train_len = get_train_dataloader.train_len()
     train_dataloader = get_train_dataloader.train_dataloader(
-        global_batch_size=total_batch_size, max_steps=accelerate_cfg.max_train_steps,
+        global_batch_size=sampler_batch_size, max_steps=accelerate_cfg.max_train_steps,
         resume_step=global_steps, seed=args.seed,
         packed=use_packed,
         max_tokens=getattr(packed_cfg, 'max_tokens', 512) if use_packed else 512,
@@ -367,7 +408,7 @@ def main():
     logger.info(f"  Training Mixed-Precision = {accelerate_cfg.mixed_precision}")
 
     # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
+    if args.resume_from_checkpoint and args.resume_from_checkpoint.lower() != "none":
         # normal read with safety check
         error_times=0
         while(True):
