@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Optional
-from einops import rearrange
+
 from fit.model.modules import (
     PatchEmbedder, TimestepEmbedder, LabelEmbedder, SizeEmbedder,
     ResNetUpsampler, FiTBlock, FinalLayer
@@ -32,7 +32,6 @@ class FiT(nn.Module):
         class_dropout_prob: float = 0.1,
         num_classes: int = 1000,
         learn_sigma: bool = True,
-        use_sit: bool = False,
         use_checkpoint: bool=False,
         use_swiglu: bool = False,
         use_swiglu_large: bool = False,
@@ -64,9 +63,7 @@ class FiT(nn.Module):
         super().__init__()
         self.context_size = context_size
         self.hidden_size = hidden_size
-        assert not (learn_sigma and use_sit)
         self.learn_sigma = learn_sigma
-        self.use_sit = use_sit
         self.use_checkpoint = use_checkpoint
         self.depth = depth
         self.mlp_ratio = mlp_ratio
@@ -180,30 +177,12 @@ class FiT(nn.Module):
             nn.init.constant_(self.upsampler.output_proj.bias, 0)
 
 
-    def unpatchify(self, x, hw):
-        """
-        args:
-            x: (B, p**2 * C_out, N)
-            N = h//p * w//p
-        return: 
-            imgs: (B, C_out, H, W)
-        """
-        h, w = hw
-        p = self.patch_size
-        if self.use_sit:
-            x = rearrange(x, "b (h w) c -> b h w c", h=h//p, w=w//p) # (B, h//2 * w//2, 16) -> (B, h//2, w//2, 16)
-            x = rearrange(x, "b h w (c p1 p2) -> b c (h p1) (w p2)", p1=p, p2=p) # (B, h//2, w//2, 16) -> (B, h, w, 4)
-        else:
-            x = rearrange(x, "b c (h w) -> b c h w", h=h//p, w=w//p) # (B, 16, h//2 * w//2) -> (B, 16, h//2, w//2)
-            x = rearrange(x, "b (c p1 p2) h w -> b c (h p1) (w p2)", p1=p, p2=p) # (B, 16, h//2, w//2) -> (B, h, w, 4)
-        return x
-
     def forward(self, x, t, y, grid, mask, size=None, doc_ids=None, block_mask=None):
         """
         Forward pass of FiT.
 
         Unpacked mode (original):
-            x:       (B, p**2*C_in, N) or (B, N, p**2*C_in) depending on use_sit
+            x:       (B, N, p**2*C_in)
             t:       (B,)
             y:       (B,)
             grid:    (B, 2, N)
@@ -227,8 +206,6 @@ class FiT(nn.Module):
         B = x.shape[0]
         D = self.hidden_size
 
-        if not self.use_sit:
-            x = rearrange(x, 'B C N -> B N C')
         x = self.x_embedder(x)                          # (B, N, D)
 
         if doc_ids is not None:
@@ -304,53 +281,8 @@ class FiT(nn.Module):
 
         x = self.final_layer(x, c)                      # (B, N, p**2 * C_out)
         x = x * mask[..., None]                         # zero out padding tokens
-        if not self.use_sit:
-            x = rearrange(x, 'B N C -> B C N')
         return x
     
-    
-    
-    def forward_with_cfg(self, x, t, y, grid, mask, size, cfg_scale, scale_pow=0.0):
-        """
-        Forward pass with classifier free guidance of FiT.
-        x: (2B, N, p**2 * C_in) if use_sit else (2B, p**2 * C_in, N) tensor of sequential inputs (flattened latent features of images, N=H*W/(p**2))
-        t: (2B,) tensor of diffusion timesteps
-        y: (2B,) tensor of class labels
-        grid: (2B, 2, N): tensor of height and weight indices that spans a grid
-        mask: (2B, N): tensor of the mask for the sequence
-        cfg_scale: float > 1.0
-        return: (B, p**2 * C_out, N), where C_out=2*C_in if leran_sigma, C_out=C_in otherwise.
-        """
-        half = x[: len(x) // 2]                     # (2B, ...) -> (B, ...)
-        combined = torch.cat([half, half], dim=0)   # (2B, ...)
-        model_out = self.forward(combined, t, y, grid, mask, size)  # (2B, N, C) is use_sit else (2B, C, N) , where C = p**2 * C_out
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # C_cfg = self.in_channels * self.patch_size * self.patch_size
-        C_cfg = 3 * self.patch_size * self.patch_size
-        if self.use_sit:
-            eps, rest = model_out[:, :, :C_cfg], model_out[:, :, C_cfg:]  # eps: (2B, N, C_cfg), where C_cfg = p**2 * 3
-        else:
-            eps, rest = model_out[:, :C_cfg], model_out[:, C_cfg:]  # eps: (2B, C_cfg, N), where C_cfg = p**2 * 3
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)   # (2B, C_cfg, H, W) -> (B, C_cfg, H, W)        
-        # from https://github.com/sail-sg/MDT/blob/main/masked_diffusion/models.py#L506
-        # improved classifier-free guidance
-        if scale_pow == 0.0:
-            real_cfg_scale = cfg_scale
-        else:
-            scale_step = (
-                1-torch.cos(((1-torch.clamp_max(t, 1.0))**scale_pow)*torch.pi)
-            )*1/2 # power-cos scaling 
-            real_cfg_scale = (cfg_scale-1)*scale_step + 1
-            real_cfg_scale = real_cfg_scale[: len(x) // 2].view(-1, 1, 1)
-        half_eps = uncond_eps + real_cfg_scale * (cond_eps - uncond_eps)    # (B, ...)
-        eps = torch.cat([half_eps, half_eps], dim=0)    # (B, ...) -> (2B, ...)
-        if self.use_sit:
-            return torch.cat([eps, rest], dim=2)          # (2B, N, C), where C = p**2 * C_out
-        else:
-            return torch.cat([eps, rest], dim=1)          # (2B, C, N), where C = p**2 * C_out
-        
     def ckpt_wrapper(self, module):
         def ckpt_forward(*inputs):
             outputs = module(*inputs)

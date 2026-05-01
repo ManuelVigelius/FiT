@@ -2,12 +2,12 @@ import os
 import os.path as osp
 import math
 import torch
-import torch.nn.functional as F
+
 import random
 from functools import partial
 from torch.utils.data import DataLoader, Dataset, BatchSampler
 from safetensors.torch import load_file
-from einops import rearrange
+from fit.scheduler.transport.utils import spatial_resize
 
 
 
@@ -60,7 +60,6 @@ class IN1kLatentDataset(Dataset):
         data = load_file(path)
         dtype = data['feature'].dtype
         p = 2   # patch_size (matches model)
-        C = 4   # VAE latent channels
 
         # Pick flip variant
         if torch.rand(1) < self.RandomHorizontalFlipProb:
@@ -79,19 +78,9 @@ class IN1kLatentDataset(Dataset):
             valid = list(range(min_g, max_g + 1))
             new_g = override_g if override_g is not None else random.choice(valid)
             if new_g != H_g:
-                # Unpatchify: (H_g, W_g, p²C) → (H_g*p, W_g*p, C)
-                feat_latent = rearrange(feat_hw.float(),
-                                        'h w (p1 p2 c) -> (h p1) (w p2) c',
-                                        p1=p, p2=p, c=C)
-                # Bilinear resize at latent level
-                feat_t = feat_latent.permute(2, 0, 1).unsqueeze(0)  # (1, C, H_l, W_l)
-                feat_t = F.interpolate(feat_t, size=(new_g * p, new_g * p),
-                                       mode='bilinear', align_corners=True)
-                feat_latent = feat_t.squeeze(0).permute(1, 2, 0).to(dtype)
-                # Re-patchify: (H_l', W_l', C) → (H_g', W_g', p²C)
-                feat_hw = rearrange(feat_latent,
-                                    '(h p1) (w p2) c -> h w (p1 p2 c)',
-                                    p1=p, p2=p)
+                tokens = spatial_resize(feat_hw.reshape(1, H_g * W_g, 16).float(),
+                                        H_g, W_g, new_g, new_g, p)
+                feat_hw = tokens.squeeze(0).reshape(new_g, new_g, 16).to(dtype)
                 H_g, W_g = new_g, new_g
 
         seq_len = H_g * W_g

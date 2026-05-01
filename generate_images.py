@@ -22,7 +22,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
+
 from PIL import Image
 from safetensors.torch import load_file
 from diffusers.models import AutoencoderKL
@@ -31,13 +31,13 @@ from diffusers.models import AutoencoderKL
 
 # Compression grid sizes to generate at.  Each entry is a square grid side-length.
 # The full-res grid for 256×256 images is 16×16 (spatial latent 32×32, patch 2×2).
-COMPRESSIONS = [2, 4, 6, 8, 10, 12, 14, 16]
+COMPRESSIONS = [2, 8, 16]
 
 # Number of images to generate per (checkpoint, compression) pair.
-N_IMAGES = 128
+N_IMAGES = 4
 
 # Batch size for the generation loop (single GPU).
-BATCH_SIZE = 128
+BATCH_SIZE = 32
 
 # Number of Euler ODE steps.
 N_STEPS = 10
@@ -76,7 +76,6 @@ _BASE_MODEL_CFG = dict(
     class_dropout_prob=0.1,
     num_classes=1000,
     learn_sigma=False,
-    use_sit=True,
     use_swiglu=True,
     use_swiglu_large=False,
     q_norm="layernorm",
@@ -102,8 +101,8 @@ CHECKPOINTS = [
         loss_type="A",
     ),
     dict(
-        name="loss_c_8k",
-        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-8000-bs8k-lossc",
+        name="loss_c_6k",
+        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-6000-bs8k-lossc",
         loss_type="C",
     ),
 ]
@@ -117,28 +116,26 @@ C_IN       = 4   # VAE latent channels
 sys.path.insert(0, str(Path(__file__).parent))
 
 from fit.model.fit_model import FiT
+from fit.scheduler.transport.utils import patchify, unpatchify, spatial_resize as _spatial_resize
 
 
 # ──────────────────────────── helpers ────────────────────────────────────────
 
 def spatial_resize(x: torch.Tensor, H: int, W: int,
                    H_out: int, W_out: int,
-                   patch_size: int = PATCH_SIZE, C_in: int = C_IN,
+                   patch_size: int = PATCH_SIZE,
                    mode: str = 'bilinear') -> torch.Tensor:
-    """Resize a patchified token sequence (B, H*W, patch_size**2*C_in)."""
-    p = patch_size
-    sp = rearrange(x, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                   h=H, w=W, p1=p, p2=p, c=C_in)
-    kwargs = {} if mode == 'area' else {'align_corners': True}
-    sp = F.interpolate(sp.float(), size=(H_out * p, W_out * p),
-                       mode=mode, **kwargs).to(x.dtype)
-    return rearrange(sp, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p)
+    if H == H_out and W == W_out:
+        return x
+    return _spatial_resize(x, H, W, H_out, W_out, patch_size, mode)
 
 
 def spatial_resize_sp(x_sp: torch.Tensor,
                       H_out: int, W_out: int,
                       patch_size: int = PATCH_SIZE) -> torch.Tensor:
     """Bilinear resize of an unpatchified spatial tensor (B, C, H*p, W*p)."""
+    if x_sp.shape[-2] == H_out * patch_size and x_sp.shape[-1] == W_out * patch_size:
+        return x_sp
     return F.interpolate(x_sp.float(), size=(H_out * patch_size, W_out * patch_size),
                          mode="bilinear", align_corners=True).to(x_sp.dtype)
 
@@ -163,17 +160,15 @@ def load_model(ckpt_path: str, cfg: dict, device: str) -> FiT:
 
 def make_grid_and_mask(H_g: int, W_g: int, B: int, device: torch.device, dtype: torch.dtype):
     """Build grid, mask, and size tensors for a given grid shape."""
-    seq = H_g * W_g
-    hs = torch.arange(H_g, dtype=dtype, device=device)
-    ws = torch.arange(W_g, dtype=dtype, device=device)
-    gh, gw = torch.meshgrid(hs, ws, indexing="ij")
-    grid = torch.zeros(B, 2, seq, dtype=dtype, device=device)
-    grid[:, 0] = gh.reshape(-1).unsqueeze(0).expand(B, -1)
-    grid[:, 1] = gw.reshape(-1).unsqueeze(0).expand(B, -1)
-    mask = torch.ones(B, seq, dtype=torch.uint8, device=device)
-    size = torch.tensor([[H_g, W_g]], dtype=torch.int32, device=device).expand(B, -1).unsqueeze(1)
+    grid_h = torch.arange(H_g, dtype=torch.long)
+    grid_w = torch.arange(W_g, dtype=torch.long)
+    grid = torch.meshgrid(grid_w, grid_h, indexing='xy')
+    grid = torch.cat([grid[0].reshape(1, -1),
+                      grid[1].reshape(1, -1)], dim=0)
+    grid = grid.repeat(B, 1, 1).to(device=device, dtype=dtype)
+    mask = torch.ones(B, H_g * W_g, device=device, dtype=dtype)
+    size = torch.tensor((H_g, W_g), dtype=torch.int32, device=device).repeat(B, 1).unsqueeze(1)
     return grid, mask, size
-
 
 # ──────────────── Euler ODE sampler (10 steps, noise→data) ───────────────────
 
@@ -203,70 +198,89 @@ def euler_sample(
     B = z.shape[0]
     r = H_g / H_fr  # downsampling ratio (1.0 for baseline)
 
-    use_fr = (loss_type == "baseline")
+    use_fr = (loss_type in ("baseline", "C"))
     H_run = H_fr if use_fr else H_g
     W_run = W_fr if use_fr else W_g
 
     y_null = torch.full_like(y, NUM_CLASSES)
-    grid, mask, size = make_grid_and_mask(H_run, W_run, B, device, dtype)
-    mask_f = mask.float()
 
-    x = z  # (B, seq_run, 16), t=1 pure noise
-    # Loss C tracks the full-res spatial trajectory in parallel.
+    # Loss C: trajectory lives at full-res in spatial form; LR grid used only for model input.
+    # Other losses: trajectory lives in token form at H_run×W_run.
     if loss_type == "C":
-        xt_fr_sp = spatial_resize_sp(
-            rearrange(x, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                      h=H_g, w=W_g, p1=p, p2=p, c=C_IN),
-            H_fr, W_fr,
-        )
+        xt_fr_sp = z  # (B, C_IN, H_fr*p, W_fr*p) full-res spatial noise
+        grid_lr, mask_lr, size_lr = make_grid_and_mask(H_g, W_g, B, device, dtype)
+    else:
+        x = z  # (B, H_run*W_run, p**2*C_IN) token-form noise
+        grid, mask, size = make_grid_and_mask(H_run, W_run, B, device, dtype)
 
-    ts = torch.linspace(1.0, 0.0, n_steps + 1, device=device, dtype=dtype)
+    # Forward time: t=0 (noise) → t=1 (data), matching the training convention
+    # where the model sees t=0 as noise and t=1 as clean data.
+    ts = torch.linspace(0.0, 1.0, n_steps + 1, device=device, dtype=dtype)
 
     for i in range(n_steps):
         t_cur  = ts[i]
         t_next = ts[i + 1]
-        dt     = t_next - t_cur  # negative
+        dt     = t_next - t_cur  # positive
 
-        sigma = (1.0 - t_cur).expand(B).to(dtype)          # (B,)
+        sigma = (1.0 - t_cur).expand(B).to(dtype)          # (B,) noise weight, 1→0
 
-        # Noise-corrected timestep fed to the model (matches eval_losses.py).
+        # Noise-corrected timestep fed to the model.
+        # For compressed grids the effective SNR shifts; sigma_inj corrects for it.
+        # At full resolution (r==1) sigma_inj == sigma, so t_model == t_cur.
         if r < 1.0:
             sigma_inj = sigma / (r + sigma * (1.0 - r))
         else:
             sigma_inj = sigma
-        t_model = 1.0 - sigma_inj                           # (B,)
-
-        v = model(
-            torch.cat([x, x], 0),
-            torch.cat([t_model, t_model], 0),
-            torch.cat([y, y_null], 0),
-            torch.cat([grid, grid], 0),
-            torch.cat([mask_f, mask_f], 0),
-            torch.cat([size, size], 0),
-        )
-        v_cond, v_uncond = v.chunk(2, dim=0)
-        v_pred_lr = v_uncond + cfg_scale * (v_cond - v_uncond)
+        t_model = 1.0 - sigma_inj                           # (B,) == t_cur for baseline
 
         if loss_type == "C":
-            v_lr_sp      = rearrange(v_pred_lr, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                                     h=H_g, w=W_g, p1=p, p2=p, c=C_IN)
-            v_lr_up_sp   = spatial_resize_sp(v_lr_sp, H_fr, W_fr)
+            x_lr_sp = F.interpolate(xt_fr_sp.float(), size=(H_g * p, W_g * p),
+                                    mode='area').to(xt_fr_sp.dtype)
+            x_lr = patchify(x_lr_sp, p)
+            v = model(
+                torch.cat([x_lr, x_lr], 0),
+                torch.cat([t_model, t_model], 0),
+                torch.cat([y, y_null], 0),
+                torch.cat([grid_lr, grid_lr], 0),
+                torch.cat([mask_lr, mask_lr], 0),
+                torch.cat([size_lr, size_lr], 0),
+            )
+        else:
+            v = model(
+                torch.cat([x, x], 0),
+                torch.cat([t_model, t_model], 0),
+                torch.cat([y, y_null], 0),
+                torch.cat([grid, grid], 0),
+                torch.cat([mask, mask], 0),
+                torch.cat([size, size], 0),
+            )
+        v_cond, v_uncond = v.chunk(2, dim=0)
+
+        # CFG on first 3*patch**2 channels only, matching model.forward_with_cfg
+        C_cfg = 3 * p * p
+        v_pred = torch.cat([
+            v_uncond[:, :, :C_cfg] + cfg_scale * (v_cond[:, :, :C_cfg] - v_uncond[:, :, :C_cfg]),
+            v_cond[:, :, C_cfg:],
+        ], dim=2)
+
+        if loss_type == "C":
+            v_lr_sp    = unpatchify(v_pred, (H_g * p, W_g * p), p)
+            v_lr_up_sp = F.interpolate(v_lr_sp.float(), size=(H_fr * p, W_fr * p),
+                                       mode='bilinear', align_corners=True).to(v_lr_sp.dtype)
             v_pred_fr_sp = model.upsampler(v_lr_up_sp, xt_fr_sp)
             xt_fr_sp     = xt_fr_sp + dt * v_pred_fr_sp
-
-        x = x + dt * v_pred_lr
+        else:
+            x = x + dt * v_pred
 
     # ── convert final state to full-res spatial latent ───────────────────────
-    if use_fr:
-        return rearrange(x, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                         h=H_fr, w=W_fr, p1=p, p2=p, c=C_IN)
-
     if loss_type == "C":
-        return xt_fr_sp
+        return unpatchify(patchify(xt_fr_sp, p), (H_fr * p, W_fr * p), p)
+
+    if use_fr:
+        return unpatchify(x, (H_fr * p, W_fr * p), p)
 
     # Loss A/B: upsample the clean prediction (not the velocity).
-    x1_hat_lr_sp = rearrange(x, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                              h=H_g, w=W_g, p1=p, p2=p, c=C_IN)
+    x1_hat_lr_sp = unpatchify(x, (H_run * p, W_run * p), p)
     return spatial_resize_sp(x1_hat_lr_sp, H_fr, W_fr)
 
 
@@ -285,7 +299,7 @@ def main():
 
     # VAE for decoding.
     print(f"\nLoading VAE from {VAE_PATH} …")
-    vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).eval()
+    vae = AutoencoderKL.from_pretrained(VAE_PATH).to(DEVICE).eval()
 
     for ckpt_cfg in CHECKPOINTS:
         ckpt_name = ckpt_cfg["name"]
@@ -316,12 +330,18 @@ def main():
                 # Random labels.
                 y = torch.randint(0, NUM_CLASSES, (bs,), device=DEVICE)
 
-                # Initial noise at the generation grid.
-                use_fr_noise = loss_type in ("baseline", "virtual_resize")
-                H_noise = H_fr if use_fr_noise else H_g
-                W_noise = W_fr if use_fr_noise else W_g
-                z = torch.randn(bs, H_noise * W_noise, PATCH_SIZE**2 * C_IN,
-                                device=DEVICE, dtype=dtype)
+                # Initial noise.
+                # Loss C: full-res spatial tensor (B, C_IN, H_fr*p, W_fr*p).
+                # Baseline: token form at full-res. A/B: token form at compressed grid.
+                if loss_type == "C":
+                    z = torch.randn(bs, C_IN, H_fr * PATCH_SIZE, W_fr * PATCH_SIZE,
+                                    device=DEVICE, dtype=dtype)
+                else:
+                    use_fr_noise = (loss_type == "baseline")
+                    H_noise = H_fr if use_fr_noise else H_g
+                    W_noise = W_fr if use_fr_noise else W_g
+                    z = torch.randn(bs, H_noise * W_noise, PATCH_SIZE**2 * C_IN,
+                                    device=DEVICE, dtype=dtype)
 
                 # Run Euler sampler → (B, C_IN, H_fr*p, W_fr*p) spatial latent.
                 x1_sp = euler_sample(

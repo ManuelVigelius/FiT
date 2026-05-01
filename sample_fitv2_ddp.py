@@ -23,6 +23,7 @@ from tqdm import tqdm
 from PIL import Image
 from diffusers.models import AutoencoderKL
 from fit.scheduler.transport import create_transport, Sampler
+from fit.scheduler.transport.utils import unpatchify
 from fit.utils.eval_utils import init_from_ckpt
 from fit.utils.utils import instantiate_from_config
 from fit.utils.sit_eval_utils import parse_sde_args, parse_ode_args
@@ -212,7 +213,7 @@ def main(args):
             samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
 
         samples = samples[..., : n_patch_h*n_patch_w]
-        samples = model.unpatchify(samples, (H, W))        
+        samples = unpatchify(samples, (H, W), patch_size)        
         samples = vae.decode(samples / vae.config.scaling_factor).sample
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
 

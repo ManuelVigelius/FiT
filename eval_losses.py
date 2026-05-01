@@ -28,8 +28,8 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 from safetensors.torch import load_file
+from fit.scheduler.transport.utils import patchify, unpatchify, spatial_resize
 from torch.utils.data import DataLoader, Subset
 
 # ─────────────────────────────── CONFIG ─────────────────────────────────────
@@ -70,7 +70,6 @@ _BASE_MODEL_CFG = dict(
     class_dropout_prob=0.1,
     num_classes=1000,
     learn_sigma=False,
-    use_sit=True,
     use_swiglu=True,
     use_swiglu_large=False,
     q_norm="layernorm",
@@ -128,28 +127,6 @@ from fit.data.in1k_latent_dataset import IN1kLatentDataset
 
 # ──────────────────────────── helpers ────────────────────────────────────────
 
-def spatial_resize(x: torch.Tensor, H: int, W: int,
-                   H_out: int, W_out: int,
-                   patch_size: int = 2, C_in: int = 4,
-                   mode: str = 'bilinear') -> torch.Tensor:
-    """Resize a patchified token sequence.
-
-    Args:
-        x:        (B, H*W, patch_size**2 * C_in) token sequence
-        H, W:     input grid dims
-        H_out, W_out: output grid dims
-        patch_size, C_in: patch and channel dims (must match x)
-        mode:     interpolation mode ('bilinear' for upsampling, 'area' for downsampling)
-    Returns:
-        (B, H_out*W_out, patch_size**2 * C_in) token sequence
-    """
-    p = patch_size
-    sp = rearrange(x, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                   h=H, w=W, p1=p, p2=p, c=C_in)
-    kwargs = {} if mode == 'area' else {'align_corners': True}
-    sp = F.interpolate(sp.float(), size=(H_out * p, W_out * p),
-                       mode=mode, **kwargs).to(x.dtype)
-    return rearrange(sp, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p)
 
 
 def spatial_resize_sp(x_sp: torch.Tensor,
@@ -210,7 +187,6 @@ def evaluate_at_compression(
     timesteps: torch.Tensor,
     device: str,
     patch_size: int = 2,
-    C_in: int = 4,
     use_resnet_upsampler: bool = False,
 ) -> dict:
     """
@@ -318,8 +294,7 @@ def evaluate_at_compression(
             xt_fr = (1.0 - sigma_exp) * x1_fr + sigma_exp * x0_fr  # (B, N_fr, 16)
             xt_lr_valid = spatial_resize(xt_fr, H_fr, W_fr, H_lr, W_lr, mode='area')  # (B, seq_lr, 16)
 
-            xt_fr_sp = rearrange(xt_fr, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                                 h=H_fr, w=W_fr, p1=p, p2=p, c=C_in)
+            xt_fr_sp = unpatchify(xt_fr, (H_fr * p, W_fr * p), p)
             ut_fr = x1_fr - x0_fr                                        # (B, N_fr, 16)
             x0_lr = spatial_resize(x0_fr, H_fr, W_fr, H_lr, W_lr)       # (B, seq_lr, 16)
             ut_lr = x1_lr - x0_lr                                        # (B, seq_lr, 16)
@@ -331,15 +306,12 @@ def evaluate_at_compression(
                 v_pred_lr = model(xt_lr_c_padded, t, **model_kwargs)[:, :seq_lr, :]
 
                 # Upsample the LR velocity prediction and run ResNet (mirrors training).
-                v_lr_sp = rearrange(v_pred_lr, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                                    h=H_lr, w=W_lr, p1=p, p2=p, c=C_in)
+                v_lr_sp = unpatchify(v_pred_lr, (H_lr * p, W_lr * p), p)
                 v_lr_up_sp = spatial_resize_sp(v_lr_sp, H_fr, W_fr)
                 v_pred_sp_fr = model.upsampler(v_lr_up_sp, xt_fr_sp)     # (B, 4, H_sp, W_sp)
                 x1_hat_sp_fr = xt_fr_sp + sigma.view(B, 1, 1, 1) * v_pred_sp_fr
-                v_pred_fr = rearrange(v_pred_sp_fr,
-                                      "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p)
-                x1_hat_fr = rearrange(x1_hat_sp_fr, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
-                                      p1=p, p2=p)
+                v_pred_fr = patchify(v_pred_sp_fr, p)
+                x1_hat_fr = patchify(x1_hat_sp_fr, p)
             else:
                 # ── Loss A/B ─────────────────────────────────────────────────
                 xt_padded = torch.zeros(B, TARGET_LEN, 16, dtype=x1_lr.dtype, device=device)
@@ -349,11 +321,9 @@ def evaluate_at_compression(
                 # Upsample the clean prediction rather than the velocity so noise
                 # is never interpolated.
                 x1_hat_lr = xt_lr_valid + sigma_exp * v_pred_lr
-                x1_hat_lr_sp = rearrange(x1_hat_lr, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                                         h=H_lr, w=W_lr, p1=p, p2=p, c=C_in)
+                x1_hat_lr_sp = unpatchify(x1_hat_lr, (H_lr * p, W_lr * p), p)
                 x1_hat_fr_sp = spatial_resize_sp(x1_hat_lr_sp, H_fr, W_fr)
-                x1_hat_fr = rearrange(x1_hat_fr_sp, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
-                                      p1=p, p2=p)
+                x1_hat_fr = patchify(x1_hat_fr_sp, p)
                 v_pred_fr = x1_hat_fr - x0_fr
 
             # ── low-res metrics (shared) ─────────────────────────────────────
@@ -394,7 +364,6 @@ def evaluate_at_compression_virtual_resize(
     timesteps: torch.Tensor,
     device: str,
     patch_size: int = 2,
-    C_in: int = 4,
 ) -> dict:
     """
     Virtual-resize evaluation for the baseline model.

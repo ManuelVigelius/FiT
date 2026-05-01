@@ -34,7 +34,6 @@ diffusion:
       class_dropout_prob: 0.1
       num_classes: 1000
       learn_sigma: false
-      use_sit: true
       use_swiglu: true
       use_swiglu_large: false
       q_norm: layernorm
