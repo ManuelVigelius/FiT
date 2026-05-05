@@ -23,3 +23,4 @@ batch*
 /test
 .venv
 .env
+.DS_Store

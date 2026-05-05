@@ -114,12 +114,24 @@ def parse_args():
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument(
         "--freeze_new_layers",
+        type=str,
+        default=None,
+        metavar="LAYERS",
+        help=(
+            "Comma-separated list of layer name substrings to keep trainable while "
+            "freezing everything else (warmup phase). "
+            "Examples: --freeze_new_layers size_embedder  (Loss A warmup) "
+            "          --freeze_new_layers size_embedder,upsampler  (Loss C warmup)"
+        ),
+    )
+    parser.add_argument(
+        "--reset_optimizer",
         action="store_true",
         default=False,
         help=(
-            "Freeze all parameters except the new layers added for size conditioning "
-            "(size_embedder) and the Loss C upsampler (upsampler). Use this for a "
-            "warmup phase before full fine-tuning."
+            "Load only model and EMA weights from the latest checkpoint, discarding "
+            "optimizer and scheduler state. Use this when transitioning from a warmup "
+            "run to full training so the optimizer is freshly initialised for all params."
         ),
     )
     args = parser.parse_args()
@@ -276,7 +288,7 @@ def main():
             ema_model = deepcopy(model).to(device=device)
         for p in ema_model.parameters():
             p.requires_grad = False
-    
+
     if args.use_ema:
         model = accelerator.prepare_model(model, device_placement=False)
         ema_model = accelerator.prepare_model(ema_model, device_placement=False)
@@ -339,8 +351,13 @@ def main():
             )
             args.resume_from_checkpoint = None
         else:
-            global_steps = int(resume_from_path.split("-")[1]) # gs not calculate the gradient_accumulation_steps
-            logger.info(f"Resuming from steps: {global_steps}")
+            if args.reset_optimizer:
+                # Weights-only resume: step counter stays at 0 so optimizer, scheduler,
+                # and dataloader all start fresh. Used when continuing from a warmup run.
+                logger.info(f"reset_optimizer: loading weights from {resume_from_path}, resetting step counter.")
+            else:
+                global_steps = int(resume_from_path.split("-")[1]) # gs not calculate the gradient_accumulation_steps
+                logger.info(f"Resuming from steps: {global_steps}")
 
     get_train_dataloader = instantiate_from_config(data_cfg)
     train_len = get_train_dataloader.train_len()
@@ -354,8 +371,12 @@ def main():
 
     # Warmup phase: freeze everything except the newly-added layers.
     # Run this before building the optimizer so only trainable params are included.
-    if args.freeze_new_layers:
-        new_layer_names = ['size_embedder', 'upsampler']
+    if args.freeze_new_layers is not None:
+        raw = args.freeze_new_layers.strip()
+        if not raw or raw == 'default':
+            new_layer_names = ['size_embedder', 'upsampler']
+        else:
+            new_layer_names = [s.strip() for s in raw.split(',') if s.strip()]
         unwrapped = accelerator.unwrap_model(model)
         unwrapped.finetune(type='partial', unfreeze=new_layer_names)
         if accelerator.is_main_process:
@@ -409,23 +430,42 @@ def main():
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint and args.resume_from_checkpoint.lower() != "none":
-        # normal read with safety check
-        error_times=0
-        while(True):
-            if error_times >= 100:
-                raise
-            try:
-                logger.info(f"Resuming from checkpoint {resume_from_path}")
-                accelerator.load_state(os.path.join(ckptdir, resume_from_path))
-                break
-            except (RuntimeError, Exception) as err:
-                error_times+=1
-                if accelerator.is_local_main_process:
-                    logger.warning(err)
-                    logger.warning(f"Failed to resume from checkpoint {resume_from_path}")
-                    shutil.rmtree(os.path.join(ckptdir, resume_from_path))
-                else:
-                    time.sleep(2)
+        ckpt_full_path = os.path.join(ckptdir, resume_from_path)
+        if args.reset_optimizer:
+            # Weights-only load: restore model + EMA weights but discard optimizer /
+            # scheduler state so full training starts with a fresh optimizer over all params.
+            from pathlib import Path
+            ckpt_dir = Path(ckpt_full_path)
+            unwrapped_model = accelerator.unwrap_model(model)
+            model_file = ckpt_dir / "model.safetensors"
+            if not model_file.exists():
+                model_file = ckpt_dir / "pytorch_model.bin"
+            logger.info(f"reset_optimizer: loading model weights from {model_file}")
+            from accelerate.checkpointing import load_model as _load_model
+            _load_model(unwrapped_model, str(model_file), device=str(accelerator.device))
+            # Initialize EMA from the warmup model weights. The deepcopy above ran before
+            # this load and still holds pretrained weights, so overwrite it here.
+            if args.use_ema:
+                unwrapped_ema = accelerator.unwrap_model(ema_model)
+                unwrapped_ema.load_state_dict(unwrapped_model.state_dict())
+        else:
+            # Normal resume: restore model, EMA, optimizer, scheduler, and step counter.
+            error_times=0
+            while(True):
+                if error_times >= 100:
+                    raise
+                try:
+                    logger.info(f"Resuming from checkpoint {resume_from_path}")
+                    accelerator.load_state(ckpt_full_path)
+                    break
+                except (RuntimeError, Exception) as err:
+                    error_times+=1
+                    if accelerator.is_local_main_process:
+                        logger.warning(err)
+                        logger.warning(f"Failed to resume from checkpoint {resume_from_path}")
+                        shutil.rmtree(ckpt_full_path)
+                    else:
+                        time.sleep(2)
     
     # save config
     OmegaConf.save(config=config, f=os.path.join(cfgdir, "config.yaml"))
