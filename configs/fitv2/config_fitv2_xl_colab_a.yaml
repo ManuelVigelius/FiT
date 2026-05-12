@@ -59,7 +59,7 @@ data:
       return_fullres: false
       packed:
         enabled: true
-        max_tokens: 8192
+        max_tokens: 16384
         pad_to_multiple: 128
       loader:
         batch_size: 4
@@ -71,7 +71,7 @@ accelerate:
   gradient_accumulation_steps: 1
   mixed_precision: 'bf16'
   num_train_epochs:
-  max_train_steps: 200000
+  max_train_steps: 8000
   learning_rate: 1.0e-4
   learning_rate_base_batch_size: 256
   max_grad_norm: 1.0
@@ -82,7 +82,7 @@ accelerate:
       weight_decay: 0
       eps: 1.0e-8
   lr_scheduler: constant_with_warmup
-  lr_warmup_steps: 200
+  lr_warmup_steps: 500
   logger: wandb
   checkpointing_epochs: False
   checkpointing_steps: 4000
