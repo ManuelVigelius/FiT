@@ -31,8 +31,12 @@ def update_ema(ema_model, model, decay=0.9999):
     """
     if hasattr(model, 'module'):
         model = model.module
+    if hasattr(model, '_orig_mod'):
+        model = model._orig_mod
     if hasattr(ema_model, 'module'):
         ema_model = ema_model.module
+    if hasattr(ema_model, '_orig_mod'):
+        ema_model = ema_model._orig_mod
     ema_params = OrderedDict(ema_model.named_parameters())
     model_params = OrderedDict(model.named_parameters())
     

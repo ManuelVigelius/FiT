@@ -149,7 +149,7 @@ class Transport:
         t_per_image = t_per_image.to(x1)                  # (B, max_n_pack)
 
         # Expand t to per-token: each token gets the t of its image.
-        safe_ids = doc_ids.clamp(min=0)                   # (B, N_total)
+        safe_ids = doc_ids.clamp(min=0).long()            # (B, N_total)
         t_per_token = t_per_image[
             torch.arange(B, device=x1.device)[:, None], safe_ids
         ]                                                  # (B, N_total)
@@ -197,7 +197,7 @@ class Transport:
         sq_err_mean_c = sq_err.mean(dim=-1)
 
         # Accumulate sum and count per image slot using scatter_add
-        safe_ids = doc_ids.clamp(min=0)                   # (B, N_total)
+        safe_ids = doc_ids.clamp(min=0).long()            # (B, N_total)
         valid = (doc_ids >= 0).float()                     # (B, N_total)
 
         token_sum   = torch.zeros(B, max_n_pack, device=device, dtype=sq_err.dtype)

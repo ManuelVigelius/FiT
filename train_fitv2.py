@@ -12,7 +12,7 @@ import diffusers
 from omegaconf import OmegaConf
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration, set_seed, DistributedDataParallelKwargs
 from tqdm.auto import tqdm
 from copy import deepcopy
 from fit.scheduler.transport import create_transport
@@ -187,11 +187,13 @@ def main():
     
     accelerator_project_cfg = ProjectConfiguration(project_dir=workdirnow, logging_dir=logging_dir)
     
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=grad_accu_steps,
         mixed_precision=accelerate_cfg.mixed_precision,
         log_with=getattr(accelerate_cfg, 'logger', 'wandb'),
         project_config=accelerator_project_cfg,
+        kwargs_handlers=[ddp_kwargs],
     )
     device = accelerator.device
     
@@ -359,8 +361,10 @@ def main():
                 global_steps = int(resume_from_path.split("-")[1]) # gs not calculate the gradient_accumulation_steps
                 logger.info(f"Resuming from steps: {global_steps}")
 
+    logger.info("Building dataset...")
     get_train_dataloader = instantiate_from_config(data_cfg)
     train_len = get_train_dataloader.train_len()
+    logger.info(f"Dataset built ({train_len} samples). Building sampler and dataloader...")
     train_dataloader = get_train_dataloader.train_dataloader(
         global_batch_size=sampler_batch_size, max_steps=accelerate_cfg.max_train_steps,
         resume_step=global_steps, seed=args.seed,
@@ -369,6 +373,7 @@ def main():
         pad_to_multiple=getattr(packed_cfg, 'pad_to_multiple', 128) if use_packed else 128,
     )
 
+    logger.info("Dataloader ready. Setting up optimizer...")
     # Warmup phase: freeze everything except the newly-added layers.
     # Run this before building the optimizer so only trainable params are included.
     if args.freeze_new_layers is not None:
@@ -401,18 +406,23 @@ def main():
         num_training_steps=accelerate_cfg.max_train_steps,
     )
     
-    # Prepare Accelerate
+    # Prepare Accelerate — packed mode uses a custom BatchSampler with no fixed batch_size,
+    # so even_batches must be False to prevent accelerate from trying to pad/shard it.
+    logger.info("Calling accelerator.prepare (distributes model + dataloader across GPUs)...")
+    if use_packed:
+        accelerator.even_batches = False
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         optimizer, train_dataloader, lr_scheduler
     )
+    logger.info("accelerator.prepare done.")
     
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process and getattr(accelerate_cfg, 'logger', 'wandb') != None:
         os.environ["WANDB_DIR"] = os.path.join(os.getcwd(), workdirnow)
         accelerator.init_trackers(
-            project_name=args.main_project_name, 
-            config=config, 
+            project_name=args.main_project_name,
+            config=OmegaConf.to_container(config, resolve=True, throw_on_missing=False),
             init_kwargs={"wandb": {"group": args.project_name}}
         )
     
@@ -437,17 +447,22 @@ def main():
             from pathlib import Path
             ckpt_dir = Path(ckpt_full_path)
             unwrapped_model = accelerator.unwrap_model(model)
+            # torch.compile wraps the model in OptimizedModule; unwrap_model only removes
+            # the DDP shell. Go one level deeper to get the raw nn.Module whose state_dict
+            # keys match the saved checkpoint (no "_orig_mod." prefix).
+            raw_model = getattr(unwrapped_model, '_orig_mod', unwrapped_model)
             model_file = ckpt_dir / "model.safetensors"
             if not model_file.exists():
                 model_file = ckpt_dir / "pytorch_model.bin"
             logger.info(f"reset_optimizer: loading model weights from {model_file}")
             from accelerate.checkpointing import load_model as _load_model
-            _load_model(unwrapped_model, str(model_file), device=str(accelerator.device))
+            _load_model(raw_model, str(model_file), device=str(accelerator.device))
             # Initialize EMA from the warmup model weights. The deepcopy above ran before
             # this load and still holds pretrained weights, so overwrite it here.
             if args.use_ema:
                 unwrapped_ema = accelerator.unwrap_model(ema_model)
-                unwrapped_ema.load_state_dict(unwrapped_model.state_dict())
+                raw_ema = getattr(unwrapped_ema, '_orig_mod', unwrapped_ema)
+                raw_ema.load_state_dict(raw_model.state_dict())
         else:
             # Normal resume: restore model, EMA, optimizer, scheduler, and step counter.
             error_times=0
@@ -463,9 +478,9 @@ def main():
                     if accelerator.is_local_main_process:
                         logger.warning(err)
                         logger.warning(f"Failed to resume from checkpoint {resume_from_path}")
-                        shutil.rmtree(ckpt_full_path)
                     else:
                         time.sleep(2)
+                    raise
     
     # save config
     OmegaConf.save(config=config, f=os.path.join(cfgdir, "config.yaml"))
@@ -489,6 +504,7 @@ def main():
     _profiling_active = False
 
     model.train()
+    logger.info("Entering training loop (first batch may trigger kernel compilation)...")
     train_loss = None  # accumulated as tensor to defer CPU-GPU sync to logging
     for step, batch in enumerate(train_dataloader, start=global_steps):
         # --- nsys profiler window ---
@@ -607,7 +623,7 @@ def main():
 
                 save_path = os.path.join(ckptdir, f"checkpoint-{global_steps}")
                 if accelerator.is_main_process:
-                    os.makedirs(save_path)
+                    os.makedirs(save_path, exist_ok=True)
                 accelerator.wait_for_everyone()
                 accelerator.save_state(save_path)
                 logger.info(f"Saved state to {save_path}")

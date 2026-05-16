@@ -1,13 +1,11 @@
 #!/bin/bash
 # Cluster training runner for FiT on visinf lab nodes.
-# Usage: bash tools/cluster_train.sh [A|B|C|WA|WC]
+# Usage: bash tools/cluster_train.sh [A|B|C|WA|WC] [--reset-optimizer]
 #
-#   A / B / C   — full training for the respective loss variant
-#   WA          — warmup for Loss A (freeze everything except size_embedder)
-#   WC          — warmup for Loss C (freeze everything except size_embedder + upsampler)
-#
-#   WA/WC share a workdir with their full counterpart (A/C). After warmup, run the
-#   full variant — it detects the warmup checkpoint and resets the optimizer automatically.
+#   A / B / C         — full training for the respective loss variant
+#   WA                — warmup for Loss A (freeze everything except size_embedder)
+#   WC                — warmup for Loss C (freeze everything except size_embedder + upsampler)
+#   --reset-optimizer — reset the optimizer state on start (use when transitioning warmup→full)
 #
 # Storage layout:
 #   /visinf/home/mb_mvigel/FiT                          code (this repo)
@@ -19,15 +17,20 @@
 
 set -e
 
-LOSS="${1:?Usage: cluster_train.sh [A|B|C|WA|WC]}"
+LOSS="${1:?Usage: cluster_train.sh [A|B|C|WA|WC] [--reset-optimizer]}"
+RESET_OPTIMIZER=false
+if [ "${2}" = "--reset-optimizer" ]; then
+  RESET_OPTIMIZER=true
+  echo "Reset optimizer flag set manually."
+fi
 
 REPO_DIR="/visinf/home/mb_mvigel/FiT"
-DATASET_SRC="/visinf/projects_students/mb_mvigel/datasets/greater_than_256_crop"
+DATASET_SRC="/visinf/projects_students/mb_mvigel/datasets"
 CHECKPOINT_SRC="/visinf/projects_students/mb_mvigel/checkpoints/model_ema.safetensors"
 CONDA_ENV="/visinf/projects_students/mb_mvigel/envs/fit"
 
 FASTDATA="/fastdata/mb_mvigel/fit"
-DATASET_FAST="$FASTDATA/datasets/imagenet1k_latents_256_sd_vae_ft_ema"
+DATASET_FAST="$FASTDATA/datasets"
 WORKDIR_FAST="$FASTDATA/workdir"
 
 PERSISTENT_OUT="/visinf/projects_students/mb_mvigel"
@@ -42,7 +45,6 @@ echo "Fastdata     : $FASTDATA"
 echo "GPUs         : $GPUS_PER_NODE"
 
 IS_WARMUP=false
-RESET_OPTIMIZER=false
 case "${LOSS^^}" in
   A)  CONFIG="$REPO_DIR/configs/fitv2/config_fitv2_xl_colab_a.yaml";       BASE_LOSS="a" ;;
   B)  CONFIG="$REPO_DIR/configs/fitv2/config_fitv2_xl_colab_b.yaml";       BASE_LOSS="b" ;;
@@ -53,15 +55,8 @@ case "${LOSS^^}" in
 esac
 
 PROJECT="fitv2_xl_cluster_${BASE_LOSS}"
-WORKDIR="$WORKDIR_FAST/$PROJECT"
+WORKDIR="$WORKDIR_FAST/workdir/$PROJECT"
 
-if [ "$IS_WARMUP" = false ] && [ -d "$WORKDIR/checkpoints" ]; then
-  CKPTS=$(ls "$WORKDIR/checkpoints" 2>/dev/null | grep "^checkpoint" | wc -l)
-  if [ "$CKPTS" -gt 0 ]; then
-    RESET_OPTIMIZER=true
-    echo "Warmup checkpoint detected — will reset optimizer for full training."
-  fi
-fi
 
 echo "Config       : $CONFIG"
 echo "Project      : $PROJECT"
@@ -70,11 +65,9 @@ echo ""
 
 # --- Activate conda environment ---
 echo "[1/3] Activating conda environment..."
-# Derive the conda base from the env path (two levels up from the env dir)
-CONDA_BASE="$(dirname "$(dirname "$CONDA_ENV")")"
-# shellcheck disable=SC1091
-source "$CONDA_BASE/etc/profile.d/conda.sh"
-conda activate "$CONDA_ENV"
+export PATH="$CONDA_ENV/bin:$PATH"
+export PYTHONNOUSERSITE=1
+export LD_LIBRARY_PATH="$(find "$CONDA_ENV/lib/python3.11/site-packages/nvidia" -name "lib" -type d | tr '\n' ':')$CONDA_ENV/lib/python3.11/site-packages/triton/backends/nvidia/lib/cupti:$LD_LIBRARY_PATH"
 
 # --- Copy dataset to fastdata ---
 if [ ! -d "$DATASET_FAST" ] || [ -z "$(ls -A "$DATASET_FAST" 2>/dev/null)" ]; then
@@ -124,7 +117,9 @@ echo "Launching training with $GPUS_PER_NODE GPUs..."
 mkdir -p "$WORKDIR"
 cd "$REPO_DIR"
 
-torchrun \
+export WANDB_MODE=offline
+
+python -m torch.distributed.run \
   --nnodes 1 \
   --nproc_per_node "$GPUS_PER_NODE" \
   --rdzv_id $RANDOM \
@@ -141,8 +136,8 @@ torchrun \
 # --- After warmup: automatically continue with full training ---
 if [ "$IS_WARMUP" = true ]; then
   echo ""
-  echo "Warmup complete. Starting full training for loss ${BASE_LOSS^^}..."
-  exec bash "$0" "${BASE_LOSS^^}"
+  echo "Warmup complete. Launching full training for loss ${BASE_LOSS^^} (optimizer reset)..."
+  exec bash "$0" "${BASE_LOSS^^}" --reset-optimizer
 fi
 
 # --- Move workdir to persistent storage ---
@@ -156,7 +151,7 @@ echo "Workdir moved."
 # --- Export final model weights ---
 # The accelerate checkpoints bundle optimizer + scheduler state. Extract just the
 # model (and EMA) weights as plain safetensors for inference / further fine-tuning.
-LATEST_CKPT=$(ls -d "$WORKDIR_OUT/checkpoints/checkpoint-"* 2>/dev/null \
+LATEST_CKPT=$(ls -d "$WORKDIR_OUT/checkpoints/"*checkpoint-* 2>/dev/null \
   | sort -t- -k2 -n | tail -1)
 if [ -n "$LATEST_CKPT" ]; then
   CKPT_OUT="$PERSISTENT_OUT/checkpoints/${PROJECT}"

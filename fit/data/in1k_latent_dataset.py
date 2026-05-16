@@ -92,11 +92,13 @@ class IN1kLatentDataset(Dataset):
 
         feature[:seq_len] = feat_hw.reshape(seq_len, 16)
 
-        # Recompute integer grid for the current resolution
+        # Recompute integer grid for the current resolution.
+        # Convention matches dataset files: grid[0]=width coords (fast), grid[1]=height coords (slow).
+        # Verified against saved .safetensors: w varies fastest (0,1,2,...,W-1,0,1,...).
         hs = torch.arange(H_g, dtype=dtype)
         ws = torch.arange(W_g, dtype=dtype)
         gh, gw = torch.meshgrid(hs, ws, indexing='ij')
-        grid[:, :seq_len] = torch.stack([gh.reshape(-1), gw.reshape(-1)])
+        grid[:, :seq_len] = torch.stack([gw.reshape(-1), gh.reshape(-1)])
 
         mask[:seq_len] = 1
         size  = torch.tensor([[H_g, W_g]], dtype=torch.int32)
@@ -156,10 +158,13 @@ class TokenBudgetBatchSampler(BatchSampler):
         # __getitem__ uses the same draw rather than re-sampling independently.
         if resize_range is not None:
             min_g, max_g = resize_range
-            valid = list(range(min_g, max_g + 1))
-            rng = random.Random(seed)
-            self._grid_sizes = [rng.choice(valid) for _ in sampler]
-            self._lengths = [g ** 2 for g in self._grid_sizes]
+            valid = torch.arange(min_g, max_g + 1)
+            rng = torch.Generator()
+            rng.manual_seed(seed)
+            picks = torch.randint(len(valid), (len(sampler),), generator=rng)
+            gs = valid[picks]
+            self._grid_sizes = gs.tolist()
+            self._lengths = (gs ** 2).tolist()
         else:
             self._grid_sizes = [None] * len(sampler)
             self._lengths = [target_len] * len(sampler)
@@ -289,7 +294,7 @@ def get_train_sampler(dataset, global_batch_size, max_steps, resume_steps, seed)
         sample_indices[fill_ptr: fill_ptr + epoch_sample_indices.size(0)] = \
             epoch_sample_indices
         fill_ptr += epoch_sample_indices.size(0)
-    return sample_indices[resume_steps * global_batch_size : ].tolist()
+    return sample_indices[resume_steps * global_batch_size : ]
 
 
    

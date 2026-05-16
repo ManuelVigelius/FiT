@@ -59,7 +59,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 VAE_PATH = "stabilityai/sd-vae-ft-ema"
 
 # Output directory for generated images.
-OUTPUT_DIR = "generated_images"
+OUTPUT_DIR = "/visinf/projects_students/mb_mvigel/images"
 
 # Global seed for reproducibility.
 GLOBAL_SEED = 42
@@ -89,21 +89,26 @@ _BASE_MODEL_CFG = dict(
 )
 
 # Checkpoints to generate from.
+# For accelerate checkpoints, set `dir` to the checkpoint-NNNN directory;
+# the script will resolve model.safetensors / ema_model.safetensors inside it.
+# For plain .safetensors files (e.g. baseline), set `dir` to the file path directly.
 CHECKPOINTS = [
     dict(
         name="baseline",
-        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-baseline",
+        dir="/visinf/projects_students/mb_mvigel/checkpoints/model_ema.safetensors",
         loss_type="baseline",
     ),
     dict(
-        name="loss_a_8k",
-        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-8000-bs8k",
+        name="loss_a_8k_ema",
+        dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
         loss_type="A",
+        use_ema=True,
     ),
     dict(
-        name="loss_c_6k",
-        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-6000-bs8k-lossc",
-        loss_type="C",
+        name="loss_a_8k_train",
+        dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
+        loss_type="A",
+        use_ema=False,
     ),
 ]
 
@@ -160,12 +165,13 @@ def load_model(ckpt_path: str, cfg: dict, device: str) -> FiT:
 
 def make_grid_and_mask(H_g: int, W_g: int, B: int, device: torch.device, dtype: torch.dtype):
     """Build grid, mask, and size tensors for a given grid shape."""
-    grid_h = torch.arange(H_g, dtype=torch.long)
-    grid_w = torch.arange(W_g, dtype=torch.long)
-    grid = torch.meshgrid(grid_w, grid_h, indexing='xy')
-    grid = torch.cat([grid[0].reshape(1, -1),
-                      grid[1].reshape(1, -1)], dim=0)
-    grid = grid.repeat(B, 1, 1).to(device=device, dtype=dtype)
+    # ── identical to IN1kLatentDataset.__getitem__ grid construction ──────────
+    hs = torch.arange(H_g, dtype=dtype)
+    ws = torch.arange(W_g, dtype=dtype)
+    gh, gw = torch.meshgrid(hs, ws, indexing='ij')
+    grid = torch.stack([gw.reshape(-1), gh.reshape(-1)])
+    # ─────────────────────────────────────────────────────────────────────────
+    grid = grid.unsqueeze(0).repeat(B, 1, 1).to(device=device, dtype=dtype)
     mask = torch.ones(B, H_g * W_g, device=device, dtype=dtype)
     size = torch.tensor((H_g, W_g), dtype=torch.int32, device=device).repeat(B, 1).unsqueeze(1)
     return grid, mask, size
@@ -297,6 +303,16 @@ def main():
     W_fr = TARGET_LEN_PIX // (PATCH_SIZE * VAE_SCALE)
     print(f"Full-res grid: {H_fr}×{W_fr}")
 
+    # Pre-generate fixed labels and full-res noise shared across all checkpoints.
+    # Compressed noise for each grid size is derived from full-res noise by downsampling
+    # so that the same underlying randomness is used regardless of loss type.
+    all_labels = torch.randint(0, NUM_CLASSES, (N_IMAGES,), device=DEVICE)
+    # Full-res noise in spatial form (N, C, H*p, W*p) — used directly for baseline/C,
+    # downsampled to token form for A/B.
+    all_noise_fr_sp = torch.randn(N_IMAGES, C_IN, H_fr * PATCH_SIZE, W_fr * PATCH_SIZE,
+                                  device=DEVICE)
+    print(f"Fixed labels and noise pre-generated (seed={GLOBAL_SEED}).")
+
     # VAE for decoding.
     print(f"\nLoading VAE from {VAE_PATH} …")
     vae = AutoencoderKL.from_pretrained(VAE_PATH).to(DEVICE).eval()
@@ -305,8 +321,17 @@ def main():
         ckpt_name = ckpt_cfg["name"]
         ckpt_dir  = ckpt_cfg["dir"]
         loss_type = ckpt_cfg["loss_type"]
+        use_ema   = ckpt_cfg.get("use_ema", None)  # None → plain file, True/False → accel dir
 
-        ckpt_path = os.path.join(ckpt_dir, "model_1.safetensors")
+        # Resolve the actual .safetensors file.
+        if os.path.isfile(ckpt_dir):
+            # Plain file (e.g. baseline model_ema.safetensors).
+            ckpt_path = ckpt_dir
+        else:
+            # Accelerate checkpoint directory: pick ema or train weights.
+            fname = "model_1.safetensors" if use_ema else "model.safetensors"
+            ckpt_path = os.path.join(ckpt_dir, fname)
+
         print(f"\n{'='*60}")
         print(f"Checkpoint: {ckpt_name}  loss={loss_type}")
         print(f"  {ckpt_path}")
@@ -327,21 +352,19 @@ def main():
             while generated < N_IMAGES:
                 bs = min(BATCH_SIZE, N_IMAGES - generated)
 
-                # Random labels.
-                y = torch.randint(0, NUM_CLASSES, (bs,), device=DEVICE)
+                y = all_labels[generated:generated + bs]
 
-                # Initial noise.
-                # Loss C: full-res spatial tensor (B, C_IN, H_fr*p, W_fr*p).
-                # Baseline: token form at full-res. A/B: token form at compressed grid.
+                # Derive noise from the shared full-res spatial noise.
+                noise_fr_sp = all_noise_fr_sp[generated:generated + bs].to(dtype)
                 if loss_type == "C":
-                    z = torch.randn(bs, C_IN, H_fr * PATCH_SIZE, W_fr * PATCH_SIZE,
-                                    device=DEVICE, dtype=dtype)
+                    z = noise_fr_sp
+                elif loss_type == "baseline":
+                    z = patchify(noise_fr_sp, PATCH_SIZE)
                 else:
-                    use_fr_noise = (loss_type == "baseline")
-                    H_noise = H_fr if use_fr_noise else H_g
-                    W_noise = W_fr if use_fr_noise else W_g
-                    z = torch.randn(bs, H_noise * W_noise, PATCH_SIZE**2 * C_IN,
-                                    device=DEVICE, dtype=dtype)
+                    # A/B: downsample full-res spatial noise to the compressed grid.
+                    noise_lr_sp = F.interpolate(noise_fr_sp, size=(H_g * PATCH_SIZE, W_g * PATCH_SIZE),
+                                                mode='bilinear', align_corners=True)
+                    z = patchify(noise_lr_sp, PATCH_SIZE)
 
                 # Run Euler sampler → (B, C_IN, H_fr*p, W_fr*p) spatial latent.
                 x1_sp = euler_sample(
@@ -374,7 +397,7 @@ def main():
 
         del model
 
-    zip_path = OUTPUT_DIR + ".zip"
+    zip_path = OUTPUT_DIR.rstrip("/") + ".zip"
     print(f"\nZipping {OUTPUT_DIR}/ → {zip_path} …")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for fpath in sorted(Path(OUTPUT_DIR).rglob("*")):
