@@ -24,6 +24,7 @@ For loss_type='virtual_resize', only img_mse_fr is computed:
 import os
 import sys
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -35,10 +36,10 @@ from torch.utils.data import DataLoader, Subset
 # ─────────────────────────────── CONFIG ─────────────────────────────────────
 
 # Dataset root (same layout as training).
-DATA_PATH = "datasets/imagenet1k_latents_256_sd_vae_ft_ema"
+DATA_PATH = "/visinf/projects_students/mb_mvigel/datasets"
 
 # Use the last N samples from the dataset for evaluation.
-N_EVAL_SAMPLES = 256
+N_EVAL_SAMPLES = 128
 
 # Compression grid sizes to evaluate.  Each entry is a square grid side-length
 # (must be even; the latent patch size is 2, so spatial size = grid*2).
@@ -95,28 +96,34 @@ _BASE_MODEL_CFG = dict(
 CHECKPOINTS = [
     dict(
         name="baseline",
-        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-baseline",
+        dir="/visinf/projects_students/mb_mvigel/checkpoints/model_ema.safetensors",
         loss_type="baseline",
     ),
     dict(
         name="baseline_virtual_resize",
-        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-baseline",
+        dir="/visinf/projects_students/mb_mvigel/checkpoints/model_ema.safetensors",
         loss_type="virtual_resize",
     ),
     dict(
-        name="loss_a_8k",
-        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-8000-bs8k",
-        loss_type="A",
+        name="zero_velocity",
+        loss_type="zero_velocity_model",
     ),
     dict(
-        name="loss_c_8k",
-        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-8000-bs8k-lossc",
-        loss_type="C",
+        name="loss_a_8k_ema",
+        dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
+        loss_type="A",
+        use_ema=True,
+    ),
+    dict(
+        name="loss_a_8k_train",
+        dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
+        loss_type="A",
+        use_ema=False,
     ),
 ]
 
 # Output file for results (JSON).
-OUTPUT_JSON = "eval_losses_results.json"
+OUTPUT_JSON = "/visinf/projects_students/mb_mvigel/eval_losses_results.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -127,6 +134,62 @@ from fit.data.in1k_latent_dataset import IN1kLatentDataset
 
 # ──────────────────────────── helpers ────────────────────────────────────────
 
+
+
+def sample_paired_noise(
+    B: int,
+    H_fr: int, W_fr: int,
+    H_lr: int, W_lr: int,
+    sigma: torch.Tensor,
+    sigma_inj: torch.Tensor,
+    x1_fr: torch.Tensor,
+    x1_lr: torch.Tensor,
+    p: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample synchronized, isotropic noise at FR and LR via a common SCM grid.
+
+    Draws i.i.d. Gaussian noise at the smallest grid whose size is a multiple of
+    both H_fr and H_lr (assuming square grids), then area-pools down to each target
+    resolution. This keeps the two noise vectors correlated and isotropic regardless
+    of the ratio between sizes.
+
+    Raises ValueError if the SCM grid is more than 8x larger than the FR grid.
+
+    Returns:
+        xt_fr    – noisy full-res tokens  (B, H_fr*W_fr, C), mixed with sigma
+        xt_lr    – noisy low-res tokens   (B, H_lr*W_lr, C), mixed with sigma_inj
+        x0_fr    – noise at FR resolution (B, H_fr*W_fr, C)
+        x0_lr    – noise at LR resolution (B, H_lr*W_lr, C)
+    """
+    H_scm = math.lcm(H_fr, H_lr)
+    W_scm = math.lcm(W_fr, W_lr)
+
+    if H_scm > 8 * H_fr or W_scm > 8 * W_fr:
+        raise ValueError(
+            f"SCM grid ({H_scm}x{W_scm}) is more than 8x larger than FR grid "
+            f"({H_fr}x{W_fr}). Reduce the size difference between FR and LR."
+        )
+
+    C = x1_fr.shape[-1]
+    x0_scm = torch.randn(B, H_scm * W_scm, C, dtype=x1_fr.dtype, device=x1_fr.device)
+
+    # Area-pooling by factor s reduces std by 1/s; rescale each output to std 1.
+    x0_fr = spatial_resize(x0_scm, H_scm, W_scm, H_fr, W_fr, p=p, mode='area') * (H_scm / H_fr)
+    x0_lr = spatial_resize(x0_scm, H_scm, W_scm, H_lr, W_lr, p=p, mode='area') * (H_scm / H_lr)
+
+    sigma_fr  = sigma.view(B, 1, 1)
+    sigma_lr  = sigma_inj.view(B, 1, 1)
+
+    xt_fr = (1.0 - sigma_fr) * x1_fr + sigma_fr * x0_fr
+    xt_lr = (1.0 - sigma_lr) * x1_lr + sigma_lr * x0_lr
+
+    return xt_fr, xt_lr, x0_fr, x0_lr
+
+
+class ZeroVelocityModel:
+    """Always predicts zero velocity — used to cross-check the zero_velocity baseline."""
+    def __call__(self, x, *args, **kwargs):
+        return torch.zeros_like(x)  # args/kwargs intentionally ignored
 
 
 def spatial_resize_sp(x_sp: torch.Tensor,
@@ -248,15 +311,10 @@ def evaluate_at_compression(
         hs = torch.arange(H_lr, dtype=x1_lr.dtype, device=device)
         ws = torch.arange(W_lr, dtype=x1_lr.dtype, device=device)
         gh, gw = torch.meshgrid(hs, ws, indexing="ij")
-        grid_lr = torch.zeros(B, 2, TARGET_LEN, dtype=x1_lr.dtype, device=device)
-        grid_lr[:, 0, :seq_lr] = gh.reshape(-1).unsqueeze(0).expand(B, -1)
-        grid_lr[:, 1, :seq_lr] = gw.reshape(-1).unsqueeze(0).expand(B, -1)
+        # grid[0]=width coords, grid[1]=height coords (matches dataset and rope convention)
+        grid_lr = torch.stack([gw.reshape(-1), gh.reshape(-1)]).unsqueeze(0).expand(B, -1, -1)
 
-        mask_lr_seq = torch.zeros(B, TARGET_LEN, dtype=torch.uint8, device=device)
-        mask_lr_seq[:, :seq_lr] = 1
-
-        feat_lr_padded = torch.zeros(B, TARGET_LEN, 16, dtype=x1_lr.dtype, device=device)
-        feat_lr_padded[:, :seq_lr] = x1_lr
+        mask_lr_seq = torch.ones(B, seq_lr, dtype=torch.uint8, device=device)
 
         size_lr_t = torch.tensor([[H_lr, W_lr]], dtype=torch.int32, device=device).expand(B, -1).unsqueeze(1)
 
@@ -271,7 +329,7 @@ def evaluate_at_compression(
         # When the low-res grid is smaller than full-res, injecting noise at
         # sigma would yield a different effective SNR after bilinear downsampling.
         # The training code corrects for this via:
-        #   sigma_inj = sigma / (r + sigma * (1 - r))
+        #   sigma_inj = sigma * r / (1 - sigma * (1 - r))
         # where r = H_lr / H_fr.  At full resolution (r == 1) sigma_inj = sigma.
         r = H_lr / H_fr
 
@@ -280,30 +338,22 @@ def evaluate_at_compression(
             t = t_val.expand(B).to(device).to(x1_lr.dtype)
 
             # Compute noise-corrected injection sigma (scalar → (B,)).
-            sigma = 1.0 - t                                       # (B,)
-            if r < 1.0:
-                sigma_inj = sigma / (r + sigma * (1.0 - r))      # (B,)
-            else:
-                sigma_inj = sigma                                  # no correction needed
+            sigma = 1.0 - t                                              # (B,)
+            sigma_inj = sigma * r / (1.0 - sigma * (1.0 - r))           # (B,)
 
-            # Build noisy latent: start from full-res i.i.d. noise, form xt_fr
-            # with plain sigma, then downsample (area) to get xt_lr.  sigma_inj
-            # is used only as the conditioning timestep fed to the model.
-            sigma_exp = sigma.view(B, 1, 1)
-            x0_fr = torch.randn_like(x1_fr)                        # (B, N_fr, 16)
-            xt_fr = (1.0 - sigma_exp) * x1_fr + sigma_exp * x0_fr  # (B, N_fr, 16)
-            xt_lr_valid = spatial_resize(xt_fr, H_fr, W_fr, H_lr, W_lr, mode='area')  # (B, seq_lr, 16)
+            xt_fr, xt_lr_valid, x0_fr, x0_lr = sample_paired_noise(
+                B, H_fr, W_fr, H_lr, W_lr, sigma, sigma_inj, x1_fr, x1_lr, p=p,
+            )
 
+            sigma_exp = sigma_inj.view(B, 1, 1)
             xt_fr_sp = unpatchify(xt_fr, (H_fr * p, W_fr * p), p)
             ut_fr = x1_fr - x0_fr                                        # (B, N_fr, 16)
-            x0_lr = spatial_resize(x0_fr, H_fr, W_fr, H_lr, W_lr)       # (B, seq_lr, 16)
             ut_lr = x1_lr - x0_lr                                        # (B, seq_lr, 16)
 
             if use_resnet_upsampler:
+                raise ValueError("The current implementation is not correct, please fix this first!")
                 # ── Loss C ───────────────────────────────────────────────────
-                xt_lr_c_padded = torch.zeros(B, TARGET_LEN, 16, dtype=x1_lr.dtype, device=device)
-                xt_lr_c_padded[:, :seq_lr] = xt_lr_valid
-                v_pred_lr = model(xt_lr_c_padded, t, **model_kwargs)[:, :seq_lr, :]
+                v_pred_lr = model(xt_lr_valid, 1 - sigma_inj, **model_kwargs)
 
                 # Upsample the LR velocity prediction and run ResNet (mirrors training).
                 v_lr_sp = unpatchify(v_pred_lr, (H_lr * p, W_lr * p), p)
@@ -314,17 +364,11 @@ def evaluate_at_compression(
                 x1_hat_fr = patchify(x1_hat_sp_fr, p)
             else:
                 # ── Loss A/B ─────────────────────────────────────────────────
-                xt_padded = torch.zeros(B, TARGET_LEN, 16, dtype=x1_lr.dtype, device=device)
-                xt_padded[:, :seq_lr] = xt_lr_valid
-                v_pred_lr = model(xt_padded, 1 - sigma_inj, **model_kwargs)[:, :seq_lr, :]
+                v_pred_lr = model(xt_lr_valid, 1 - sigma_inj, **model_kwargs)
 
-                # Upsample the clean prediction rather than the velocity so noise
-                # is never interpolated.
-                x1_hat_lr = xt_lr_valid + sigma_exp * v_pred_lr
-                x1_hat_lr_sp = unpatchify(x1_hat_lr, (H_lr * p, W_lr * p), p)
-                x1_hat_fr_sp = spatial_resize_sp(x1_hat_lr_sp, H_fr, W_fr)
-                x1_hat_fr = patchify(x1_hat_fr_sp, p)
-                v_pred_fr = x1_hat_fr - x0_fr
+                v_pred_lr_sp = unpatchify(v_pred_lr, (H_lr * p, W_lr * p), p)
+                v_pred_fr_sp = spatial_resize_sp(v_pred_lr_sp, H_fr, W_fr)
+                v_pred_fr = patchify(v_pred_fr_sp, p)
 
             # ── low-res metrics (shared) ─────────────────────────────────────
             x1_hat_lr = xt_lr_valid + sigma_exp * v_pred_lr
@@ -332,6 +376,11 @@ def evaluate_at_compression(
             img_mse_lr  = ((x1_hat_lr - x1_lr) * mask_lr).pow(2).mean(dim=[1, 2]).mean()
 
             # ── full-res metrics (shared) ────────────────────────────────────
+            x1_hat_lr_sp = unpatchify(x0_lr + v_pred_lr, (H_lr * p, W_lr * p), p)
+            x1_hat_lr_up_sp = spatial_resize_sp(x1_hat_lr_sp, H_fr, W_fr)
+            x1_hat_lr_up = patchify(x1_hat_lr_up_sp, p)
+            sigma_fr = sigma.view(B, 1, 1)
+            x1_hat_fr = (1.0 - sigma_fr) * x1_fr + sigma_fr * x1_hat_lr_up
             vel_loss_fr = ((v_pred_fr - ut_fr) * mask_fr).pow(2).mean(dim=[1, 2]).mean()
             img_mse_fr  = ((x1_hat_fr - x1_fr) * mask_fr).pow(2).mean(dim=[1, 2]).mean()
 
@@ -409,14 +458,10 @@ def evaluate_at_compression_virtual_resize(
         hs = torch.arange(H_fr, dtype=x1_fr.dtype, device=device)
         ws = torch.arange(W_fr, dtype=x1_fr.dtype, device=device)
         gh, gw = torch.meshgrid(hs, ws, indexing="ij")
-        grid_fr = torch.zeros(B, 2, TARGET_LEN, dtype=x1_fr.dtype, device=device)
-        grid_fr[:, 0, :seq_fr] = gh.reshape(-1).unsqueeze(0).expand(B, -1)
-        grid_fr[:, 1, :seq_fr] = gw.reshape(-1).unsqueeze(0).expand(B, -1)
+        # grid[0]=width coords, grid[1]=height coords (matches dataset and rope convention)
+        grid_fr = torch.stack([gw.reshape(-1), gh.reshape(-1)]).unsqueeze(0).expand(B, -1, -1)
 
-        mask_fr_seq = torch.zeros(B, TARGET_LEN, dtype=torch.uint8, device=device)
-        mask_fr_seq[:, :seq_fr] = 1
-
-        feat_fr_padded = torch.zeros(B, TARGET_LEN, 16, dtype=x1_fr.dtype, device=device)
+        mask_fr_seq = torch.ones(B, seq_fr, dtype=torch.uint8, device=device)
 
         size_fr_t = torch.tensor([[H_fr, W_fr]], dtype=torch.int32, device=device).expand(B, -1).unsqueeze(1)
 
@@ -452,11 +497,7 @@ def evaluate_at_compression_virtual_resize(
             xt_virtual = (1.0 - sigma) * x1_virtual + sigma * x0_virtual
             xt_fr = (1.0 - sigma) * x1_fr + sigma * x0_fr
 
-            feat_fr_padded[:, :seq_fr] = xt_virtual
-            xt_padded = feat_fr_padded.clone()
-
-            v_pred_padded = model(xt_padded, t, **model_kwargs)  # (B, target_len, 16)
-            v_pred_fr = v_pred_padded[:, :seq_fr, :]             # (B, N_fr, 16)
+            v_pred_fr = model(xt_virtual, t, **model_kwargs)  # (B, N_fr, 16)
 
             # Recover predicted clean latent: x1_hat = xt + sigma * v_pred
             x1_hat_fr = xt_fr + sigma * v_pred_fr                # (B, N_fr, 16)
@@ -482,6 +523,8 @@ def evaluate_at_compression_virtual_resize(
             "img_mse_fr":  sums["img_mse_fr"][ti].item()  / n,
         }
     return results
+
+
 
 
 # ──────────────────────────── main ───────────────────────────────────────────
@@ -513,17 +556,27 @@ def main():
 
     for ckpt_cfg in CHECKPOINTS:
         ckpt_name = ckpt_cfg["name"]
-        ckpt_dir  = ckpt_cfg["dir"]
         loss_type = ckpt_cfg["loss_type"]
-        model_cfg = model_cfg_for(loss_type)
 
-        weight_files = {
-            "ema": os.path.join(ckpt_dir, "model_1.safetensors"),
-        }
+        print(f"\n{'='*60}")
 
-        for weight_name, ckpt_path in weight_files.items():
-            run_key = f"{ckpt_name}/{weight_name}"
-            print(f"\n{'='*60}")
+        if loss_type == "zero_velocity_model":
+            print(f"Checkpoint: {ckpt_name}  loss={loss_type}  (ZeroVelocityModel stub)")
+            model = ZeroVelocityModel()
+        else:
+            ckpt_dir  = ckpt_cfg["dir"]
+            use_ema   = ckpt_cfg.get("use_ema", None)  # None → plain file
+            model_cfg = model_cfg_for(loss_type)
+
+            # Resolve the actual .safetensors file (same logic as generate_images.py).
+            if os.path.isfile(ckpt_dir):
+                ckpt_path = ckpt_dir
+                weight_name = "plain"
+            else:
+                fname = "model_1.safetensors" if use_ema else "model.safetensors"
+                ckpt_path = os.path.join(ckpt_dir, fname)
+                weight_name = "ema" if use_ema else "train"
+
             print(f"Checkpoint: {ckpt_name}  loss={loss_type}  weights={weight_name}")
             print(f"  {ckpt_path}")
             if not os.path.isfile(ckpt_path):
@@ -532,51 +585,52 @@ def main():
 
             model = load_model(ckpt_path, model_cfg, DEVICE)
 
-            results_for_run = {}
+        results_for_run = {}
 
-            for g in COMPRESSIONS:
-                print(f"\n  Compression grid={g}×{g}  (seq_len={g*g} tokens, "
-                      f"spatial={g*2}×{g*2} latent pixels)")
+        for g in COMPRESSIONS:
+            print(f"\n  Compression grid={g}×{g}  (seq_len={g*g} tokens, "
+                  f"spatial={g*2}×{g*2} latent pixels)")
 
-                if loss_type == "virtual_resize":
-                    per_t = evaluate_at_compression_virtual_resize(
-                        model=model,
-                        dataloader=dataloader,
-                        grid_size=g,
-                        timesteps=timesteps,
-                        device=DEVICE,
-                    )
-                    results_for_run[f"grid_{g}x{g}"] = per_t
+            if loss_type == "virtual_resize":
+                per_t = evaluate_at_compression_virtual_resize(
+                    model=model,
+                    dataloader=dataloader,
+                    grid_size=g,
+                    timesteps=timesteps,
+                    device=DEVICE,
+                )
+                results_for_run[f"grid_{g}x{g}"] = per_t
 
-                    header = f"{'t':>8}  {'vel_fr':>10}  {'img_fr':>10}"
-                    print(f"    {header}")
-                    print(f"    {'-'*len(header)}")
-                    for t_key, vals in per_t.items():
-                        print(f"    {float(t_key):8.4f}  "
-                              f"{vals['vel_loss_fr']:10.6f}  "
-                              f"{vals['img_mse_fr']:10.6f}")
-                else:
-                    per_t = evaluate_at_compression(
-                        model=model,
-                        dataloader=dataloader,
-                        grid_size=g,
-                        timesteps=timesteps,
-                        device=DEVICE,
-                        use_resnet_upsampler=(loss_type == "C"),
-                    )
-                    results_for_run[f"grid_{g}x{g}"] = per_t
+                header = f"{'t':>8}  {'vel_fr':>10}  {'img_fr':>10}"
+                print(f"    {header}")
+                print(f"    {'-'*len(header)}")
+                for t_key, vals in per_t.items():
+                    print(f"    {float(t_key):8.4f}  "
+                          f"{vals['vel_loss_fr']:10.6f}  "
+                          f"{vals['img_mse_fr']:10.6f}")
+            else:
+                per_t = evaluate_at_compression(
+                    model=model,
+                    dataloader=dataloader,
+                    grid_size=g,
+                    timesteps=timesteps,
+                    device=DEVICE,
+                    use_resnet_upsampler=(loss_type == "C"),
+                )
+                results_for_run[f"grid_{g}x{g}"] = per_t
 
-                    header = f"{'t':>8}  {'vel_lr':>10}  {'vel_fr':>10}  {'img_lr':>10}  {'img_fr':>10}"
-                    print(f"    {header}")
-                    print(f"    {'-'*len(header)}")
-                    for t_key, vals in per_t.items():
-                        print(f"    {float(t_key):8.4f}  "
-                              f"{vals['vel_loss_lr']:10.6f}  "
-                              f"{vals['vel_loss_fr']:10.6f}  "
-                              f"{vals['img_mse_lr']:10.6f}  "
-                              f"{vals['img_mse_fr']:10.6f}")
+                header = f"{'t':>8}  {'vel_lr':>10}  {'vel_fr':>10}  {'img_lr':>10}  {'img_fr':>10}"
+                print(f"    {header}")
+                print(f"    {'-'*len(header)}")
+                for t_key, vals in per_t.items():
+                    print(f"    {float(t_key):8.4f}  "
+                          f"{vals['vel_loss_lr']:10.6f}  "
+                          f"{vals['vel_loss_fr']:10.6f}  "
+                          f"{vals['img_mse_lr']:10.6f}  "
+                          f"{vals['img_mse_fr']:10.6f}")
 
-            all_results[run_key] = results_for_run
+        all_results[ckpt_name] = results_for_run
+        del model
 
     # Save to JSON.
     with open(OUTPUT_JSON, "w") as f:

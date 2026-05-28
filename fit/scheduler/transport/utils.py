@@ -45,6 +45,9 @@ def spatial_resize(x: torch.Tensor, H: int, W: int,
     Returns:
         same leading dims, N replaced by H_out*W_out
     """
+    if H == H_out and W == W_out:
+        return x
+    
     batched = x.dim() == 3
     if not batched:
         x = x.unsqueeze(0)

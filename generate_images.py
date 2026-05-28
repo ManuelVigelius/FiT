@@ -1,23 +1,23 @@
 """
-Image generation script: generates 128 images per (model, compression) pair using
-a 10-step Euler ODE sampler with CFG=4.0.
+Image generation script: generates images per (model, schedule) pair using
+a 16-step Euler ODE sampler with CFG=4.0.
 
-The sampling mirrors the full-res velocity error evaluation in eval_losses.py:
-  - For baseline / virtual_resize: the model runs at full resolution (16×16 grid),
-    noise is sampled at full-res, and the trajectory integrates v_pred at full-res.
-  - For loss A/B: the model runs at the compressed grid with size conditioning;
-    the predicted clean latent is bilinearly upsampled to full-res before decoding.
-  - For loss C: as A/B but the ResNet upsampler refines the predicted clean latent.
+Each schedule is a length-16 sequence of grid sizes interpolated from a
+length-4 combination of [1, 6, 11, 16] that ends at 16 (full-res).
+At every step the model runs at that step's grid size; the clean prediction
+is upscaled and accumulated into a full-res running mean.
 
 Generated images are saved as PNG under:
-  <OUTPUT_DIR>/<ckpt_name>/grid_<g>x<g>/<idx:06d>.png
+  <OUTPUT_DIR>/<ckpt_name>/schedule_<idx>/<idx:06d>.png
 
 All configuration lives in the CONFIG block below — no CLI arguments needed.
 """
 
 import os
+import shutil
 import sys
 import zipfile
+from itertools import combinations_with_replacement
 from pathlib import Path
 
 import torch
@@ -29,18 +29,38 @@ from diffusers.models import AutoencoderKL
 
 # ─────────────────────────────── CONFIG ─────────────────────────────────────
 
-# Compression grid sizes to generate at.  Each entry is a square grid side-length.
-# The full-res grid for 256×256 images is 16×16 (spatial latent 32×32, patch 2×2).
-COMPRESSIONS = [2, 8, 16]
+# Scale schedules: all length-4 combinations (with replacement) from the digit set
+# that end at 16 (full-res), each interpolated to 16 steps.
+def _make_schedules():
+    digits = [1, 6, 11, 16]
 
-# Number of images to generate per (checkpoint, compression) pair.
-N_IMAGES = 4
+    def interpolate(seq, target_len=16):
+        n = len(seq)
+        segments = target_len - 1
+        gaps = n - 1
+        steps_per_gap = segments // gaps
+        result = []
+        for i in range(gaps):
+            a, b = seq[i], seq[i + 1]
+            for j in range(steps_per_gap):
+                result.append(int(round(a + j * (b - a) / steps_per_gap)))
+        result.append(seq[-1])
+        return result
+
+    return {
+        idx: interpolate(x)
+        for idx, x in enumerate(combinations_with_replacement(digits, 4))
+        if x[-1] == digits[-1]
+    }
+
+SCHEDULES = {0: [16] * 16}
+N_STEPS = 16
+
+# Number of images to generate per (checkpoint, schedule) pair.
+N_IMAGES = 6
 
 # Batch size for the generation loop (single GPU).
 BATCH_SIZE = 32
-
-# Number of Euler ODE steps.
-N_STEPS = 10
 
 # Classifier-free guidance scale.
 CFG_SCALE = 4.0
@@ -98,18 +118,18 @@ CHECKPOINTS = [
         dir="/visinf/projects_students/mb_mvigel/checkpoints/model_ema.safetensors",
         loss_type="baseline",
     ),
-    dict(
-        name="loss_a_8k_ema",
-        dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
-        loss_type="A",
-        use_ema=True,
-    ),
-    dict(
-        name="loss_a_8k_train",
-        dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
-        loss_type="A",
-        use_ema=False,
-    ),
+    # dict(
+    #     name="loss_a_8k_ema",
+    #     dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
+    #     loss_type="A",
+    #     use_ema=True,
+    # ),
+    # dict(
+    #     name="loss_a_8k_train",
+    #     dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
+    #     loss_type="A",
+    #     use_ema=False,
+    # ),
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,19 +141,11 @@ C_IN       = 4   # VAE latent channels
 sys.path.insert(0, str(Path(__file__).parent))
 
 from fit.model.fit_model import FiT
-from fit.scheduler.transport.utils import patchify, unpatchify, spatial_resize as _spatial_resize
+from fit.noise_field_sampler.noise_field_sampler import sample as noise_field_sample
+from fit.scheduler.transport.utils import patchify, unpatchify
 
 
 # ──────────────────────────── helpers ────────────────────────────────────────
-
-def spatial_resize(x: torch.Tensor, H: int, W: int,
-                   H_out: int, W_out: int,
-                   patch_size: int = PATCH_SIZE,
-                   mode: str = 'bilinear') -> torch.Tensor:
-    if H == H_out and W == W_out:
-        return x
-    return _spatial_resize(x, H, W, H_out, W_out, patch_size, mode)
-
 
 def spatial_resize_sp(x_sp: torch.Tensor,
                       H_out: int, W_out: int,
@@ -148,7 +160,6 @@ def spatial_resize_sp(x_sp: torch.Tensor,
 def model_cfg_for(loss_type: str) -> dict:
     cfg = dict(_BASE_MODEL_CFG)
     cfg["use_size_cond"] = (loss_type not in ("baseline", "virtual_resize"))
-    cfg["use_upsampler"] = (loss_type == "C")
     return cfg
 
 
@@ -176,123 +187,194 @@ def make_grid_and_mask(H_g: int, W_g: int, B: int, device: torch.device, dtype: 
     size = torch.tensor((H_g, W_g), dtype=torch.int32, device=device).repeat(B, 1).unsqueeze(1)
     return grid, mask, size
 
-# ──────────────── Euler ODE sampler (10 steps, noise→data) ───────────────────
+# ──────────────── Standard full-res Euler ODE sampler ────────────────────────
+
+@torch.no_grad()
+def euler_sample_fr(
+    model: FiT,
+    z: torch.Tensor,       # (B, N, C*p*p) full-res noise tokens
+    y: torch.Tensor,       # (B,) class labels
+    H_fr: int, W_fr: int,
+    n_steps: int,
+    cfg_scale: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Standard flow-matching Euler ODE at full resolution. x_t = (1-t)*z + t*x1."""
+    p = PATCH_SIZE
+    B = y.shape[0]
+    y_null = torch.full_like(y, NUM_CLASSES)
+    grid, mask, size = make_grid_and_mask(H_fr, W_fr, B, device, dtype)
+
+    x = z
+    ts = torch.linspace(0.0, 1.0, n_steps + 1, device=device, dtype=dtype)
+
+    for i in range(n_steps):
+        t_cur = ts[i]
+        dt    = ts[i + 1] - t_cur
+        t_b   = t_cur.expand(B).to(dtype)
+
+        v = model(
+            torch.cat([x, x], 0),
+            torch.cat([t_b, t_b], 0),
+            torch.cat([y, y_null], 0),
+            torch.cat([grid, grid], 0),
+            torch.cat([mask, mask], 0),
+            torch.cat([size, size], 0),
+        )
+        v_cond, v_uncond = v.chunk(2, dim=0)
+        v_pred = v_uncond + cfg_scale * (v_cond - v_uncond)
+        x = x + dt * v_pred
+
+    return unpatchify(x, (H_fr * p, W_fr * p), p)
+
+
+# ──────────────── Minimal standard Euler (token-space, full-res) ─────────────
+
+@torch.no_grad()
+def euler_sample_fr2(
+    model: FiT,
+    z: torch.Tensor,       # (B, N, C*p*p) full-res noise tokens
+    y: torch.Tensor,
+    H_fr: int, W_fr: int,
+    n_steps: int,
+    cfg_scale: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    p = PATCH_SIZE
+    B = y.shape[0]
+    y_null = torch.full_like(y, NUM_CLASSES)
+    grid, mask, size = make_grid_and_mask(H_fr, W_fr, B, device, dtype)
+
+    x = z
+    z_prev = z
+    ts = torch.linspace(0.0, 1.0, n_steps + 1, device=device, dtype=dtype)
+
+    for i in range(n_steps):
+        t_cur = ts[i]
+        dt    = ts[i + 1] - t_cur
+        sigma = (1.0 - t_cur).expand(B).to(dtype).view(B, 1, 1)
+        t_model = t_cur.expand(B).to(dtype)
+
+        z = torch.randn_like(z)
+        # x = sigma * z + (1 - sigma) * x
+        # x = x + sigma * (z - z_prev)
+        x = sigma * z + x
+        z_prev = z
+
+        v = model(
+            torch.cat([x, x], 0),
+            torch.cat([t_model, t_model], 0),
+            torch.cat([y, y_null], 0),
+            torch.cat([grid, grid], 0),
+            torch.cat([mask, mask], 0),
+            torch.cat([size, size], 0),
+        )
+        v_cond, v_uncond = v.chunk(2, dim=0)
+        v_pred = v_uncond + cfg_scale * (v_cond - v_uncond)
+
+        # x = x + sigma * v_pred
+        # x = x + dt * v_pred
+        x = x + sigma * v_pred
+
+
+    return unpatchify(x, (H_fr * p, W_fr * p), p)
+
+
+# ──────────────── Schedule-based Euler ODE sampler ───────────────────────────
 
 @torch.no_grad()
 def euler_sample(
     model: FiT,
-    z: torch.Tensor,              # (B, seq, 16)  initial noise at t=1
-    y: torch.Tensor,              # (B,) class labels
-    H_g: int, W_g: int,          # generation grid
-    H_fr: int, W_fr: int,        # full-res grid
-    n_steps: int,
+    y: torch.Tensor,                      # (B,) class labels
+    H_fr: int, W_fr: int,                 # full-res grid
     cfg_scale: float,
-    loss_type: str,
     device: torch.device,
     dtype: torch.dtype,
-) -> torch.Tensor:
+    scale_schedule: list[tuple[int, int]], # per-step (H, W); len == n_steps
+    z_schedule: list[torch.Tensor],        # per-step noise tokens; len == n_steps
+    return_intermediates: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
     """
     Run a simple Euler ODE from t=1 (pure noise) to t=0 (clean image).
 
-    For baseline the trajectory runs at full resolution (H_fr×W_fr).
-    For A/B/C the trajectory runs at the compressed grid (H_g×W_g).
+    Each step uses its own resolution and noise sample from the schedules.
 
     Returns the predicted clean latent at full-res as a spatial tensor
-    (B, C_IN, H_fr*p, W_fr*p).
+    (B, C_IN, H_fr*p, W_fr*p), or a (final, intermediates) tuple when
+    return_intermediates=True, where intermediates[i] is x after step i+1.
     """
     p = PATCH_SIZE
-    B = z.shape[0]
-    r = H_g / H_fr  # downsampling ratio (1.0 for baseline)
-
-    use_fr = (loss_type in ("baseline", "C"))
-    H_run = H_fr if use_fr else H_g
-    W_run = W_fr if use_fr else W_g
+    B = y.shape[0]
+    n_steps = len(scale_schedule)
 
     y_null = torch.full_like(y, NUM_CLASSES)
 
-    # Loss C: trajectory lives at full-res in spatial form; LR grid used only for model input.
-    # Other losses: trajectory lives in token form at H_run×W_run.
-    if loss_type == "C":
-        xt_fr_sp = z  # (B, C_IN, H_fr*p, W_fr*p) full-res spatial noise
-        grid_lr, mask_lr, size_lr = make_grid_and_mask(H_g, W_g, B, device, dtype)
-    else:
-        x = z  # (B, H_run*W_run, p**2*C_IN) token-form noise
-        grid, mask, size = make_grid_and_mask(H_run, W_run, B, device, dtype)
+    # x accumulates full-res clean estimates in spatial form; initialise from step 0 noise.
+    H0, W0 = scale_schedule[0]
+    z0_sp = unpatchify(z_schedule[0], (H0 * p, W0 * p), p)
+    x = spatial_resize_sp(z0_sp, H_fr, W_fr)
 
-    # Forward time: t=0 (noise) → t=1 (data), matching the training convention
-    # where the model sees t=0 as noise and t=1 as clean data.
+    intermediates = []
     ts = torch.linspace(0.0, 1.0, n_steps + 1, device=device, dtype=dtype)
 
     for i in range(n_steps):
-        t_cur  = ts[i]
-        t_next = ts[i + 1]
-        dt     = t_next - t_cur  # positive
+        t_cur = ts[i]
+        H_run, W_run = scale_schedule[i]
+        z_lr = z_schedule[i]
+        grid, mask, size = make_grid_and_mask(H_run, W_run, B, device, dtype)
 
-        sigma = (1.0 - t_cur).expand(B).to(dtype)          # (B,) noise weight, 1→0
+        r = H_run / H_fr
+        sigma = (1.0 - t_cur).expand(B).to(dtype)
 
-        # Noise-corrected timestep fed to the model.
-        # For compressed grids the effective SNR shifts; sigma_inj corrects for it.
-        # At full resolution (r==1) sigma_inj == sigma, so t_model == t_cur.
+        # Noise-corrected timestep: for compressed grids the effective SNR shifts.
+        # At full resolution (r==1) sigma_inj == sigma.
         if r < 1.0:
-            sigma_inj = sigma / (r + sigma * (1.0 - r))
+            sigma_inj = sigma * r / (1.0 - sigma * (1.0 - r))
         else:
             sigma_inj = sigma
-        t_model = 1.0 - sigma_inj                           # (B,) == t_cur for baseline
+        t_model = 1.0 - sigma_inj
 
-        if loss_type == "C":
-            x_lr_sp = F.interpolate(xt_fr_sp.float(), size=(H_g * p, W_g * p),
-                                    mode='area').to(xt_fr_sp.dtype)
-            x_lr = patchify(x_lr_sp, p)
-            v = model(
-                torch.cat([x_lr, x_lr], 0),
-                torch.cat([t_model, t_model], 0),
-                torch.cat([y, y_null], 0),
-                torch.cat([grid_lr, grid_lr], 0),
-                torch.cat([mask_lr, mask_lr], 0),
-                torch.cat([size_lr, size_lr], 0),
-            )
-        else:
-            v = model(
-                torch.cat([x, x], 0),
-                torch.cat([t_model, t_model], 0),
-                torch.cat([y, y_null], 0),
-                torch.cat([grid, grid], 0),
-                torch.cat([mask, mask], 0),
-                torch.cat([size, size], 0),
-            )
+        # Build x_t in low-res token form: interpolate current estimate and noise at t_cur.
+        # x lives in full-res spatial form, so downsample it first.
+        x_lr_sp = spatial_resize_sp(x, H_run, W_run)
+        x_lr = patchify(x_lr_sp, p)
+        x_t_lr = (1.0 - t_model).view(B, 1, 1) * z_lr + t_model.view(B, 1, 1) * x_lr
+
+        v = model(
+            torch.cat([x_t_lr, x_t_lr], 0),
+            torch.cat([t_model, t_model], 0),
+            torch.cat([y, y_null], 0),
+            torch.cat([grid, grid], 0),
+            torch.cat([mask, mask], 0),
+            torch.cat([size, size], 0),
+        )
         v_cond, v_uncond = v.chunk(2, dim=0)
 
-        # CFG on first 3*patch**2 channels only, matching model.forward_with_cfg
-        C_cfg = 3 * p * p
-        v_pred = torch.cat([
-            v_uncond[:, :, :C_cfg] + cfg_scale * (v_cond[:, :, :C_cfg] - v_uncond[:, :, :C_cfg]),
-            v_cond[:, :, C_cfg:],
-        ], dim=2)
+        v_pred = v_uncond + cfg_scale * (v_cond - v_uncond)
 
-        if loss_type == "C":
-            v_lr_sp    = unpatchify(v_pred, (H_g * p, W_g * p), p)
-            v_lr_up_sp = F.interpolate(v_lr_sp.float(), size=(H_fr * p, W_fr * p),
-                                       mode='bilinear', align_corners=True).to(v_lr_sp.dtype)
-            v_pred_fr_sp = model.upsampler(v_lr_up_sp, xt_fr_sp)
-            xt_fr_sp     = xt_fr_sp + dt * v_pred_fr_sp
-        else:
-            x = x + dt * v_pred
+        # Clean estimate: x1_hat = x_t + sigma_inj * v  (consistent with t_model = 1 - sigma_inj)
+        x_hat_lr = unpatchify(x_t_lr + sigma_inj.view(B, 1, 1) * v_pred, (H_run * p, W_run * p), p)
+        x = spatial_resize_sp(x_hat_lr, H_fr, W_fr)
 
-    # ── convert final state to full-res spatial latent ───────────────────────
-    if loss_type == "C":
-        return unpatchify(patchify(xt_fr_sp, p), (H_fr * p, W_fr * p), p)
+        # n = i + 1
+        # x = (x * (n - 1) + x_hat) / n
 
-    if use_fr:
-        return unpatchify(x, (H_fr * p, W_fr * p), p)
+        if return_intermediates:
+            intermediates.append(x)
 
-    # Loss A/B: upsample the clean prediction (not the velocity).
-    x1_hat_lr_sp = unpatchify(x, (H_run * p, W_run * p), p)
-    return spatial_resize_sp(x1_hat_lr_sp, H_fr, W_fr)
+    if return_intermediates:
+        return x, intermediates
+    return x
 
 
 # ──────────────────────────── main ───────────────────────────────────────────
 
 def main():
+    if os.path.isdir(OUTPUT_DIR):
+        shutil.rmtree(OUTPUT_DIR)
+
     torch.manual_seed(GLOBAL_SEED)
     print(f"Device: {DEVICE}")
     print(f"Generating {N_IMAGES} images per (checkpoint, compression) pair")
@@ -307,7 +389,7 @@ def main():
     # Compressed noise for each grid size is derived from full-res noise by downsampling
     # so that the same underlying randomness is used regardless of loss type.
     all_labels = torch.randint(0, NUM_CLASSES, (N_IMAGES,), device=DEVICE)
-    # Full-res noise in spatial form (N, C, H*p, W*p) — used directly for baseline/C,
+    # Full-res noise in spatial form (N, C, H*p, W*p) — used directly for baseline,
     # downsampled to token form for A/B.
     all_noise_fr_sp = torch.randn(N_IMAGES, C_IN, H_fr * PATCH_SIZE, W_fr * PATCH_SIZE,
                                   device=DEVICE)
@@ -342,57 +424,113 @@ def main():
         model = load_model(ckpt_path, model_cfg_for(loss_type), DEVICE)
         dtype = next(model.parameters()).dtype
 
-        for g in COMPRESSIONS:
-            H_g = g; W_g = g
-            out_dir = os.path.join(OUTPUT_DIR, ckpt_name, f"grid_{g}x{g}")
+        for sampler_name, sampler_fn in [("euler_fr", euler_sample_fr), ("euler_fr2", euler_sample_fr2)]:
+            out_dir = os.path.join(OUTPUT_DIR, ckpt_name, sampler_name)
             os.makedirs(out_dir, exist_ok=True)
-            print(f"\n  Grid {g}×{g}  →  {out_dir}")
+            print(f"\n  {sampler_name}  →  {out_dir}")
 
             generated = 0
             while generated < N_IMAGES:
                 bs = min(BATCH_SIZE, N_IMAGES - generated)
-
                 y = all_labels[generated:generated + bs]
-
-                # Derive noise from the shared full-res spatial noise.
                 noise_fr_sp = all_noise_fr_sp[generated:generated + bs].to(dtype)
-                if loss_type == "C":
-                    z = noise_fr_sp
-                elif loss_type == "baseline":
-                    z = patchify(noise_fr_sp, PATCH_SIZE)
-                else:
-                    # A/B: downsample full-res spatial noise to the compressed grid.
-                    noise_lr_sp = F.interpolate(noise_fr_sp, size=(H_g * PATCH_SIZE, W_g * PATCH_SIZE),
-                                                mode='bilinear', align_corners=True)
-                    z = patchify(noise_lr_sp, PATCH_SIZE)
-
-                # Run Euler sampler → (B, C_IN, H_fr*p, W_fr*p) spatial latent.
-                x1_sp = euler_sample(
-                    model=model,
-                    z=z,
-                    y=y,
-                    H_g=H_g, W_g=W_g,
+                z = patchify(noise_fr_sp, PATCH_SIZE)
+                x1_sp = sampler_fn(
+                    model=model, z=z, y=y,
                     H_fr=H_fr, W_fr=W_fr,
                     n_steps=N_STEPS,
                     cfg_scale=CFG_SCALE,
-                    loss_type=loss_type,
-                    device=DEVICE,
-                    dtype=dtype,
-                )  # (B, 4, 32, 32)
-
-                # Decode with VAE.
+                    device=DEVICE, dtype=dtype,
+                )
                 with torch.no_grad():
                     imgs = vae.decode(x1_sp / vae.config.scaling_factor).sample
                 imgs = torch.clamp(127.5 * imgs + 128.0, 0, 255)
                 imgs = imgs.permute(0, 2, 3, 1).to(torch.uint8).cpu().numpy()
-
                 for i, img_arr in enumerate(imgs):
-                    idx = generated + i
-                    Image.fromarray(img_arr).save(os.path.join(out_dir, f"{idx:06d}.png"))
-
+                    Image.fromarray(img_arr).save(os.path.join(out_dir, f"{generated + i:06d}.png"))
                 generated += bs
                 print(f"    {generated}/{N_IMAGES}", end="\r", flush=True)
+            print(f"    {N_IMAGES}/{N_IMAGES}  done")
 
+        # --- noise-field sampler (progressive resolution with consistent noise) ---
+        for sched_idx, grid_sizes in SCHEDULES.items():
+            out_dir = os.path.join(OUTPUT_DIR, ckpt_name, f"noise_field_{sched_idx:03d}")
+            os.makedirs(out_dir, exist_ok=True)
+            print(f"\n  Noise-field {sched_idx:03d} {grid_sizes}  →  {out_dir}")
+
+            generated = 0
+            while generated < N_IMAGES:
+                bs = min(BATCH_SIZE, N_IMAGES - generated)
+                y = all_labels[generated:generated + bs]
+                y_null = torch.full_like(y, NUM_CLASSES)
+
+                def model_fn(x_sp: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+                    H_g = x_sp.shape[-2] // PATCH_SIZE
+                    W_g = x_sp.shape[-1] // PATCH_SIZE
+                    grid, mask, size = make_grid_and_mask(H_g, W_g, bs, DEVICE, dtype)
+                    x_tok = patchify(x_sp, PATCH_SIZE)
+                    v = model(
+                        torch.cat([x_tok, x_tok], 0),
+                        torch.cat([t, t], 0),
+                        torch.cat([y, y_null], 0),
+                        torch.cat([grid, grid], 0),
+                        torch.cat([mask, mask], 0),
+                        torch.cat([size, size], 0),
+                    )
+                    v_cond, v_uncond = v.chunk(2, dim=0)
+                    v_pred = v_uncond + CFG_SCALE * (v_cond - v_uncond)
+                    return unpatchify(v_pred, (H_g * PATCH_SIZE, W_g * PATCH_SIZE), PATCH_SIZE)
+
+                # Deterministic per batch: sampler draws its own noise fields internally.
+                torch.manual_seed(GLOBAL_SEED + generated)
+                x1_sp = noise_field_sample(
+                    model_fn,
+                    scale_schedule=list(grid_sizes),
+                    b=bs,
+                    d=C_IN,
+                    device=DEVICE,
+                    dtype=dtype,
+                )
+
+                with torch.no_grad():
+                    imgs = vae.decode(x1_sp / vae.config.scaling_factor).sample
+                imgs = torch.clamp(127.5 * imgs + 128.0, 0, 255)
+                imgs = imgs.permute(0, 2, 3, 1).to(torch.uint8).cpu().numpy()
+                for i, img_arr in enumerate(imgs):
+                    Image.fromarray(img_arr).save(os.path.join(out_dir, f"{generated + i:06d}.png"))
+                generated += bs
+                print(f"    {generated}/{N_IMAGES}", end="\r", flush=True)
+            print(f"    {N_IMAGES}/{N_IMAGES}  done")
+
+        # --- schedule-based sampler (commented out for now) ---
+        for sched_idx, grid_sizes in SCHEDULES.items():
+            out_dir = os.path.join(OUTPUT_DIR, ckpt_name, f"schedule_{sched_idx:03d}")
+            os.makedirs(out_dir, exist_ok=True)
+            print(f"\n  Schedule {sched_idx:03d} {grid_sizes}  →  {out_dir}")
+            generated = 0
+            while generated < N_IMAGES:
+                bs = min(BATCH_SIZE, N_IMAGES - generated)
+                y = all_labels[generated:generated + bs]
+                noise_fr_sp = all_noise_fr_sp[generated:generated + bs].to(dtype)
+                scale_schedule = [(g, g) for g in grid_sizes]
+                # z_schedule = [patchify(noise_fr_sp, PATCH_SIZE)] * N_STEPS
+                z_schedule = [
+                    torch.randn(bs, H * W, C_IN * PATCH_SIZE * PATCH_SIZE, device=DEVICE, dtype=dtype)
+                    for H, W in scale_schedule
+                ]
+                x1_sp = euler_sample(
+                    model=model, y=y, H_fr=H_fr, W_fr=W_fr, cfg_scale=CFG_SCALE,
+                    device=DEVICE, dtype=dtype,
+                    scale_schedule=scale_schedule, z_schedule=z_schedule,
+                )
+                with torch.no_grad():
+                    imgs = vae.decode(x1_sp / vae.config.scaling_factor).sample
+                imgs = torch.clamp(127.5 * imgs + 128.0, 0, 255)
+                imgs = imgs.permute(0, 2, 3, 1).to(torch.uint8).cpu().numpy()
+                for i, img_arr in enumerate(imgs):
+                    Image.fromarray(img_arr).save(os.path.join(out_dir, f"{generated + i:06d}.png"))
+                generated += bs
+                print(f"    {generated}/{N_IMAGES}", end="\r", flush=True)
             print(f"    {N_IMAGES}/{N_IMAGES}  done")
 
         del model
