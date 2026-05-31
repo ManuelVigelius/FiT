@@ -482,10 +482,12 @@ def main():
                     return unpatchify(v_pred, (H_g * PATCH_SIZE, W_g * PATCH_SIZE), PATCH_SIZE)
 
                 # Deterministic per batch: sampler draws its own noise fields internally.
+                # The sampler treats schedule entries as spatial sizes; convert from
+                # packed grid sizes by multiplying with PATCH_SIZE.
                 torch.manual_seed(GLOBAL_SEED + generated)
                 x1_sp = noise_field_sample(
                     model_fn,
-                    scale_schedule=list(grid_sizes),
+                    scale_schedule=[g * PATCH_SIZE for g in grid_sizes],
                     b=bs,
                     d=C_IN,
                     device=DEVICE,

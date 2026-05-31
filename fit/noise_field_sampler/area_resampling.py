@@ -78,17 +78,18 @@ def area_resample_nn_correction(x, out_h, out_w):
 
 
 # --- tests ---
-def check(name, x, oh, ow):
-    ref = area_resample_ref(x, oh, ow)
-    out = area_resample_nn_correction(x, oh, ow)
-    ok = torch.allclose(ref, out, atol=1e-6)
-    print(f"{name}: {'OK' if ok else 'FAIL'}")
-    if not ok:
-        print("  ref:", ref)
-        print("  got:", out)
+if __name__ == '__main__':
+    def check(name, x, oh, ow):
+        ref = area_resample_ref(x, oh, ow)
+        out = area_resample_nn_correction(x, oh, ow)
+        ok = torch.allclose(ref, out, atol=1e-6)
+        print(f"{name}: {'OK' if ok else 'FAIL'}")
+        if not ok:
+            print("  ref:", ref)
+            print("  got:", out)
 
-check("center pixel 3x3->2x2", torch.tensor([[[[0.,0.,0.],[0.,1.,0.],[0.,0.,0.]]]]), 2, 2)
-check("checkerboard 2x2->3x3", torch.tensor([[[[1.,-1.],[-1.,1.]]]]), 3, 3)
-check("1x1->3x3",              torch.tensor([[[[5.]]]]), 3, 3)
-check("random 4x4->7x7",      torch.rand(2,3,4,4), 7, 7)
-check("random 3x5->8x9",      torch.rand(1,1,3,5), 8, 9)
+    check("center pixel 3x3->2x2", torch.tensor([[[[0.,0.,0.],[0.,1.,0.],[0.,0.,0.]]]]), 2, 2)
+    check("checkerboard 2x2->3x3", torch.tensor([[[[1.,-1.],[-1.,1.]]]]), 3, 3)
+    check("1x1->3x3",              torch.tensor([[[[5.]]]]), 3, 3)
+    check("random 4x4->7x7",      torch.rand(2,3,4,4), 7, 7)
+    check("random 3x5->8x9",      torch.rand(1,1,3,5), 8, 9)
