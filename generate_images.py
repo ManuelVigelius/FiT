@@ -60,7 +60,7 @@ N_STEPS = 16
 N_IMAGES = 6
 
 # Batch size for the generation loop (single GPU).
-BATCH_SIZE = 32
+BATCH_SIZE = 512
 
 # Classifier-free guidance scale.
 CFG_SCALE = 4.0
@@ -112,21 +112,43 @@ _BASE_MODEL_CFG = dict(
 # For accelerate checkpoints, set `dir` to the checkpoint-NNNN directory;
 # the script will resolve model.safetensors / ema_model.safetensors inside it.
 # For plain .safetensors files (e.g. baseline), set `dir` to the file path directly.
-CHECKPOINTS = [
+# CHECKPOINTS = [ # cluster paths
+#     dict(
+#         name="baseline",
+#         dir="/visinf/projects_students/mb_mvigel/checkpoints/model_ema.safetensors",
+#         loss_type="baseline",
+#     ),
+#     # dict(
+#     #     name="loss_a_8k_ema",
+#     #     dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
+#     #     loss_type="A",
+#     #     use_ema=True,
+#     # ),
+#     # dict(
+#     #     name="loss_a_8k_train",
+#     #     dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
+#     #     loss_type="A",
+#     #     use_ema=False,
+#     # ),
+# ]
+
+
+CHECKPOINTS = [ # colab
     dict(
         name="baseline",
-        dir="/visinf/projects_students/mb_mvigel/checkpoints/model_ema.safetensors",
-        loss_type="baseline",
+        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-baseline",
+        loss_type="A",
+        use_ema=True
+    ),
+    dict(
+        name="loss_a_8k_ema",
+        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-8000",
+        loss_type="A",
+        use_ema=True,
     ),
     # dict(
-    #     name="loss_a_8k_ema",
-    #     dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
-    #     loss_type="A",
-    #     use_ema=True,
-    # ),
-    # dict(
     #     name="loss_a_8k_train",
-    #     dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
+    #     dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-8000",
     #     loss_type="A",
     #     use_ema=False,
     # ),

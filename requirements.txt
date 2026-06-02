@@ -16,3 +16,4 @@ omegaconf
 tqdm
 torch
 numpy
+pytorch-fid
