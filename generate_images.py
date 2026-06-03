@@ -60,7 +60,7 @@ N_STEPS = 16
 N_IMAGES = 6
 
 # Batch size for the generation loop (single GPU).
-BATCH_SIZE = 512
+BATCH_SIZE = 64
 
 # Classifier-free guidance scale.
 CFG_SCALE = 4.0

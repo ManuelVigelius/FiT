@@ -31,6 +31,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from diffusers.models import AutoencoderKL
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -77,21 +78,100 @@ GLOBAL_SEED = 42
 
 # Path to the ADM reference statistics .npz (stores `mu` and `sigma`), e.g. the
 # guided-diffusion VIRTUAL_imagenet256_labeled.npz.
-REF_STATS_NPZ = "/content/drive/MyDrive/FiT/fid/VIRTUAL_imagenet256_labeled.npz"
+# Overridable via the FID_REF_NPZ env var (set by tools/cluster_fid.sh).
+REF_STATS_NPZ = os.environ.get(
+    "FID_REF_NPZ", "/content/drive/MyDrive/FiT/fid/VIRTUAL_imagenet256_labeled.npz"
+)
 
 # VAE checkpoint.
 VAE_PATH = gi.VAE_PATH
 
 # Output directory for FID results (and an optional features cache).
-OUTPUT_DIR = "/content/drive/MyDrive/FiT/fid_eval"
+# Overridable via the FID_OUTPUT_DIR env var.
+OUTPUT_DIR = os.environ.get("FID_OUTPUT_DIR", "/content/drive/MyDrive/FiT/fid_eval")
 
-# Checkpoints to evaluate (reuse the active list from generate_images.py).
-CHECKPOINTS = gi.CHECKPOINTS
+# Checkpoints to evaluate. On the cluster, set FID_CLUSTER=1 to use the cluster
+# checkpoint paths; otherwise reuse the active (Colab) list from generate_images.
+if os.environ.get("FID_CLUSTER") == "1":
+    CHECKPOINTS = [
+        dict(
+            name="baseline",
+            dir="/visinf/projects_students/mb_mvigel/checkpoints/model_ema.safetensors",
+            loss_type="baseline",
+        ),
+    ]
+else:
+    CHECKPOINTS = gi.CHECKPOINTS
 
 # InceptionV3 batch size for feature extraction.
 INCEPTION_BATCH_SIZE = 64
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────── distributed setup ─────────────────────────────
+
+def _setup_distributed():
+    """Initialise (optional) DDP. Works both under torchrun and single-process.
+
+    Returns (rank, world_size, device). When launched without torchrun (no
+    RANK/WORLD_SIZE env vars), runs as a single process on `gi.DEVICE`.
+    """
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
+        dist.init_process_group("nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank, world_size = 0, 1
+        device = torch.device(gi.DEVICE)
+    # Point the reused generation helpers at this rank's device.
+    gi.DEVICE = device
+    globals()["DEVICE"] = device
+    return rank, world_size, device
+
+
+def _is_dist():
+    return dist.is_available() and dist.is_initialized()
+
+
+def _gather_features(local_feats: np.ndarray) -> np.ndarray | None:
+    """All-gather per-rank (N_i, 2048) feature arrays onto rank 0.
+
+    Ranks may hold different counts, so we pad to the global max, gather, then
+    trim. Returns the concatenated features on rank 0, None on other ranks.
+    """
+    if not _is_dist():
+        return local_feats
+
+    device = DEVICE
+    t = torch.from_numpy(local_feats).to(device)
+    n = torch.tensor([t.shape[0]], device=device)
+    counts = [torch.zeros_like(n) for _ in range(dist.get_world_size())]
+    dist.all_gather(counts, n)
+    counts = [int(c.item()) for c in counts]
+    max_n = max(counts)
+
+    feat_dim = t.shape[1]
+    padded = torch.zeros(max_n, feat_dim, device=device, dtype=t.dtype)
+    padded[: t.shape[0]] = t
+    gathered = [torch.zeros_like(padded) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, padded)
+
+    if dist.get_rank() != 0:
+        return None
+    parts = [g[:c].cpu().numpy() for g, c in zip(gathered, counts)]
+    return np.concatenate(parts, axis=0)
+
+
+def _shard_range(total: int, rank: int, world_size: int) -> tuple[int, int]:
+    """Contiguous [start, end) slice of `total` items for this rank."""
+    per = (total + world_size - 1) // world_size
+    start = rank * per
+    end = min(start + per, total)
+    return start, max(start, end)
 
 
 def _load_inception():
@@ -200,21 +280,38 @@ def _gen_noise_field(model, vae, y, grid_sizes, dtype, seed) -> torch.Tensor:
 
 def _compute_fid_for_sampler(sampler_name, gen_one_batch, inception,
                              ref_mu, ref_sigma, all_labels, all_noise_fr_sp,
-                             H_fr, W_fr, dtype) -> float:
-    """Generate N_IMAGES with `gen_one_batch`, extract features, return FID."""
+                             H_fr, W_fr, dtype, rank, world_size) -> float | None:
+    """Generate this rank's shard of N_IMAGES, gather features, return FID.
+
+    Each rank generates a contiguous, non-overlapping slice of the shared
+    labels/noise so the union covers all N_IMAGES exactly once. Features are
+    all-gathered onto rank 0, which computes and returns the FID (other ranks
+    return None).
+    """
+    shard_start, shard_end = _shard_range(N_IMAGES, rank, world_size)
     feats = []
-    generated = 0
-    while generated < N_IMAGES:
-        bs = min(BATCH_SIZE, N_IMAGES - generated)
+    generated = shard_start
+    while generated < shard_end:
+        bs = min(BATCH_SIZE, shard_end - generated)
         y = all_labels[generated:generated + bs]
         noise_fr_sp = all_noise_fr_sp[generated:generated + bs].to(dtype)
         imgs_uint8 = gen_one_batch(y, noise_fr_sp, generated)
         feats.append(_inception_features(inception, imgs_uint8))
         generated += bs
-        print(f"    [{sampler_name}] {generated}/{N_IMAGES}", end="\r", flush=True)
-    print(f"    [{sampler_name}] {N_IMAGES}/{N_IMAGES}  generated")
+        if rank == 0:
+            done = generated - shard_start
+            total = shard_end - shard_start
+            print(f"    [{sampler_name}] rank0 {done}/{total} (×{world_size} ranks)",
+                  end="\r", flush=True)
 
-    acts = np.concatenate(feats, axis=0)
+    local_feats = (np.concatenate(feats, axis=0) if feats
+                   else np.zeros((0, 2048), dtype=np.float32))
+    acts = _gather_features(local_feats)
+    if rank != 0:
+        return None
+
+    print(f"    [{sampler_name}] {acts.shape[0]}/{N_IMAGES} generated"
+          f"{' ' * 20}")
     mu = acts.mean(axis=0)
     sigma = np.cov(acts, rowvar=False)
     fid = _frechet_distance(mu, sigma, ref_mu, ref_sigma)
@@ -223,32 +320,46 @@ def _compute_fid_for_sampler(sampler_name, gen_one_batch, inception,
 
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    rank, world_size, device = _setup_distributed()
+    is_main = rank == 0
+
+    def log(*a, **k):
+        if is_main:
+            print(*a, **k)
+
+    if is_main:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
     torch.manual_seed(GLOBAL_SEED)
-    print(f"Device: {DEVICE}")
-    print(f"Computing FID over {N_IMAGES} images per (checkpoint, sampler)")
-    print(f"CFG={CFG_SCALE}, euler steps={N_STEPS}")
+    log(f"Device: {device}  |  world_size: {world_size}")
+    log(f"Computing FID over {N_IMAGES} images per (checkpoint, sampler)")
+    log(f"CFG={CFG_SCALE}, euler steps={N_STEPS}")
 
     H_fr = TARGET_LEN_PIX // (PATCH_SIZE * VAE_SCALE)
     W_fr = TARGET_LEN_PIX // (PATCH_SIZE * VAE_SCALE)
-    print(f"Full-res grid: {H_fr}×{W_fr}")
+    log(f"Full-res grid: {H_fr}×{W_fr}")
 
-    print(f"\nLoading reference statistics from {REF_STATS_NPZ} …")
-    ref_mu, ref_sigma = _load_ref_stats(REF_STATS_NPZ)
-    print(f"  reference: mu {ref_mu.shape}, sigma {ref_sigma.shape}")
+    # Reference stats are only needed on rank 0 (it computes the FID).
+    ref_mu = ref_sigma = None
+    if is_main:
+        log(f"\nLoading reference statistics from {REF_STATS_NPZ} …")
+        ref_mu, ref_sigma = _load_ref_stats(REF_STATS_NPZ)
+        log(f"  reference: mu {ref_mu.shape}, sigma {ref_sigma.shape}")
 
-    print("Loading InceptionV3 (pytorch-fid) …")
+    log("Loading InceptionV3 (pytorch-fid) …")
     inception = _load_inception()
 
     # Fixed labels and full-res noise shared across all samplers/checkpoints.
-    all_labels = torch.randint(0, NUM_CLASSES, (N_IMAGES,), device=DEVICE)
+    # Generated on CPU with a fixed seed so every rank produces the identical
+    # global tensors; each rank then operates on its own contiguous shard.
+    g = torch.Generator().manual_seed(GLOBAL_SEED)
+    all_labels = torch.randint(0, NUM_CLASSES, (N_IMAGES,), generator=g).to(device)
     all_noise_fr_sp = torch.randn(
-        N_IMAGES, C_IN, H_fr * PATCH_SIZE, W_fr * PATCH_SIZE, device=DEVICE
-    )
-    print(f"Fixed labels and noise pre-generated (seed={GLOBAL_SEED}).")
+        N_IMAGES, C_IN, H_fr * PATCH_SIZE, W_fr * PATCH_SIZE, generator=g
+    ).to(device)
+    log(f"Fixed labels and noise pre-generated (seed={GLOBAL_SEED}).")
 
-    print(f"\nLoading VAE from {VAE_PATH} …")
-    vae = AutoencoderKL.from_pretrained(VAE_PATH).to(DEVICE).eval()
+    log(f"\nLoading VAE from {VAE_PATH} …")
+    vae = AutoencoderKL.from_pretrained(VAE_PATH).to(device).eval()
 
     results = {}
     for ckpt_cfg in CHECKPOINTS:
@@ -263,14 +374,14 @@ def main():
             fname = "model_1.safetensors" if use_ema else "model.safetensors"
             ckpt_path = os.path.join(ckpt_dir, fname)
 
-        print(f"\n{'='*60}")
-        print(f"Checkpoint: {ckpt_name}  loss={loss_type}")
-        print(f"  {ckpt_path}")
+        log(f"\n{'='*60}")
+        log(f"Checkpoint: {ckpt_name}  loss={loss_type}")
+        log(f"  {ckpt_path}")
         if not os.path.isfile(ckpt_path):
-            print("  [skip] file not found")
+            log("  [skip] file not found")
             continue
 
-        model = load_model(ckpt_path, model_cfg_for(loss_type), DEVICE)
+        model = load_model(ckpt_path, model_cfg_for(loss_type), device)
         dtype = next(model.parameters()).dtype
         results[ckpt_name] = {}
 
@@ -280,7 +391,7 @@ def main():
 
         results[ckpt_name]["euler_fr"] = _compute_fid_for_sampler(
             "euler_fr", euler_batch, inception, ref_mu, ref_sigma,
-            all_labels, all_noise_fr_sp, H_fr, W_fr, dtype,
+            all_labels, all_noise_fr_sp, H_fr, W_fr, dtype, rank, world_size,
         )
 
         # --- noise-field samplers for the requested schedules ---
@@ -288,27 +399,36 @@ def main():
             name = f"noise_field_{sched_idx:03d}"
 
             def nf_batch(y, noise_fr_sp, generated, _gs=grid_sizes):
+                # Seed is keyed to the absolute (global) image index so every
+                # image's noise field is identical regardless of which rank
+                # produces it.
                 return _gen_noise_field(model, vae, y, _gs, dtype,
                                         GLOBAL_SEED + generated)
 
             results[ckpt_name][name] = _compute_fid_for_sampler(
                 name, nf_batch, inception, ref_mu, ref_sigma,
-                all_labels, all_noise_fr_sp, H_fr, W_fr, dtype,
+                all_labels, all_noise_fr_sp, H_fr, W_fr, dtype, rank, world_size,
             )
 
         del model
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    out_json = os.path.join(OUTPUT_DIR, "fid_results.json")
-    with open(out_json, "w") as f:
-        json.dump(results, f, indent=2)
+    if is_main:
+        out_json = os.path.join(OUTPUT_DIR, "fid_results.json")
+        with open(out_json, "w") as f:
+            json.dump(results, f, indent=2)
 
-    print(f"\n{'='*60}\nFID results:")
-    for ckpt_name, sampler_fids in results.items():
-        print(f"  {ckpt_name}")
-        for sampler_name, fid in sampler_fids.items():
-            print(f"    {sampler_name:18s}  FID = {fid:.4f}")
-    print(f"\nSaved {out_json}")
+        print(f"\n{'='*60}\nFID results:")
+        for ckpt_name, sampler_fids in results.items():
+            print(f"  {ckpt_name}")
+            for sampler_name, fid in sampler_fids.items():
+                print(f"    {sampler_name:18s}  FID = {fid:.4f}")
+        print(f"\nSaved {out_json}")
+
+    if _is_dist():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
