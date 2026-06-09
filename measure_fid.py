@@ -32,6 +32,7 @@ Results are printed and written to <OUTPUT_DIR>/fid_results.json.
 import json
 import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -158,7 +159,11 @@ def _setup_distributed():
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
-        dist.init_process_group("nccl")
+        # Bound the collective timeout so a rank that dies (OOM, bad file, …)
+        # doesn't leave its peers blocked on a barrier for the 30-min NCCL
+        # default — on a shared box that would pin all 4 GPUs idle. After this
+        # the surviving ranks raise and main()'s handler tears the group down.
+        dist.init_process_group("nccl", timeout=timedelta(minutes=10))
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
     else:
@@ -208,6 +213,33 @@ def _latent_files(root_dir: str) -> list[str]:
     return paths
 
 
+def _reference_paths() -> list[str]:
+    """The exact, ordered list of latent files the reference is built from.
+
+    Collect → shuffle (fixed seed) → cap at REF_MAX. Pure and deterministic, so
+    both the decode loop and the resume check in _ensure_reference agree on the
+    count and ordering without touching the VAE. Filenames written during decode
+    are keyed to the index in *this* list (see _decode_reference_latents).
+    """
+    paths = sorted(_latent_files(REF_IMAGE_DIR))
+    if not paths:
+        raise FileNotFoundError(
+            f"No latent .safetensors found under {REF_IMAGE_DIR} (expected "
+            f"IN1kLatentDataset subdirs, e.g. greater_than_{TARGET_LEN_PIX}_resize/). "
+            f"Set FID_REF_IS_LATENT=0 if this is a folder of real images."
+        )
+    # Shuffle, then cap. Filenames are class-prefixed, so an alphabetical prefix
+    # would be skewed toward the lowest class ids; shuffling makes the capped
+    # subset span all classes. Fixed RNG → every rank produces the same
+    # permutation (and runs are reproducible).
+    g = torch.Generator().manual_seed(GLOBAL_SEED)
+    perm = torch.randperm(len(paths), generator=g).tolist()
+    paths = [paths[i] for i in perm]
+    if REF_MAX and len(paths) > REF_MAX:
+        paths = paths[:REF_MAX]
+    return paths
+
+
 def _decode_reference_latents(vae, dst_dir: str, rank: int, world_size: int):
     """Decode the latent reference set into PNGs under dst_dir (sharded by rank).
 
@@ -219,24 +251,9 @@ def _decode_reference_latents(vae, dst_dir: str, rank: int, world_size: int):
     """
     from safetensors.torch import load_file
 
-    paths = sorted(_latent_files(REF_IMAGE_DIR))
-    if not paths:
-        raise FileNotFoundError(
-            f"No latent .safetensors found under {REF_IMAGE_DIR} (expected "
-            f"IN1kLatentDataset subdirs, e.g. greater_than_{TARGET_LEN_PIX}_resize/). "
-            f"Set FID_REF_IS_LATENT=0 if this is a folder of real images."
-        )
-    # Shuffle, then cap. Filenames are class-prefixed, so an alphabetical prefix
-    # would be skewed toward the lowest class ids; shuffling makes the capped
-    # subset span all classes. Seed sorted paths with a fixed RNG so every rank
-    # produces the same permutation (and runs are reproducible).
-    g = torch.Generator().manual_seed(GLOBAL_SEED)
-    perm = torch.randperm(len(paths), generator=g).tolist()
-    paths = [paths[i] for i in perm]
-    if REF_MAX and len(paths) > REF_MAX:
-        if rank == 0:
-            print(f"    reference: shuffled, capped at {REF_MAX} / {len(perm)} latents")
-        paths = paths[:REF_MAX]
+    paths = _reference_paths()
+    if rank == 0 and REF_MAX and len(_latent_files(REF_IMAGE_DIR)) > REF_MAX:
+        print(f"    reference: shuffled, capped at {REF_MAX} latents")
     dtype = next(vae.parameters()).dtype
     start, end = _shard_range(len(paths), rank, world_size)
     for gi_idx in range(start, end):
@@ -284,13 +301,35 @@ def _ensure_reference(vae, is_main: bool, rank: int, world_size: int):
     if REF_IS_LATENT:
         # Decode latents → PNGs (all ranks), barrier, then rank 0 builds stats.
         decode_dir = REF_DECODE_DIR or os.path.join(OUTPUT_DIR, "_reference_decoded")
+        # Resume support: decoding 150k latents is the expensive part, and the
+        # stats cache may be missing even when a previous run already produced
+        # the PNGs (e.g. it crashed between decode and make_custom_stats). If the
+        # decode dir already holds exactly the expected number of PNGs, reuse
+        # them and skip straight to building the stats. The expected count is the
+        # post-shuffle, post-cap path count — same value _decode_reference_latents
+        # would return — computed here without touching the VAE.
+        n_expected = len(_reference_paths())
+        n_have = (
+            sum(1 for f in os.listdir(decode_dir) if f.endswith(".png"))
+            if os.path.isdir(decode_dir)
+            else 0
+        )
+        already_decoded = n_have == n_expected and n_expected > 0
         if is_main:
             os.makedirs(decode_dir, exist_ok=True)
-            print(f"  decoding latent reference from {REF_IMAGE_DIR}\n"
-                  f"  → {decode_dir} (VAE-decoded, then scored once) …")
+            if already_decoded:
+                print(f"  reusing {n_have} already-decoded reference PNGs in "
+                      f"{decode_dir} (skipping decode).")
+            else:
+                if n_have:
+                    print(f"  decode dir has {n_have} PNGs but {n_expected} "
+                          f"expected — re-decoding from scratch.")
+                print(f"  decoding latent reference from {REF_IMAGE_DIR}\n"
+                      f"  → {decode_dir} (VAE-decoded, then scored once) …")
         if _is_dist():
             dist.barrier()
-        _decode_reference_latents(vae, decode_dir, rank, world_size)
+        if not already_decoded:
+            _decode_reference_latents(vae, decode_dir, rank, world_size)
         if _is_dist():
             dist.barrier()
         if is_main:
@@ -394,8 +433,10 @@ def _generate_sampler_pngs(sampler_name, gen_one_batch, out_dir,
     generated = shard_start
     while generated < shard_end:
         bs = min(BATCH_SIZE, shard_end - generated)
-        y = all_labels[generated:generated + bs]
-        noise_fr_sp = all_noise_fr_sp[generated:generated + bs].to(dtype)
+        # all_labels / all_noise_fr_sp live on CPU (see main()); move this rank's
+        # batch slice to the device here so peak GPU memory is one batch.
+        y = all_labels[generated:generated + bs].to(DEVICE)
+        noise_fr_sp = all_noise_fr_sp[generated:generated + bs].to(DEVICE, dtype)
         imgs_uint8 = gen_one_batch(y, noise_fr_sp, generated)
         _save_pngs(imgs_uint8, out_dir, generated)
         generated += bs
@@ -441,12 +482,19 @@ def main():
     # Fixed labels and full-res noise shared across all samplers/checkpoints.
     # Generated on CPU with a fixed seed so every rank produces the identical
     # global tensors; each rank then operates on its own contiguous shard.
+    #
+    # These stay on CPU on purpose. The full noise tensor is
+    # N_IMAGES×C_IN×(H·p)×(W·p) — ~10 GB in fp32 at N_IMAGES=10000 — and every
+    # rank would otherwise hold the *entire* thing on its GPU even though it only
+    # ever touches its own shard. Slices are moved to the device per batch
+    # (labels in _generate_sampler_pngs, noise at the .to(dtype) call below), so
+    # peak GPU use is one batch, not all of N_IMAGES.
     g = torch.Generator().manual_seed(GLOBAL_SEED)
-    all_labels = torch.randint(0, NUM_CLASSES, (N_IMAGES,), generator=g).to(device)
+    all_labels = torch.randint(0, NUM_CLASSES, (N_IMAGES,), generator=g)
     all_noise_fr_sp = torch.randn(
         N_IMAGES, C_IN, H_fr * PATCH_SIZE, W_fr * PATCH_SIZE, generator=g
-    ).to(device)
-    log(f"Fixed labels and noise pre-generated (seed={GLOBAL_SEED}).")
+    )
+    log(f"Fixed labels and noise pre-generated on CPU (seed={GLOBAL_SEED}).")
 
     results = {}
     for ckpt_cfg in CHECKPOINTS:
@@ -507,7 +555,19 @@ def main():
             dist.barrier()
         if is_main:
             for name in sampler_dirs:
-                fid = _compute_fid_dir(sampler_dirs[name], num_gen=N_IMAGES)
+                # Guard against a silently-truncated run: a per-image failure in
+                # some shard would leave fewer PNGs than N_IMAGES, and clean-fid
+                # would happily score whatever exists, producing a confident but
+                # wrong FID. Require the exact expected count before scoring.
+                out_dir = sampler_dirs[name]
+                n_png = sum(1 for f in os.listdir(out_dir) if f.endswith(".png"))
+                if n_png != N_IMAGES:
+                    raise RuntimeError(
+                        f"[{ckpt_name}/{name}] expected {N_IMAGES} generated PNGs "
+                        f"but found {n_png} in {out_dir}. A generation shard likely "
+                        f"failed; refusing to compute FID on an incomplete set."
+                    )
+                fid = _compute_fid_dir(out_dir, num_gen=N_IMAGES)
                 results[ckpt_name][name] = fid
                 log(f"    [{name}] FID = {fid:.4f}")
 
@@ -529,8 +589,32 @@ def main():
 
     if _is_dist():
         dist.barrier()
-        dist.destroy_process_group()
+
+
+def _run():
+    """Entry point. Guarantees the process group is always torn down.
+
+    Without this, an exception in any rank (OOM, corrupt latent, missing
+    checkpoint on one mount) would skip destroy_process_group and leave a
+    wedged process holding its GPU until the launcher is killed by hand. On
+    failure we abort the group so surviving peers stop waiting on their next
+    barrier instead of blocking for the full NCCL timeout, then re-raise so
+    torchrun sees a non-zero exit and brings the whole job down.
+    """
+    try:
+        main()
+    except BaseException:
+        if _is_dist():
+            # abort() (not just destroy) signals peers stuck in a collective.
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+        raise
+    else:
+        if _is_dist():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    main()
+    _run()

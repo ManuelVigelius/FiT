@@ -41,6 +41,15 @@ export FID_CLUSTER=1   # make measure_fid.py use the cluster checkpoint paths
 GPUS_PER_NODE=4
 MASTER_PORT=29501   # differ from train (29500) so both can run on one node
 
+# Pin to a fixed set of GPUs so the run can NEVER touch devices owned by other
+# jobs. Without this, rank 0 ends up opening a small CUDA context on EVERY
+# visible device (the first torch.cuda.device_count() / NCCL init probes them
+# all), spilling ~1 GB onto GPUs 6/7 where other people's jobs run. Masking
+# visibility here means device_count()==4 and NCCL only ever sees 0-3.
+# Override on the command line if 0-3 are taken, e.g.:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 bash tools/cluster_fid.sh
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+
 echo "=== FiT Cluster FID Setup ==="
 echo "Repo dir   : $REPO_DIR"
 echo "GPUs       : $GPUS_PER_NODE"
