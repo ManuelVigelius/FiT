@@ -21,12 +21,20 @@ REPO_DIR="/visinf/home/mb_mvigel/FiT"
 CONDA_ENV="/visinf/projects_students/mb_mvigel/envs/fit"
 PERSISTENT_OUT="/visinf/projects_students/mb_mvigel"
 
-# FID reference statistics (.npz) and output directory.
-# Download the reference once with:
-#   mkdir -p "$PERSISTENT_OUT/fid"
-#   wget -c -O "$PERSISTENT_OUT/fid/VIRTUAL_imagenet256_labeled.npz" \
-#     https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz
-export FID_REF_NPZ="${FID_REF_NPZ:-$PERSISTENT_OUT/fid/VIRTUAL_imagenet256_labeled.npz}"
+# FID reference (clean-fid custom stats) and output directory.
+# clean-fid ships no ImageNet reference, so measure_fid.py builds one ONCE and
+# caches it under FID_REF_NAME (clean-fid's own cache, in the env).
+#
+# The reference is the SAME data we train on: VAE-encoded ImageNet-256 latents
+# (an IN1kLatentDataset tree), already copied to fastdata by cluster_train.sh.
+# FID_REF_IS_LATENT=1 makes measure_fid.py VAE-decode those latents to images
+# (via the same decode path as the generated samples) before scoring, so the
+# real and generated sides go through identical VAE+Inception pipelines.
+FASTDATA="/fastdata/mb_mvigel/fit"
+export FID_REF_NAME="${FID_REF_NAME:-fit_imagenet256}"
+export FID_REF_DIR="${FID_REF_DIR:-$FASTDATA/datasets}"
+export FID_REF_IS_LATENT="${FID_REF_IS_LATENT:-1}"
+export FID_MODE="${FID_MODE:-clean}"
 export FID_OUTPUT_DIR="${FID_OUTPUT_DIR:-$PERSISTENT_OUT/fid/eval}"
 export FID_CLUSTER=1   # make measure_fid.py use the cluster checkpoint paths
 
@@ -36,9 +44,24 @@ MASTER_PORT=29501   # differ from train (29500) so both can run on one node
 echo "=== FiT Cluster FID Setup ==="
 echo "Repo dir   : $REPO_DIR"
 echo "GPUs       : $GPUS_PER_NODE"
-echo "Reference  : $FID_REF_NPZ"
+echo "Reference  : clean-fid '$FID_REF_NAME' (mode=$FID_MODE, latent=$FID_REF_IS_LATENT)"
+echo "Ref latents: $FID_REF_DIR"
 echo "Output dir : $FID_OUTPUT_DIR"
 echo ""
+
+# The reference latents must be present on fastdata. cluster_train.sh copies
+# them there; if you run FID standalone, copy them first (or point FID_REF_DIR
+# at the persistent dataset at $PERSISTENT_OUT/datasets). In practice the latent
+# tree only has the greater_than_256_resize/ split (256x256 crops).
+if [ "$FID_REF_IS_LATENT" = "1" ] && [ ! -d "$FID_REF_DIR/greater_than_256_resize" ]; then
+  echo "WARNING: $FID_REF_DIR does not look like an IN1kLatentDataset tree"
+  echo "         (no greater_than_256_resize/ subdir). Falling back to persistent dataset."
+  export FID_REF_DIR="$PERSISTENT_OUT/datasets"
+fi
+
+# Cap the number of real images used to build the reference (safety margin over
+# the 10k generated). Set to 0 to use all available latents.
+export FID_REF_MAX="${FID_REF_MAX:-150000}"
 
 # --- Activate conda environment (identical to cluster_train.sh) ---
 echo "[1/2] Activating conda environment..."
@@ -46,10 +69,14 @@ export PATH="$CONDA_ENV/bin:$PATH"
 export PYTHONNOUSERSITE=1
 export LD_LIBRARY_PATH="$(find "$CONDA_ENV/lib/python3.11/site-packages/nvidia" -name "lib" -type d | tr '\n' ':')$CONDA_ENV/lib/python3.11/site-packages/triton/backends/nvidia/lib/cupti:$LD_LIBRARY_PATH"
 
-# --- pytorch-fid is required for the FID-standard InceptionV3 weights ---
-if ! python -c "import pytorch_fid" 2>/dev/null; then
-  echo "[1/2] Installing pytorch-fid into the conda env..."
-  python -m pip install --no-input pytorch-fid
+# --- clean-fid provides the standardized FID pipeline (Inception + stats) ---
+# Install with --no-deps so pip cannot upgrade/replace pinned training deps
+# (a plain install here previously corrupted `regex` and broke diffusers).
+# clean-fid's runtime deps (torch, torchvision, scipy, pillow, numpy, requests)
+# are already present in the training env.
+if ! python -c "import cleanfid" 2>/dev/null; then
+  echo "[1/2] Installing clean-fid into the conda env (--no-deps)..."
+  python -m pip install --no-input --no-deps clean-fid
 fi
 
 mkdir -p "$FID_OUTPUT_DIR"

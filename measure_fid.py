@@ -4,10 +4,9 @@ standard full-resolution Euler integrator.
 
 For each (checkpoint, sampler) pair this script:
   1. generates N_IMAGES images with the given sampler,
-  2. extracts pytorch-fid InceptionV3 pool3 (2048-d) activations,
-  3. computes the Fréchet Inception Distance against an ADM reference
-     statistics file (the canonical ImageNet-256
-     `VIRTUAL_imagenet256_labeled.npz`, which stores `mu` and `sigma`).
+  2. writes them as PNGs to <OUTPUT_DIR>/<ckpt>/<sampler>/,
+  3. computes the Fréchet Inception Distance with the `clean-fid` library
+     against a precomputed custom reference built from real ImageNet-256.
 
 The samplers measured are:
   - "euler_fr"          : standard full-res Euler ODE (generate_images.euler_sample_fr)
@@ -16,10 +15,16 @@ The samplers measured are:
   - "noise_field_033"   : noise-field sampler, schedule [11,12,13,14,15,16,...,16]
   - "noise_field_034"   : noise-field sampler, schedule [16,16,...,16]
 
+Reproducibility: both the reference statistics and the generated-image
+statistics are produced by clean-fid's single Inception pipeline (identical
+weights, preprocessing and resizing), so the FID is comparable across runs and
+between samplers. clean-fid ships no ImageNet reference, so we build a custom
+one (REF_STATS_NAME) once from real ImageNet-256 images (REF_IMAGE_DIR); it is
+cached by clean-fid and reused on subsequent runs.
+
 All configuration lives in the CONFIG block below — no CLI arguments needed.
 
-Requires `pytorch-fid` (pip install pytorch-fid) for the FID-standard
-InceptionV3 weights, plus scipy for the matrix sqrt.
+Requires `clean-fid` (pip install clean-fid).
 
 Results are printed and written to <OUTPUT_DIR>/fid_results.json.
 """
@@ -29,10 +34,10 @@ import os
 import sys
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from diffusers.models import AutoencoderKL
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -76,17 +81,46 @@ N_STEPS = 16
 # Global seed for reproducibility.
 GLOBAL_SEED = 42
 
-# Path to the ADM reference statistics .npz (stores `mu` and `sigma`), e.g. the
-# guided-diffusion VIRTUAL_imagenet256_labeled.npz.
-# Overridable via the FID_REF_NPZ env var (set by tools/cluster_fid.sh).
-REF_STATS_NPZ = os.environ.get(
-    "FID_REF_NPZ", "/content/drive/MyDrive/FiT/fid/VIRTUAL_imagenet256_labeled.npz"
+# clean-fid custom reference. clean-fid ships no ImageNet reference, so we
+# build one once (cached by clean-fid under this name) from real ImageNet-256
+# images, then compare every sampler against it. Both sides go through the same
+# clean-fid Inception pipeline → reproducible, sampler-comparable FID.
+#   REF_STATS_NAME — clean-fid custom-stats name (the cache key).
+#   REF_IMAGE_DIR  — folder of real images used to build the reference the
+#                    first time. May be an ImageFolder tree (clean-fid walks it
+#                    recursively). Ignored once the stats are cached.
+# Overridable via FID_REF_NAME / FID_REF_DIR (set by tools/cluster_fid.sh).
+REF_STATS_NAME = os.environ.get("FID_REF_NAME", "fit_imagenet256")
+REF_IMAGE_DIR = os.environ.get(
+    "FID_REF_DIR", "/content/drive/MyDrive/FiT/fid/imagenet256_real"
 )
+# clean-fid mode: "clean" (recommended, bicubic+antialias) for new, internally
+# consistent numbers; "legacy_tensorflow" only if you must match old TF-FID.
+FID_MODE = os.environ.get("FID_MODE", "clean")
+
+# How to interpret REF_IMAGE_DIR when building the reference:
+#   FID_REF_IS_LATENT=1 → it is an IN1kLatentDataset tree of VAE-encoded
+#     latents (the data we train on); we decode them through the VAE to images
+#     first, so the reference goes through the SAME decode path as the generated
+#     samples. This is the cluster default (the fastdata set has no raw images).
+#   FID_REF_IS_LATENT=0 → it is a folder of real image files; clean-fid reads
+#     them directly (Colab convenience).
+REF_IS_LATENT = os.environ.get("FID_REF_IS_LATENT", "1") == "1"
+
+# Where to write decoded reference images while building the stats. They are
+# only needed during make_custom_stats (the stats are cached afterwards), so a
+# scratch dir is fine. Defaults to a sibling of OUTPUT_DIR.
+REF_DECODE_DIR = os.environ.get("FID_REF_DECODE_DIR", "")
+
+# Cap on the number of real images used to build the reference. Decoding the
+# full latent set is expensive and 150k reals already give a stable FID
+# reference (well above the 10k generated). Set FID_REF_MAX=0 to use all.
+REF_MAX = int(os.environ.get("FID_REF_MAX", "150000"))
 
 # VAE checkpoint.
 VAE_PATH = gi.VAE_PATH
 
-# Output directory for FID results (and an optional features cache).
+# Output directory: per-sampler PNG dirs + the results JSON.
 # Overridable via the FID_OUTPUT_DIR env var.
 OUTPUT_DIR = os.environ.get("FID_OUTPUT_DIR", "/content/drive/MyDrive/FiT/fid_eval")
 
@@ -99,12 +133,15 @@ if os.environ.get("FID_CLUSTER") == "1":
             dir="/visinf/projects_students/mb_mvigel/checkpoints/model_ema.safetensors",
             loss_type="baseline",
         ),
+        dict(
+        name="loss_a_8k_ema",
+        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-8000",
+        loss_type="A",
+        use_ema=True,
+    ),
     ]
 else:
     CHECKPOINTS = gi.CHECKPOINTS
-
-# InceptionV3 batch size for feature extraction.
-INCEPTION_BATCH_SIZE = 64
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -137,35 +174,6 @@ def _is_dist():
     return dist.is_available() and dist.is_initialized()
 
 
-def _gather_features(local_feats: np.ndarray) -> np.ndarray | None:
-    """All-gather per-rank (N_i, 2048) feature arrays onto rank 0.
-
-    Ranks may hold different counts, so we pad to the global max, gather, then
-    trim. Returns the concatenated features on rank 0, None on other ranks.
-    """
-    if not _is_dist():
-        return local_feats
-
-    device = DEVICE
-    t = torch.from_numpy(local_feats).to(device)
-    n = torch.tensor([t.shape[0]], device=device)
-    counts = [torch.zeros_like(n) for _ in range(dist.get_world_size())]
-    dist.all_gather(counts, n)
-    counts = [int(c.item()) for c in counts]
-    max_n = max(counts)
-
-    feat_dim = t.shape[1]
-    padded = torch.zeros(max_n, feat_dim, device=device, dtype=t.dtype)
-    padded[: t.shape[0]] = t
-    gathered = [torch.zeros_like(padded) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered, padded)
-
-    if dist.get_rank() != 0:
-        return None
-    parts = [g[:c].cpu().numpy() for g, c in zip(gathered, counts)]
-    return np.concatenate(parts, axis=0)
-
-
 def _shard_range(total: int, rank: int, world_size: int) -> tuple[int, int]:
     """Contiguous [start, end) slice of `total` items for this rank."""
     per = (total + world_size - 1) // world_size
@@ -174,60 +182,142 @@ def _shard_range(total: int, rank: int, world_size: int) -> tuple[int, int]:
     return start, max(start, end)
 
 
-def _load_inception():
-    """Load the pytorch-fid InceptionV3 (pool3, 2048-d) feature extractor."""
-    from pytorch_fid.inception import InceptionV3
-    block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
-    model = InceptionV3([block_idx]).to(DEVICE).eval()
-    return model
+# ─────────────────────────────── clean-fid ──────────────────────────────────
+
+def _latent_files(root_dir: str) -> list[str]:
+    """All per-image latent .safetensors paths in an IN1kLatentDataset tree.
+
+    Mirrors IN1kLatentDataset's layout (from_16_to_256 / greater_than_256_resize
+    / greater_than_256_crop). In practice only greater_than_256_resize/ is
+    populated (256x256 crops); the other subdirs are tolerated when present. For
+    files that exist in both the resize and crop variants we keep a single path
+    (crop), matching the dataset's deduplication, so each image is counted once.
+    """
+    import os.path as osp
+
+    dir_1 = osp.join(root_dir, f"from_16_to_{TARGET_LEN_PIX}")
+    dir_2 = osp.join(root_dir, f"greater_than_{TARGET_LEN_PIX}_resize")
+    dir_3 = osp.join(root_dir, f"greater_than_{TARGET_LEN_PIX}_crop")
+    files_1 = os.listdir(dir_1) if osp.isdir(dir_1) else []
+    files_2 = os.listdir(dir_2) if osp.isdir(dir_2) else []
+    files_3 = os.listdir(dir_3) if osp.isdir(dir_3) else []
+    files_23 = set(files_2) - set(files_3)
+    paths = [osp.join(dir_1, f) for f in files_1]
+    paths += [osp.join(dir_2, f) for f in files_23]
+    paths += [osp.join(dir_3, f) for f in files_3]  # crop variant when both exist
+    return paths
 
 
-@torch.no_grad()
-def _inception_features(model, imgs_uint8: torch.Tensor) -> np.ndarray:
-    """Extract 2048-d pool3 features for a batch of uint8 images (B, H, W, 3)."""
-    feats = []
-    for i in range(0, imgs_uint8.shape[0], INCEPTION_BATCH_SIZE):
-        batch = imgs_uint8[i:i + INCEPTION_BATCH_SIZE].to(DEVICE)
-        # pytorch-fid expects float in [0, 1], NCHW; it resizes to 299 internally.
-        x = batch.permute(0, 3, 1, 2).float() / 255.0
-        out = model(x)[0]  # (B, 2048, 1, 1)
-        feats.append(out.squeeze(-1).squeeze(-1).cpu().numpy())
-    return np.concatenate(feats, axis=0)
+def _decode_reference_latents(vae, dst_dir: str, rank: int, world_size: int):
+    """Decode the latent reference set into PNGs under dst_dir (sharded by rank).
+
+    Reads IN1kLatentDataset .safetensors files, takes the unflipped variant,
+    unpatchifies the (H_g, W_g, 16) grid to a (4, H, W) spatial latent and
+    VAE-decodes it with the SAME path used for generated samples. Each rank
+    decodes a contiguous slice; filenames are keyed to the global file index so
+    shards never collide. Returns the total number of reference images.
+    """
+    from safetensors.torch import load_file
+
+    paths = sorted(_latent_files(REF_IMAGE_DIR))
+    if not paths:
+        raise FileNotFoundError(
+            f"No latent .safetensors found under {REF_IMAGE_DIR} (expected "
+            f"IN1kLatentDataset subdirs, e.g. greater_than_{TARGET_LEN_PIX}_resize/). "
+            f"Set FID_REF_IS_LATENT=0 if this is a folder of real images."
+        )
+    # Shuffle, then cap. Filenames are class-prefixed, so an alphabetical prefix
+    # would be skewed toward the lowest class ids; shuffling makes the capped
+    # subset span all classes. Seed sorted paths with a fixed RNG so every rank
+    # produces the same permutation (and runs are reproducible).
+    g = torch.Generator().manual_seed(GLOBAL_SEED)
+    perm = torch.randperm(len(paths), generator=g).tolist()
+    paths = [paths[i] for i in perm]
+    if REF_MAX and len(paths) > REF_MAX:
+        if rank == 0:
+            print(f"    reference: shuffled, capped at {REF_MAX} / {len(perm)} latents")
+        paths = paths[:REF_MAX]
+    dtype = next(vae.parameters()).dtype
+    start, end = _shard_range(len(paths), rank, world_size)
+    for gi_idx in range(start, end):
+        data = load_file(paths[gi_idx])
+        feat_hw = data["feature"][0]                 # (H_g, W_g, 16), unflipped
+        H_g, W_g = feat_hw.shape[0], feat_hw.shape[1]
+        tokens = feat_hw.reshape(1, H_g * W_g, 16)   # (1, N, c*p*p)
+        x1_sp = unpatchify(tokens, (H_g * PATCH_SIZE, W_g * PATCH_SIZE), PATCH_SIZE)
+        x1_sp = x1_sp.to(DEVICE, dtype)
+        imgs_uint8 = _decode_to_uint8(vae, x1_sp)    # (1, H, W, 3) uint8 CPU
+        _save_pngs(imgs_uint8, dst_dir, gi_idx)
+        if rank == 0 and (gi_idx - start) % 200 == 0:
+            print(f"    decoding reference {gi_idx - start}/{end - start} "
+                  f"(×{world_size} ranks)", end="\r", flush=True)
+    return len(paths)
 
 
-def _frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6) -> float:
-    """Standard FID between two Gaussians (same maths as pytorch-fid)."""
-    from scipy import linalg
+def _ensure_reference(vae, is_main: bool, rank: int, world_size: int):
+    """Make sure the clean-fid custom reference exists (build it once).
 
-    mu1, mu2 = np.atleast_1d(mu1), np.atleast_1d(mu2)
-    sigma1, sigma2 = np.atleast_2d(sigma1), np.atleast_2d(sigma2)
+    clean-fid ships no ImageNet reference, so the first run computes statistics
+    from REF_IMAGE_DIR and caches them under REF_STATS_NAME. Subsequent runs
+    (and other machines sharing the cache) reuse them.
 
-    diff = mu1 - mu2
-    covmean, _ = linalg.sqrtm(sigma1 @ sigma2, disp=False)
-    if not np.isfinite(covmean).all():
-        offset = np.eye(sigma1.shape[0]) * eps
-        covmean = linalg.sqrtm((sigma1 + offset) @ (sigma2 + offset))
-    if np.iscomplexobj(covmean):
-        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
-            m = np.max(np.abs(covmean.imag))
-            raise ValueError(f"Imaginary component {m} in sqrtm")
-        covmean = covmean.real
-    return float(diff @ diff + np.trace(sigma1) + np.trace(sigma2) - 2 * np.trace(covmean))
+    When REF_IS_LATENT, REF_IMAGE_DIR holds VAE-encoded latents (our training
+    data): all ranks decode them to PNGs in parallel, then rank 0 builds the
+    stats from the decoded folder. Otherwise REF_IMAGE_DIR is a folder of real
+    images that clean-fid reads directly (rank 0 only).
+    """
+    from cleanfid import fid as cleanfid
+
+    if cleanfid.test_stats_exists(REF_STATS_NAME, mode=FID_MODE):
+        if is_main:
+            print(f"  reference '{REF_STATS_NAME}' ({FID_MODE}) already cached.")
+        return
+
+    if not os.path.isdir(REF_IMAGE_DIR):
+        if is_main:
+            raise FileNotFoundError(
+                f"Reference '{REF_STATS_NAME}' is not cached and REF_IMAGE_DIR "
+                f"does not exist: {REF_IMAGE_DIR}"
+            )
+        return
+
+    if REF_IS_LATENT:
+        # Decode latents → PNGs (all ranks), barrier, then rank 0 builds stats.
+        decode_dir = REF_DECODE_DIR or os.path.join(OUTPUT_DIR, "_reference_decoded")
+        if is_main:
+            os.makedirs(decode_dir, exist_ok=True)
+            print(f"  decoding latent reference from {REF_IMAGE_DIR}\n"
+                  f"  → {decode_dir} (VAE-decoded, then scored once) …")
+        if _is_dist():
+            dist.barrier()
+        _decode_reference_latents(vae, decode_dir, rank, world_size)
+        if _is_dist():
+            dist.barrier()
+        if is_main:
+            print(f"\n  building reference '{REF_STATS_NAME}' from decoded PNGs …")
+            cleanfid.make_custom_stats(REF_STATS_NAME, decode_dir, mode=FID_MODE)
+            print(f"  reference '{REF_STATS_NAME}' built and cached.")
+        return
+
+    # Plain image folder: rank 0 builds directly.
+    if is_main:
+        print(f"  building reference '{REF_STATS_NAME}' from {REF_IMAGE_DIR} …")
+        cleanfid.make_custom_stats(REF_STATS_NAME, REF_IMAGE_DIR, mode=FID_MODE)
+        print(f"  reference '{REF_STATS_NAME}' built and cached.")
 
 
-def _load_ref_stats(npz_path: str):
-    """Load (mu, sigma) from an ADM-style reference .npz."""
-    if not os.path.isfile(npz_path):
-        raise FileNotFoundError(f"Reference statistics not found: {npz_path}")
-    data = np.load(npz_path)
-    if "mu" in data and "sigma" in data:
-        return data["mu"], data["sigma"]
-    # Some ADM files store raw activations under "arr_0" instead of mu/sigma.
-    if "arr_0" in data:
-        acts = data["arr_0"]
-        return acts.mean(axis=0), np.cov(acts, rowvar=False)
-    raise KeyError(
-        f"{npz_path} has neither (mu, sigma) nor arr_0; keys = {list(data.keys())}"
+def _compute_fid_dir(image_dir: str, num_gen: int) -> float:
+    """clean-fid between a folder of generated PNGs and the custom reference."""
+    from cleanfid import fid as cleanfid
+
+    return float(
+        cleanfid.compute_fid(
+            image_dir,
+            dataset_name=REF_STATS_NAME,
+            dataset_split="custom",
+            mode=FID_MODE,
+            num_gen=num_gen,
+        )
     )
 
 
@@ -278,45 +368,44 @@ def _gen_noise_field(model, vae, y, grid_sizes, dtype, seed) -> torch.Tensor:
     return _decode_to_uint8(vae, x1_sp)
 
 
-def _compute_fid_for_sampler(sampler_name, gen_one_batch, inception,
-                             ref_mu, ref_sigma, all_labels, all_noise_fr_sp,
-                             H_fr, W_fr, dtype, rank, world_size) -> float | None:
-    """Generate this rank's shard of N_IMAGES, gather features, return FID.
+def _save_pngs(imgs_uint8: torch.Tensor, out_dir: str, start_idx: int):
+    """Write a batch of uint8 images (B, H, W, 3) as zero-padded PNGs.
 
-    Each rank generates a contiguous, non-overlapping slice of the shared
-    labels/noise so the union covers all N_IMAGES exactly once. Features are
-    all-gathered onto rank 0, which computes and returns the FID (other ranks
-    return None).
+    Filenames are keyed to the absolute global image index so shards from
+    different ranks never collide.
+    """
+    arr = imgs_uint8.numpy()
+    for j in range(arr.shape[0]):
+        Image.fromarray(arr[j]).save(
+            os.path.join(out_dir, f"{start_idx + j:07d}.png")
+        )
+
+
+def _generate_sampler_pngs(sampler_name, gen_one_batch, out_dir,
+                           all_labels, all_noise_fr_sp, dtype,
+                           rank, world_size):
+    """Generate this rank's contiguous shard of N_IMAGES and write them as PNGs.
+
+    Each rank takes a non-overlapping slice of the shared labels/noise, so the
+    union of all shards covers N_IMAGES exactly once. FID is computed separately
+    (by rank 0 via clean-fid) once every rank has finished writing.
     """
     shard_start, shard_end = _shard_range(N_IMAGES, rank, world_size)
-    feats = []
     generated = shard_start
     while generated < shard_end:
         bs = min(BATCH_SIZE, shard_end - generated)
         y = all_labels[generated:generated + bs]
         noise_fr_sp = all_noise_fr_sp[generated:generated + bs].to(dtype)
         imgs_uint8 = gen_one_batch(y, noise_fr_sp, generated)
-        feats.append(_inception_features(inception, imgs_uint8))
+        _save_pngs(imgs_uint8, out_dir, generated)
         generated += bs
         if rank == 0:
             done = generated - shard_start
             total = shard_end - shard_start
             print(f"    [{sampler_name}] rank0 {done}/{total} (×{world_size} ranks)",
                   end="\r", flush=True)
-
-    local_feats = (np.concatenate(feats, axis=0) if feats
-                   else np.zeros((0, 2048), dtype=np.float32))
-    acts = _gather_features(local_feats)
-    if rank != 0:
-        return None
-
-    print(f"    [{sampler_name}] {acts.shape[0]}/{N_IMAGES} generated"
-          f"{' ' * 20}")
-    mu = acts.mean(axis=0)
-    sigma = np.cov(acts, rowvar=False)
-    fid = _frechet_distance(mu, sigma, ref_mu, ref_sigma)
-    print(f"    [{sampler_name}] FID = {fid:.4f}")
-    return fid
+    if rank == 0:
+        print(f"    [{sampler_name}] PNGs written{' ' * 30}")
 
 
 def main():
@@ -338,15 +427,16 @@ def main():
     W_fr = TARGET_LEN_PIX // (PATCH_SIZE * VAE_SCALE)
     log(f"Full-res grid: {H_fr}×{W_fr}")
 
-    # Reference stats are only needed on rank 0 (it computes the FID).
-    ref_mu = ref_sigma = None
-    if is_main:
-        log(f"\nLoading reference statistics from {REF_STATS_NPZ} …")
-        ref_mu, ref_sigma = _load_ref_stats(REF_STATS_NPZ)
-        log(f"  reference: mu {ref_mu.shape}, sigma {ref_sigma.shape}")
+    log(f"\nLoading VAE from {VAE_PATH} …")
+    vae = AutoencoderKL.from_pretrained(VAE_PATH).to(device).eval()
 
-    log("Loading InceptionV3 (pytorch-fid) …")
-    inception = _load_inception()
+    # Build / verify the clean-fid reference. When the reference is latent it is
+    # VAE-decoded here (all ranks), so the VAE must already be loaded. Ranks then
+    # sync so nobody starts generating against a half-built cache.
+    log(f"\nReference: clean-fid custom stats '{REF_STATS_NAME}' (mode={FID_MODE})")
+    _ensure_reference(vae, is_main, rank, world_size)
+    if _is_dist():
+        dist.barrier()
 
     # Fixed labels and full-res noise shared across all samplers/checkpoints.
     # Generated on CPU with a fixed seed so every rank produces the identical
@@ -357,9 +447,6 @@ def main():
         N_IMAGES, C_IN, H_fr * PATCH_SIZE, W_fr * PATCH_SIZE, generator=g
     ).to(device)
     log(f"Fixed labels and noise pre-generated (seed={GLOBAL_SEED}).")
-
-    log(f"\nLoading VAE from {VAE_PATH} …")
-    vae = AutoencoderKL.from_pretrained(VAE_PATH).to(device).eval()
 
     results = {}
     for ckpt_cfg in CHECKPOINTS:
@@ -385,30 +472,44 @@ def main():
         dtype = next(model.parameters()).dtype
         results[ckpt_name] = {}
 
-        # --- standard full-res Euler integrator ---
+        # Build the list of (sampler_name, per-batch generator) to run.
         def euler_batch(y, noise_fr_sp, generated):
             return _gen_euler_fr(model, vae, y, noise_fr_sp, H_fr, W_fr, dtype)
 
-        results[ckpt_name]["euler_fr"] = _compute_fid_for_sampler(
-            "euler_fr", euler_batch, inception, ref_mu, ref_sigma,
-            all_labels, all_noise_fr_sp, H_fr, W_fr, dtype, rank, world_size,
-        )
-
-        # --- noise-field samplers for the requested schedules ---
+        samplers = [("euler_fr", euler_batch)]
         for sched_idx, grid_sizes in NOISE_FIELD_SCHEDULES.items():
             name = f"noise_field_{sched_idx:03d}"
 
             def nf_batch(y, noise_fr_sp, generated, _gs=grid_sizes):
-                # Seed is keyed to the absolute (global) image index so every
-                # image's noise field is identical regardless of which rank
-                # produces it.
+                # Seed keyed to the absolute (global) image index so every
+                # image's noise field is identical regardless of producing rank.
                 return _gen_noise_field(model, vae, y, _gs, dtype,
                                         GLOBAL_SEED + generated)
 
-            results[ckpt_name][name] = _compute_fid_for_sampler(
-                name, nf_batch, inception, ref_mu, ref_sigma,
-                all_labels, all_noise_fr_sp, H_fr, W_fr, dtype, rank, world_size,
+            samplers.append((name, nf_batch))
+
+        # --- Phase 1: every rank generates its shard of PNGs for each sampler.
+        sampler_dirs = {}
+        for name, gen_batch in samplers:
+            out_dir = os.path.join(OUTPUT_DIR, ckpt_name, name)
+            sampler_dirs[name] = out_dir
+            if is_main:
+                os.makedirs(out_dir, exist_ok=True)
+            if _is_dist():
+                dist.barrier()  # ensure the dir exists before any rank writes
+            _generate_sampler_pngs(
+                name, gen_batch, out_dir,
+                all_labels, all_noise_fr_sp, dtype, rank, world_size,
             )
+
+        # --- Phase 2: wait for all PNGs, then rank 0 scores each dir.
+        if _is_dist():
+            dist.barrier()
+        if is_main:
+            for name in sampler_dirs:
+                fid = _compute_fid_dir(sampler_dirs[name], num_gen=N_IMAGES)
+                results[ckpt_name][name] = fid
+                log(f"    [{name}] FID = {fid:.4f}")
 
         del model
         if torch.cuda.is_available():
