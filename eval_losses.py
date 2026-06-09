@@ -6,13 +6,11 @@ All configuration lives in the CONFIG block below — no CLI arguments needed.
 
 Metrics computed at each (t, compression_grid) pair:
   1. vel_loss_lr   – MSE between v_pred and v_target at the low-res grid
-  2. vel_loss_fr   – MSE between upsampled-v_pred and v_target at full-res
-                     (bilinear upsample of the low-res prediction; meaningful
-                      even for Loss A/B/C checkpoints as a diagnostic)
-  3. img_mse_lr    – MSE between x1_hat (recovered from v_pred via the ICPlan
+  2. img_mse_lr    – MSE between x1_hat (recovered from v_pred via the ICPlan
                      formula x1_hat = xt + (1-t)*v_pred) and the true low-res
                      latent x1, evaluated at the low-res grid
-  4. img_mse_fr    – same but upsampled to full-res and compared to x1_fr
+  3. img_mse_fr    – full-res latent error at timestep t:
+                     (x1_fr - (t*x1_fr + (1-t)*upsample(x0_lr - v_pred_lr)))**2
 
 For loss_type='virtual_resize', only img_mse_fr is computed:
   The full-res latent is spatially compressed to the low-res grid and back
@@ -59,8 +57,7 @@ TARGET_LEN = 256
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Base model config shared by all checkpoints.
-# use_upsampler is overridden per-checkpoint for Loss C.
-_BASE_MODEL_CFG = dict( 
+_BASE_MODEL_CFG = dict(
     context_size=256,
     patch_size=2,
     in_channels=4,
@@ -87,10 +84,9 @@ _BASE_MODEL_CFG = dict(
 # Each entry is a dict with:
 #   name      – label used in results and printed output
 #   dir       – folder containing model_1.safetensors (EMA weights)
-#   loss_type – 'baseline', 'A', 'B', or 'C'
-#               'baseline' → no size conditioning, no upsampler
-#               'A'/'B'    → size conditioning, no upsampler
-#               'C'        → size conditioning + ResNet upsampler
+#   loss_type – 'baseline', 'A', or 'B'
+#               'baseline' → no size conditioning
+#               'A'/'B'    → size conditioning
 #
 # Only model_1.safetensors (EMA) is evaluated.  Missing files are skipped.
 CHECKPOINTS = [
@@ -226,13 +222,11 @@ def build_dataset(data_path: str, target_len: int) -> IN1kLatentDataset:
 def model_cfg_for(loss_type: str) -> dict:
     """Build a model config dict for a given loss type.
 
-    baseline / virtual_resize → no size conditioning, no upsampler
-    A / B                     → size conditioning, no upsampler
-    C                         → size conditioning + ResNet upsampler
+    baseline / virtual_resize → no size conditioning
+    A / B                     → size conditioning
     """
     cfg = dict(_BASE_MODEL_CFG)
     cfg["use_size_cond"] = (loss_type not in ("baseline", "virtual_resize"))
-    cfg["use_upsampler"] = (loss_type == "C")
     return cfg
 
 
@@ -250,14 +244,12 @@ def evaluate_at_compression(
     timesteps: torch.Tensor,
     device: str,
     patch_size: int = 2,
-    use_resnet_upsampler: bool = False,
 ) -> dict:
     """
     For a fixed grid size (compression) and a set of timesteps, compute the
-    four metrics averaged over the dataloader.
+    three metrics averaged over the dataloader.
 
-    Returns a dict keyed by float(t) → {vel_loss_lr, vel_loss_fr,
-                                         img_mse_lr, img_mse_fr}.
+    Returns a dict keyed by float(t) → {vel_loss_lr, img_mse_lr, img_mse_fr}.
     """
     p = patch_size
 
@@ -265,7 +257,6 @@ def evaluate_at_compression(
     T = len(timesteps)
     sums = {
         "vel_loss_lr": torch.zeros(T),
-        "vel_loss_fr": torch.zeros(T),
         "img_mse_lr":  torch.zeros(T),
         "img_mse_fr":  torch.zeros(T),
     }
@@ -341,52 +332,33 @@ def evaluate_at_compression(
             sigma = 1.0 - t                                              # (B,)
             sigma_inj = sigma * r / (1.0 - sigma * (1.0 - r))           # (B,)
 
-            xt_fr, xt_lr_valid, x0_fr, x0_lr = sample_paired_noise(
+            _xt_fr, xt_lr_valid, _x0_fr, x0_lr = sample_paired_noise(
                 B, H_fr, W_fr, H_lr, W_lr, sigma, sigma_inj, x1_fr, x1_lr, p=p,
             )
 
             sigma_exp = sigma_inj.view(B, 1, 1)
-            xt_fr_sp = unpatchify(xt_fr, (H_fr * p, W_fr * p), p)
-            ut_fr = x1_fr - x0_fr                                        # (B, N_fr, 16)
             ut_lr = x1_lr - x0_lr                                        # (B, seq_lr, 16)
 
-            if use_resnet_upsampler:
-                raise ValueError("The current implementation is not correct, please fix this first!")
-                # ── Loss C ───────────────────────────────────────────────────
-                v_pred_lr = model(xt_lr_valid, 1 - sigma_inj, **model_kwargs)
-
-                # Upsample the LR velocity prediction and run ResNet (mirrors training).
-                v_lr_sp = unpatchify(v_pred_lr, (H_lr * p, W_lr * p), p)
-                v_lr_up_sp = spatial_resize_sp(v_lr_sp, H_fr, W_fr)
-                v_pred_sp_fr = model.upsampler(v_lr_up_sp, xt_fr_sp)     # (B, 4, H_sp, W_sp)
-                x1_hat_sp_fr = xt_fr_sp + sigma.view(B, 1, 1, 1) * v_pred_sp_fr
-                v_pred_fr = patchify(v_pred_sp_fr, p)
-                x1_hat_fr = patchify(x1_hat_sp_fr, p)
-            else:
-                # ── Loss A/B ─────────────────────────────────────────────────
-                v_pred_lr = model(xt_lr_valid, 1 - sigma_inj, **model_kwargs)
-
-                v_pred_lr_sp = unpatchify(v_pred_lr, (H_lr * p, W_lr * p), p)
-                v_pred_fr_sp = spatial_resize_sp(v_pred_lr_sp, H_fr, W_fr)
-                v_pred_fr = patchify(v_pred_fr_sp, p)
+            v_pred_lr = model(xt_lr_valid, 1 - sigma_inj, **model_kwargs)
 
             # ── low-res metrics (shared) ─────────────────────────────────────
             x1_hat_lr = xt_lr_valid + sigma_exp * v_pred_lr
             vel_loss_lr = ((v_pred_lr - ut_lr) * mask_lr).pow(2).mean(dim=[1, 2]).mean()
             img_mse_lr  = ((x1_hat_lr - x1_lr) * mask_lr).pow(2).mean(dim=[1, 2]).mean()
 
-            # ── full-res metrics (shared) ────────────────────────────────────
-            x1_hat_lr_sp = unpatchify(x0_lr + v_pred_lr, (H_lr * p, W_lr * p), p)
-            x1_hat_lr_up_sp = spatial_resize_sp(x1_hat_lr_sp, H_fr, W_fr)
-            x1_hat_lr_up = patchify(x1_hat_lr_up_sp, p)
-            sigma_fr = sigma.view(B, 1, 1)
-            x1_hat_fr = (1.0 - sigma_fr) * x1_fr + sigma_fr * x1_hat_lr_up
-            vel_loss_fr = ((v_pred_fr - ut_fr) * mask_fr).pow(2).mean(dim=[1, 2]).mean()
-            img_mse_fr  = ((x1_hat_fr - x1_fr) * mask_fr).pow(2).mean(dim=[1, 2]).mean()
+            # ── full-res latent metric ───────────────────────────────────────
+            # Error at timestep t between the full-res target latent and a
+            # reconstruction that mixes the clean full-res latent (weight t) with
+            # the upsampled (noise - velocity) residual (weight 1 - t):
+            #   (x1_fr - (t * x1_fr + (1 - t) * upsample(x0_lr - v_pred_lr))) ** 2
+            resid_lr_sp = unpatchify(x0_lr - v_pred_lr, (H_lr * p, W_lr * p), p)
+            resid_up = patchify(spatial_resize_sp(resid_lr_sp, H_fr, W_fr), p)
+            t_fr = t.view(B, 1, 1)
+            x1_hat_fr = t_fr * x1_fr + (1.0 - t_fr) * resid_up
+            img_mse_fr = ((x1_fr - x1_hat_fr) * mask_fr).pow(2).mean(dim=[1, 2]).mean()
 
             # Accumulate (each batch contributes B samples).
             sums["vel_loss_lr"][ti] += vel_loss_lr.item() * B
-            sums["vel_loss_fr"][ti] += vel_loss_fr.item() * B
             sums["img_mse_lr"][ti]  += img_mse_lr.item() * B
             sums["img_mse_fr"][ti]  += img_mse_fr.item() * B
             counts[ti] += B
@@ -398,7 +370,6 @@ def evaluate_at_compression(
         n = counts[ti].item()
         results[key] = {
             "vel_loss_lr": sums["vel_loss_lr"][ti].item() / n,
-            "vel_loss_fr": sums["vel_loss_fr"][ti].item() / n,
             "img_mse_lr":  sums["img_mse_lr"][ti].item()  / n,
             "img_mse_fr":  sums["img_mse_fr"][ti].item()  / n,
         }
@@ -417,21 +388,36 @@ def evaluate_at_compression_virtual_resize(
     """
     Virtual-resize evaluation for the baseline model.
 
-    For each sample the full-res latent is spatially compressed to grid_size
-    and bilinearly upsampled back to full-res (virtual resize).  The result is
-    noised and passed through the full-res model.  The predicted clean latent is
-    compared to the original full-res latent via img_mse_fr.
+    The full-res model is run on a virtually-resized input — the clean latent is
+    compressed to grid_size and back (up(down(image))) and noised at timestep t:
+        model_input = t * up(down(image)) + (1 - t) * noise
+    The predicted full-res velocity is then downsampled to the g×g grid
+    (velocity = down(velocity_full_res)) and the metrics are computed against
+    the low-res target velocity / latent:
 
-    This mirrors the 'virtual resize' condition from
-    virtual_vs_real_resize_experiment.py.
+        vel_loss_lr = (down(image) - down(noise) - velocity) ** 2
+        img_mse_lr  = (down(image)
+                       - (t*down(image) + (1-t)*(down(noise) - velocity))) ** 2
+        img_mse_fr  = (image
+                       - (t*image + (1-t)*up(down(noise) - velocity))) ** 2
 
-    Returns a dict keyed by float(t) → {vel_loss_fr, img_mse_fr}.
+    Returns a dict keyed by float(t) → {vel_loss_lr, img_mse_lr, img_mse_fr}.
     """
     p = patch_size
 
     T = len(timesteps)
-    sums = {"vel_loss_fr": torch.zeros(T), "img_mse_fr": torch.zeros(T)}
+    sums = {
+        "vel_loss_lr": torch.zeros(T),
+        "img_mse_lr":  torch.zeros(T),
+        "img_mse_fr":  torch.zeros(T),
+    }
     counts = torch.zeros(T)
+
+    def down(x):
+        return spatial_resize(x, H_fr, W_fr, g, g)
+
+    def up(x):
+        return spatial_resize(x, g, g, H_fr, W_fr)
 
     for batch in dataloader:
         feat_fr = batch["feature"].to(device)          # (B, target_len, 16)
@@ -449,10 +435,10 @@ def evaluate_at_compression_virtual_resize(
         g = grid_size
 
         # ── virtual resize: compress x1_fr to g×g and back to full-res ────────
-        x1_virtual = spatial_resize(
-            spatial_resize(x1_fr, H_fr, W_fr, g, g),
-            g, g, H_fr, W_fr,
-        )                                            # (B, N_fr, 16) — virtually resized
+        x1_lr = down(x1_fr)                           # (B, N_lr, 16) — down(image)
+        x1_virtual = up(x1_lr)                        # (B, N_fr, 16) — up(down(image))
+
+        mask_lr = torch.ones(B, g * g, 1, device=device, dtype=x1_fr.dtype)
 
         # ── build model kwargs for full-res forward (no size conditioning) ─────
         hs = torch.arange(H_fr, dtype=x1_fr.dtype, device=device)
@@ -474,44 +460,33 @@ def evaluate_at_compression_virtual_resize(
 
         for ti, t_val in enumerate(timesteps):
             t = t_val.expand(B).to(device).to(x1_fr.dtype)
-            sigma = (1.0 - t).view(B, 1, 1)
+            t_e = t.view(B, 1, 1)
 
-            # Sample two independent full-res noise tensors, then replace their
-            # low-res component with a shared one.  This ensures the model cannot
-            # exploit high-freq noise correlations between xt_virtual and xt_fr,
-            # while preserving the physically meaningful low-freq coupling that
-            # would exist if both trajectories were derived from the same source.
-            x0_a = torch.randn_like(x1_fr)
-            x0_b = torch.randn_like(x1_fr)
-            # Shared low-res noise component (downsample → upsample x0_a).
-            x0_lr = spatial_resize(
-                spatial_resize(x0_a, H_fr, W_fr, g, g),
-                g, g, H_fr, W_fr,
-            )
-            # Each sample = shared low-freq component + its own high-freq residual.
-            # x0_virtual simplifies to x0_a since x0_lr is already its low-freq part.
-            x0_virtual = x0_a
-            x0_fr      = x0_lr + (x0_b - spatial_resize(
-                spatial_resize(x0_b, H_fr, W_fr, g, g), g, g, H_fr, W_fr))
+            x0_fr = torch.randn_like(x1_fr)           # full-res noise
+            x0_lr = down(x0_fr)                        # down(noise)
 
-            xt_virtual = (1.0 - sigma) * x1_virtual + sigma * x0_virtual
-            xt_fr = (1.0 - sigma) * x1_fr + sigma * x0_fr
+            # ── model input: t * up(down(image)) + (1 - t) * noise ────────────
+            model_input = t_e * x1_virtual + (1.0 - t_e) * x0_fr
+            v_pred_fr = model(model_input, t, **model_kwargs)  # (B, N_fr, 16)
 
-            v_pred_fr = model(xt_virtual, t, **model_kwargs)  # (B, N_fr, 16)
+            # ── velocity = down(velocity_full_res) ────────────────────────────
+            velocity = down(v_pred_fr)                # (B, N_lr, 16)
 
-            # Recover predicted clean latent: x1_hat = xt + sigma * v_pred
-            x1_hat_fr = xt_fr + sigma * v_pred_fr                # (B, N_fr, 16)
+            # ── low-res velocity error ────────────────────────────────────────
+            target_velocity = x1_lr - x0_lr           # down(image) - down(noise)
+            vel_loss_lr = ((target_velocity - velocity) * mask_lr).pow(2).mean(dim=[1, 2]).mean()
 
-            # vel_loss_fr: velocity error against the target the model was conditioned on
-            ut_fr = x1_fr - x0_virtual
-            vel_loss_fr = ((v_pred_fr - ut_fr) * mask_fr).pow(2).mean(dim=[1, 2]).mean()
+            # ── low-res image error ───────────────────────────────────────────
+            recon_lr = t_e * x1_lr + (1.0 - t_e) * (x0_lr - velocity)
+            img_mse_lr = ((x1_lr - recon_lr) * mask_lr).pow(2).mean(dim=[1, 2]).mean()
 
-            # img_mse_fr: compare to the original (uncompressed) full-res latent
-            img_sq_fr = ((x1_hat_fr - x1_fr) * mask_fr) ** 2
-            img_mse_fr = img_sq_fr.mean(dim=[1, 2]).mean()
+            # ── full-res image error ──────────────────────────────────────────
+            recon_fr = t_e * x1_fr + (1.0 - t_e) * up(x0_lr - velocity)
+            img_mse_fr = ((x1_fr - recon_fr) * mask_fr).pow(2).mean(dim=[1, 2]).mean()
 
-            sums["vel_loss_fr"][ti] += vel_loss_fr.item() * B
-            sums["img_mse_fr"][ti] += img_mse_fr.item() * B
+            sums["vel_loss_lr"][ti] += vel_loss_lr.item() * B
+            sums["img_mse_lr"][ti]  += img_mse_lr.item() * B
+            sums["img_mse_fr"][ti]  += img_mse_fr.item() * B
             counts[ti] += B
 
     results = {}
@@ -519,7 +494,8 @@ def evaluate_at_compression_virtual_resize(
         key = f"{t_val.item():.4f}"
         n = counts[ti].item()
         results[key] = {
-            "vel_loss_fr": sums["vel_loss_fr"][ti].item() / n,
+            "vel_loss_lr": sums["vel_loss_lr"][ti].item() / n,
+            "img_mse_lr":  sums["img_mse_lr"][ti].item()  / n,
             "img_mse_fr":  sums["img_mse_fr"][ti].item()  / n,
         }
     return results
@@ -601,12 +577,13 @@ def main():
                 )
                 results_for_run[f"grid_{g}x{g}"] = per_t
 
-                header = f"{'t':>8}  {'vel_fr':>10}  {'img_fr':>10}"
+                header = f"{'t':>8}  {'vel_lr':>10}  {'img_lr':>10}  {'img_fr':>10}"
                 print(f"    {header}")
                 print(f"    {'-'*len(header)}")
                 for t_key, vals in per_t.items():
                     print(f"    {float(t_key):8.4f}  "
-                          f"{vals['vel_loss_fr']:10.6f}  "
+                          f"{vals['vel_loss_lr']:10.6f}  "
+                          f"{vals['img_mse_lr']:10.6f}  "
                           f"{vals['img_mse_fr']:10.6f}")
             else:
                 per_t = evaluate_at_compression(
@@ -615,17 +592,15 @@ def main():
                     grid_size=g,
                     timesteps=timesteps,
                     device=DEVICE,
-                    use_resnet_upsampler=(loss_type == "C"),
                 )
                 results_for_run[f"grid_{g}x{g}"] = per_t
 
-                header = f"{'t':>8}  {'vel_lr':>10}  {'vel_fr':>10}  {'img_lr':>10}  {'img_fr':>10}"
+                header = f"{'t':>8}  {'vel_lr':>10}  {'img_lr':>10}  {'img_fr':>10}"
                 print(f"    {header}")
                 print(f"    {'-'*len(header)}")
                 for t_key, vals in per_t.items():
                     print(f"    {float(t_key):8.4f}  "
                           f"{vals['vel_loss_lr']:10.6f}  "
-                          f"{vals['vel_loss_fr']:10.6f}  "
                           f"{vals['img_mse_lr']:10.6f}  "
                           f"{vals['img_mse_fr']:10.6f}")
 

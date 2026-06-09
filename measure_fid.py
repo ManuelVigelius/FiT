@@ -58,6 +58,7 @@ from generate_images import (
     make_grid_and_mask,
     model_cfg_for,
 )
+from fit.noise_field_sampler.noise_field_generator import sample_noise_fields_2d
 from fit.noise_field_sampler.noise_field_sampler import sample as noise_field_sample
 from fit.scheduler.transport.utils import patchify, unpatchify
 
@@ -163,9 +164,23 @@ def _setup_distributed():
         # doesn't leave its peers blocked on a barrier for the 30-min NCCL
         # default — on a shared box that would pin all 4 GPUs idle. After this
         # the surviving ranks raise and main()'s handler tears the group down.
-        dist.init_process_group("nccl", timeout=timedelta(minutes=10))
+        #
+        # The timeout must exceed the longest *single-rank* stretch the other
+        # ranks block through: rank 0 builds the clean-fid reference stats over
+        # ~150k decoded PNGs (single-process Inception, ~15 min) and later scores
+        # each sampler dir alone, while ranks 1-3 wait at a barrier the whole
+        # time. 10 min was too short and the idle ranks' barrier timed out
+        # (NCCL watchdog SIGABRT). Default to 60 min; override via FID_NCCL_TIMEOUT_MIN.
+        nccl_timeout_min = int(os.environ.get("FID_NCCL_TIMEOUT_MIN", "60"))
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+        # Pass device_id so NCCL knows which GPU this rank owns up front. Without
+        # it PyTorch warns "using GPU N ... is currently unknown ... can
+        # potentially cause a hang" and infers the device lazily on first
+        # collective; binding it here removes the warning and the hang risk.
+        dist.init_process_group(
+            "nccl", timeout=timedelta(minutes=nccl_timeout_min), device_id=device
+        )
     else:
         rank, world_size = 0, 1
         device = torch.device(gi.DEVICE)
@@ -368,7 +383,18 @@ def _decode_to_uint8(vae, x1_sp: torch.Tensor) -> torch.Tensor:
     return imgs.permute(0, 2, 3, 1).to(torch.uint8).cpu()
 
 
-def _gen_euler_fr(model, vae, y, noise_fr_sp, H_fr, W_fr, dtype) -> torch.Tensor:
+def _gen_euler_fr(model, vae, y, H_fr, W_fr, dtype, seed) -> torch.Tensor:
+    bs = y.shape[0]
+    # Use the full-resolution noise field as the initial noise so euler_fr is
+    # reproducible against the noise-field sampler: both draw from the same
+    # seeded sample_noise_fields_2d realization. The full grid is H_fr (== max
+    # schedule), so the full-res field at H_fr * PATCH_SIZE matches euler_fr's
+    # noise shape and per-pixel unit std.
+    full_size = H_fr * PATCH_SIZE
+    torch.manual_seed(seed)
+    noise_fr_sp = sample_noise_fields_2d([full_size], C_IN, bs)[0].to(
+        device=DEVICE, dtype=dtype
+    )
     z = patchify(noise_fr_sp, PATCH_SIZE)
     x1_sp = euler_sample_fr(
         model=model, z=z, y=y, H_fr=H_fr, W_fr=W_fr,
@@ -522,7 +548,11 @@ def main():
 
         # Build the list of (sampler_name, per-batch generator) to run.
         def euler_batch(y, noise_fr_sp, generated):
-            return _gen_euler_fr(model, vae, y, noise_fr_sp, H_fr, W_fr, dtype)
+            # Seed keyed to the absolute (global) image index, matching the
+            # noise-field samplers so euler_fr and the noise-field schedules
+            # share the same full-res noise realization per image.
+            return _gen_euler_fr(model, vae, y, H_fr, W_fr, dtype,
+                                 GLOBAL_SEED + generated)
 
         samplers = [("euler_fr", euler_batch)]
         for sched_idx, grid_sizes in NOISE_FIELD_SCHEDULES.items():
