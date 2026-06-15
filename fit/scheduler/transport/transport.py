@@ -4,7 +4,7 @@ import numpy as np
 import enum
 
 from . import path
-from .utils import mean_flat, get_flexible_mask_and_ratio, spatial_resize, patchify, unpatchify
+from .utils import mean_flat, get_flexible_mask_and_ratio
 from .integrators import ode, sde
 
 class ModelType(enum.Enum):
@@ -51,7 +51,6 @@ class Transport:
         train_eps,
         sample_eps,
         snr_type,
-        multires_loss: str = 'A',
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -65,7 +64,6 @@ class Transport:
         self.train_eps = train_eps
         self.sample_eps = sample_eps
         self.snr_type = snr_type
-        self.multires_loss = multires_loss  # 'A' = velocity loss, 'B' = upsample loss
 
     def prior_logp(self, z):
         '''
@@ -248,118 +246,6 @@ class Transport:
             terms['loss'] = self._mean_per_image(sq_err, doc_ids, model_kwargs, x1)
         return terms
 
-    def _loss_b(self, x1_fullres, xt, t, model_output, model_kwargs):
-        """Loss B: predict clean low-res, upsample, compare to full-res target."""
-        p = 2
-        # For ICPlan: x1_hat = xt + (1-t) * v_pred.
-        _sigma = 1.0 - t
-        x1_hat = xt + _sigma.view(-1, 1, 1) * model_output   # (B, N_lr, 16)
-        size_lr = model_kwargs['size']                        # (B, 1, 2)
-        size_fr = model_kwargs['size_fullres']                # (B, 1, 2)
-        H_lr = int(size_lr[0, 0, 0]); W_lr = int(size_lr[0, 0, 1])
-        H_fr = int(size_fr[0, 0, 0]); W_fr = int(size_fr[0, 0, 1])
-        x1_hat_fr = spatial_resize(x1_hat, H_lr, W_lr, H_fr, W_fr, p)  # (B, N_fr, 16)
-        mask_fr, ratio_fr = get_flexible_mask_and_ratio(
-            {'mask': model_kwargs['mask_fullres']}, x1_fullres
-        )
-        # Correction factor 1/sigma^2 makes this equivalent to the standard
-        # velocity loss: ||x1_hat - x1||^2 = sigma^2 * ||v_pred - v*||^2.
-        correction = 1.0 / (_sigma ** 2).mean()
-        return {'loss': mean_flat(((x1_hat_fr - x1_fullres) * mask_fr) ** 2) * ratio_fr * correction}
-
-    def _loss_c(self, model, x1_lr, x1_fullres, model_kwargs):
-        """Loss C: low-res FiT → ResNet → full-res velocity (packed mode only).
-
-        Fully self-contained: samples its own timesteps and builds xt_lr as the
-        bilinear downsample of xt_fr, eliminating cross-resolution leakage.
-        B=1 always; n_pack images are concatenated in the sequence dimension.
-        """
-        p = 2
-        doc_ids    = model_kwargs['doc_ids']     # (1, N_total_lr)
-        doc_ids_fr = model_kwargs['doc_ids_fr']  # (1, N_total_fr)
-        n_pack  = int(model_kwargs['n_pack'][0])
-        size_lr = model_kwargs['size']           # (1, n_pack, 2)
-        size_fr = model_kwargs['size_fullres']   # (1, n_pack, 2)
-        device  = x1_fullres.device
-
-        # 1. Sample per-image timesteps (same distribution as _forward_packed)
-        t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
-        if self.snr_type == SNRType.UNIFORM:
-            t_per_image = torch.rand((1, n_pack), device=device) * (t1 - t0) + t0
-        elif self.snr_type == SNRType.LOGNORM:
-            u = torch.normal(mean=0.0, std=1.0, size=(1, n_pack), device=device)
-            t_per_image = 1 / (1 + torch.exp(-u)) * (t1 - t0) + t0
-        else:
-            raise ValueError(f"Unknown snr type: {self.snr_type}")
-        t_per_image = t_per_image.to(x1_fullres)  # (1, n_pack)
-
-        # 2. Build per-token fullres xt using per-image t
-        safe_fr    = doc_ids_fr.clamp(min=0)                  # (1, N_total_fr)
-        t_token_fr = t_per_image[0, safe_fr[0]]               # (N_total_fr,)
-        valid_fr   = (doc_ids_fr[0] >= 0).to(x1_fullres)
-        t_exp_fr   = (t_token_fr * valid_fr).view(1, -1, 1)   # (1, N_total_fr, 1)
-
-        x0_fr = torch.randn_like(x1_fullres)                   # (1, N_total_fr, 16)
-        xt_fr = t_exp_fr * x1_fullres + (1 - t_exp_fr) * x0_fr
-
-        # 3. Build packed low-res xt by downsampling xt_fr per image
-        xt_lr_packed = torch.zeros_like(x1_lr)                 # (1, N_total_lr, 16)
-        for i in range(n_pack):
-            H_fr_i = int(size_fr[0, i, 0]); W_fr_i = int(size_fr[0, i, 1])
-            H_lr_i = int(size_lr[0, i, 0]); W_lr_i = int(size_lr[0, i, 1])
-            mask_fr_i = (doc_ids_fr[0] == i)
-            xt_fr_i   = xt_fr[0, mask_fr_i]                    # (N_fr_i, 16)
-            xt_lr_i   = spatial_resize(xt_fr_i, H_fr_i, W_fr_i, H_lr_i, W_lr_i, p, mode='area')
-            mask_lr_i = (doc_ids[0] == i)
-            xt_lr_packed[0, mask_lr_i] = xt_lr_i
-
-        # 4. FiT forward in packed mode
-        lr_kwargs = {k: v for k, v in model_kwargs.items()
-                     if k not in ('x1_fullres', 'mask_fullres', 'size_fullres',
-                                  'doc_ids_fr', 'n_pack')}
-        model_out_lr = model(xt_lr_packed, t_per_image, **lr_kwargs)  # (1, N_total_lr, 16)
-
-        # 5. Per-image: recover x1_lr_hat, upsample to full-res spatial.
-        #    Full-res grid size is constant across images (16×16 → 32×32 spatial),
-        #    so spatial tensors can be stacked and fed to the ResNet in one batch.
-        H_fr = int(size_fr[0, 0, 0]); W_fr = int(size_fr[0, 0, 1])
-        H_fr_sp = H_fr * p;           W_fr_sp = W_fr * p
-
-        x_lr_up_batch  = []  # (n_pack, C_in, H_fr_sp, W_fr_sp)
-        xt_fr_sp_batch = []  # (n_pack, C_in, H_fr_sp, W_fr_sp)
-        ut_fr_list     = []  # n_pack × (N_fr_i, 16)
-
-        for i in range(n_pack):
-            H_lr_i = int(size_lr[0, i, 0]); W_lr_i = int(size_lr[0, i, 1])
-
-            mask_lr_i = (doc_ids[0] == i)
-            v_lr_i    = model_out_lr[0, mask_lr_i]               # (N_lr_i, 16)
-
-            v_lr_up = spatial_resize(v_lr_i, H_lr_i, W_lr_i, H_fr, W_fr, p, mode='bilinear')
-            x_lr_up_batch.append(unpatchify(v_lr_up.unsqueeze(0), (H_fr_sp, W_fr_sp), p))
-
-            mask_fr_i  = (doc_ids_fr[0] == i)
-            xt_fr_i    = xt_fr[0, mask_fr_i]                    # (N_fr_i, 16)
-            xt_fr_sp_batch.append(unpatchify(xt_fr_i.unsqueeze(0), (H_fr_sp, W_fr_sp), p))
-
-            x1_fr_i = x1_fullres[0, mask_fr_i]
-            x0_fr_i = x0_fr[0, mask_fr_i]
-            ut_fr_list.append(x1_fr_i - x0_fr_i)               # (N_fr_i, 16)
-
-        # Single batched ResNet forward over all images.
-        v_fr_sp = model.upsampler(
-            torch.cat(x_lr_up_batch,  dim=0),                   # (n_pack, C_in, H_fr_sp, W_fr_sp)
-            torch.cat(xt_fr_sp_batch, dim=0),                   # (n_pack, C_in, H_fr_sp, W_fr_sp)
-        )                                                        # (n_pack, C_in, H_fr_sp, W_fr_sp)
-
-        v_fr = patchify(v_fr_sp, p)
-
-        ut_fr = torch.stack(ut_fr_list)                         # (n_pack, N_fr, 16)
-        loss  = (v_fr - ut_fr).pow(2).mean()
-
-        # Shape (1,) to match what training_losses expects from .mean().
-        return {'loss': loss.unsqueeze(0)}
-
     def training_losses(self, model, x1, model_kwargs=None):
         """Loss for training the score model.
         Args:
@@ -370,14 +256,13 @@ class Transport:
         if model_kwargs is None:
             model_kwargs = {}
 
-        doc_ids    = model_kwargs.get('doc_ids', None)
-        x1_fullres = model_kwargs.get('x1_fullres', None)
+        doc_ids = model_kwargs.get('doc_ids', None)
 
-        # Loss C is fully self-contained (its own sampling, no shared forward pass).
-        if self.multires_loss == 'C' and x1_fullres is not None:
-            terms = self._loss_c(model, x1, x1_fullres, model_kwargs)
-            terms['pred'] = None
-            return terms
+        # Upsampler path: the dataset has already noised both resolutions and
+        # supplied the full-res velocity target, so this collapses to a plain
+        # velocity loss at full resolution.
+        if 'feature_fullres' in model_kwargs:
+            return self._loss_upsampler(model, x1, model_kwargs)
 
         # Run the appropriate forward pass.
         t_expanded = sigma_t = None
@@ -393,14 +278,39 @@ class Transport:
         assert model_output.size() == (B, *xt.size()[1:-1], C)
 
         terms = {'pred': model_output}
-
-        if self.multires_loss == 'B' and x1_fullres is not None and doc_ids is None:
-            terms.update(self._loss_b(x1_fullres, xt, t, model_output, model_kwargs))
-        else:
-            terms.update(self._loss_a(x1, x0, xt, ut, t, model_output,
-                                      doc_ids, t_expanded, sigma_t, model_kwargs))
+        terms.update(self._loss_a(x1, x0, xt, ut, t, model_output,
+                                  doc_ids, t_expanded, sigma_t, model_kwargs))
 
         return terms
+
+    def _loss_upsampler(self, model, xt_lr, model_kwargs):
+        """Upsampler velocity loss (merged Loss C).
+
+        The dataset noised both resolutions from one consistent noise family and
+        shares a single timestep per image, so here we only forward the model
+        and compare its dense full-res prediction to the full-res velocity
+        target ut_fr = x1_fr - x0_fr.
+
+        x1 (the positional arg) is the packed low-res noisy input xt_lr.
+        """
+        t = model_kwargs['t']                       # (1, n_pack)
+        ut_fr = model_kwargs['ut_fullres']          # (n_pack, N_fr, 16)
+        mask_fr = model_kwargs['mask_fullres']      # (n_pack, N_fr)
+
+        # Map dataset fields to the model's forward signature and strip the
+        # loss-only / transport-only keys.
+        fwd = {k: v for k, v in model_kwargs.items()
+               if k not in ('ut_fullres', 'n_pack', 't', 'feature_fullres')}
+        fwd['x_fullres'] = model_kwargs['feature_fullres']
+
+        v_fr = model(xt_lr, t, **fwd)               # (n_pack, N_fr, 16)
+
+        mask = mask_fr[..., None].to(v_fr.dtype)
+        sq_err = ((v_fr - ut_fr) * mask) ** 2
+        # Per-image mean over valid tokens, then mean over images.
+        denom = mask.sum(dim=(1, 2)).clamp(min=1)
+        per_image = sq_err.sum(dim=(1, 2)) / denom  # (n_pack,)
+        return {'loss': per_image.mean().unsqueeze(0), 'pred': v_fr}
     
 
     def get_drift(

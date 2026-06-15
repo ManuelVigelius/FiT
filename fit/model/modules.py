@@ -142,55 +142,6 @@ class SizeEmbedder(nn.Module):
 
 
 
-class ResBlock(nn.Module):
-    def __init__(self, channels: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            nn.GroupNorm(8, channels),
-            nn.SiLU(),
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            nn.GroupNorm(8, channels),
-        )
-        self.act = nn.SiLU()
-
-    def forward(self, x):
-        return self.act(x + self.net(x))
-
-
-class ResNetUpsampler(nn.Module):
-    """
-    Lightweight convolutional residual network for Loss C.
-
-    Takes the concatenation of:
-      - upsampled low-res transformer output  (B, C_vae, H_fr_sp, W_fr_sp)
-      - full-res noisy input xt_fr            (B, C_vae, H_fr_sp, W_fr_sp)
-    and predicts the full-res velocity field  (B, C_vae, H_fr_sp, W_fr_sp).
-
-    Operates in the *latent spatial* domain (after unpatchify), so spatial dims
-    are H_grid * patch_size (e.g. 32x32 for a 16x16 grid with patch_size=2).
-    The output_proj is zero-initialized in FiT.initialize_weights() so the
-    upsampler starts as a no-op when loading from a pretrained checkpoint.
-    """
-    def __init__(self, in_channels: int = 8, hidden_channels: int = 128,
-                 out_channels: int = 4, num_blocks: int = 3):
-        super().__init__()
-        self.input_proj  = nn.Conv2d(in_channels, hidden_channels, 3, padding=1)
-        self.blocks      = nn.Sequential(*[ResBlock(hidden_channels) for _ in range(num_blocks)])
-        self.output_proj = nn.Conv2d(hidden_channels, out_channels, 1)
-
-    def forward(self, x_lr_up: torch.Tensor, xt_fr: torch.Tensor) -> torch.Tensor:
-        """
-        x_lr_up : (B, C_vae, H_sp, W_sp)  — upsampled low-res latent
-        xt_fr   : (B, C_vae, H_sp, W_sp)  — full-res noisy observation
-        returns : (B, C_vae, H_sp, W_sp)  — predicted full-res velocity
-        """
-        x = torch.cat([x_lr_up, xt_fr], dim=1)
-        x = self.input_proj(x)
-        x = self.blocks(x)
-        return self.output_proj(x)
-
-
 #################################################################################
 #                                  Attention                                    #
 #################################################################################

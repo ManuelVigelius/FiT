@@ -7,7 +7,6 @@ diffusion:
     sample_eps: null
     train_eps: null
     snr_type: lognorm
-    multires_loss: 'C'   # FiT at low-res → ResNet upsample → full-res velocity loss
   sampler:
     mode: ODE
     sde:

@@ -120,8 +120,8 @@ def parse_args():
         help=(
             "Comma-separated list of layer name substrings to keep trainable while "
             "freezing everything else (warmup phase). "
-            "Examples: --freeze_new_layers size_embedder  (Loss A warmup) "
-            "          --freeze_new_layers size_embedder,upsampler  (Loss C warmup)"
+            "Examples: --freeze_new_layers size_embedder  (low-res warmup) "
+            "          --freeze_new_layers size_embedder,fr_embedder  (upsampler warmup)"
         ),
     )
     parser.add_argument(
@@ -379,7 +379,7 @@ def main():
     if args.freeze_new_layers is not None:
         raw = args.freeze_new_layers.strip()
         if not raw or raw == 'default':
-            new_layer_names = ['size_embedder', 'upsampler']
+            new_layer_names = ['size_embedder', 'fr_embedder']
         else:
             new_layer_names = [s.strip() for s in raw.split(',') if s.strip()]
         unwrapped = accelerator.unwrap_model(model)
@@ -562,11 +562,13 @@ def main():
                 model_kwargs = dict(y=y, grid=grid.long(), mask=mask, size=size,
                                     doc_ids=doc_ids, n_pack=n_pack, block_mask=block_mask)
                 if 'feature_fullres' in batch:
-                    model_kwargs['x1_fullres']   = batch['feature_fullres'].to(device=device)
-                    model_kwargs['mask_fullres'] = batch['mask_fullres'].to(device=device)
-                    model_kwargs['size_fullres'] = batch['size_fullres'].to(device=device)
-                    if 'doc_ids_fr' in batch:
-                        model_kwargs['doc_ids_fr'] = batch['doc_ids_fr'].to(device=device)
+                    # Dense full-res fields for the in-model bicubic upsampler.
+                    model_kwargs['feature_fullres'] = batch['feature_fullres'].to(device=device)
+                    model_kwargs['ut_fullres']      = batch['ut_fullres'].to(device=device)
+                    model_kwargs['grid_fullres']    = batch['grid_fullres'].long().to(device=device)
+                    model_kwargs['mask_fullres']    = batch['mask_fullres'].to(device=device)
+                    model_kwargs['size_fullres']    = batch['size_fullres'].to(device=device)
+                    model_kwargs['t']               = batch['t'].to(device=device)
                 with torch.cuda.nvtx.range("forward") if _profiling_active else contextlib.nullcontext():
                     # forward model and compute loss
                     with accelerator.autocast():

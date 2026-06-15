@@ -7,7 +7,6 @@ diffusion:
     sample_eps: null
     train_eps: null
     snr_type: lognorm
-    multires_loss: 'A'   # velocity loss at low-res grid
   sampler:
     mode: ODE
     sde:

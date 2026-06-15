@@ -7,7 +7,6 @@ diffusion:
     sample_eps: null
     train_eps: null
     snr_type: lognorm
-    multires_loss: 'C'   # FiT at low-res → ResNet upsample → full-res velocity loss
   sampler:
     mode: ODE
     sde:
@@ -46,7 +45,7 @@ diffusion:
       adaln_type: lora
       adaln_lora_dim: 288
       use_size_cond: true
-      use_upsampler: true      # ResNetUpsampler for Loss C
+      use_upsampler: true      # split FiT blocks + in-model bicubic upsampler
       pretrain_ckpt: checkpoints/fitv2_xl.safetensors
 
 data:
@@ -57,7 +56,7 @@ data:
       target_len: 256
       random: 'crop'
       resize_range: [1, 16]
-      return_fullres: true     # required for Loss C
+      return_fullres: true     # required for the upsampler velocity loss
       packed:
         enabled: true
         max_tokens: 8192

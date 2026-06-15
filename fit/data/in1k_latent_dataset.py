@@ -8,12 +8,25 @@ from functools import partial
 from torch.utils.data import DataLoader, Dataset, BatchSampler
 from safetensors.torch import load_file
 from fit.scheduler.transport.utils import spatial_resize
+from fit.noise_field_sampler.noise_field_generator import sample_noise_fields_2d
 
+
+
+def _sample_t(snr_type: str, t0: float, t1: float) -> float:
+    """Sample a single timestep in [t0, t1], matching the transport sampler."""
+    if snr_type == 'uniform':
+        return float(torch.rand(()) * (t1 - t0) + t0)
+    elif snr_type == 'lognorm':
+        u = torch.normal(mean=0.0, std=1.0, size=())
+        return float(torch.sigmoid(u) * (t1 - t0) + t0)
+    else:
+        raise ValueError(f"Unknown snr type: {snr_type}")
 
 
 class IN1kLatentDataset(Dataset):
     def __init__(self, root_dir, target_len=256, random='random',
-                 resize_range=None, return_fullres=False):
+                 resize_range=None, return_fullres=False,
+                 snr_type='lognorm', train_eps=None, sample_eps=None):
         super().__init__()
         self.RandomHorizontalFlipProb = 0.5
         self.root_dir = root_dir
@@ -21,6 +34,11 @@ class IN1kLatentDataset(Dataset):
         self.random = random
         self.resize_range = resize_range      # (min_grid, max_grid) or None
         self.return_fullres = return_fullres  # if True, also return full-res feature
+        # Timestep sampling (only used when return_fullres builds the noisy
+        # upsampler inputs). For ICPlan/velocity with null eps this is [0, 1].
+        self.snr_type = snr_type
+        self.t0 = 0.0 if train_eps is None else float(train_eps)
+        self.t1 = 1.0
         self.files = []
         dir_1 = osp.join(root_dir, f'from_16_to_{target_len}')
         dir_2 = osp.join(root_dir, f'greater_than_{target_len}_resize')
@@ -107,16 +125,61 @@ class IN1kLatentDataset(Dataset):
         result = dict(feature=feature, grid=grid, mask=mask, label=label, size=size)
 
         if self.return_fullres:
-            seq_fr = int(data['grid'].shape[-1])
-            feat_fr = torch.zeros((self.target_len, 16), dtype=dtype)
-            mask_fr = torch.zeros((self.target_len,), dtype=torch.uint8)
-            feat_fr[:seq_fr] = feat_hw_fullres.reshape(seq_fr, 16)
-            mask_fr[:seq_fr] = 1
+            # Build the noisy upsampler inputs directly here so the transport
+            # loss reduces to a plain velocity loss. The low-res and full-res
+            # noise come from one cross-resolution-consistent family, and a
+            # single timestep t is shared between the two resolutions of this
+            # image.
             H_fr = int(data['size'][0])
             W_fr = int(data['size'][1])
+            seq_fr = H_fr * W_fr
+
+            # Square-only for now (sample_noise_fields_2d uses a single size k).
+            assert H_g == W_g, f"low-res latent must be square, got {H_g}x{W_g}"
+            assert H_fr == W_fr, f"full-res latent must be square, got {H_fr}x{W_fr}"
+
+            x1_lr = feat_hw.reshape(seq_len, 16).to(torch.float32)          # (seq_len, 16)
+            x1_fr = feat_hw_fullres.reshape(seq_fr, 16).to(torch.float32)   # (seq_fr, 16)
+
+            # Consistent noise at both resolutions: fields are (1, 16, k, k).
+            nf_lr, nf_fr = sample_noise_fields_2d([H_g, H_fr], d=16, b=1)
+            x0_lr = nf_lr[0].permute(1, 2, 0).reshape(seq_len, 16)          # (seq_len, 16)
+            x0_fr = nf_fr[0].permute(1, 2, 0).reshape(seq_fr, 16)          # (seq_fr, 16)
+
+            t = _sample_t(self.snr_type, self.t0, self.t1)
+
+            # ICPlan interpolation: xt = t * x1 + (1 - t) * x0.
+            xt_lr = (t * x1_lr + (1.0 - t) * x0_lr).to(dtype)
+            xt_fr = (t * x1_fr + (1.0 - t) * x0_fr).to(dtype)
+
+            # Overwrite the low-res feature with the noised low-res input.
+            feature[:seq_len] = xt_lr
+
+            # Full-res velocity target ut = x1 - x0 (ICPlan d_alpha=1, d_sigma=-1).
+            ut_fr = (x1_fr - x0_fr).to(dtype)
+
+            # Full-res tensors (dense per image; the common full-res size lets
+            # the collate stack them into a dense batch).
+            feat_fr = torch.zeros((self.target_len, 16), dtype=dtype)
+            ut_fr_pad = torch.zeros((self.target_len, 16), dtype=dtype)
+            grid_fr = torch.zeros((2, self.target_len), dtype=dtype)
+            mask_fr = torch.zeros((self.target_len,), dtype=torch.uint8)
+            feat_fr[:seq_fr]   = xt_fr
+            ut_fr_pad[:seq_fr] = ut_fr
+            mask_fr[:seq_fr]   = 1
+
+            hs_fr = torch.arange(H_fr, dtype=dtype)
+            ws_fr = torch.arange(W_fr, dtype=dtype)
+            gh_fr, gw_fr = torch.meshgrid(hs_fr, ws_fr, indexing='ij')
+            grid_fr[:, :seq_fr] = torch.stack([gw_fr.reshape(-1), gh_fr.reshape(-1)])
+
+            result['feature']         = feature
             result['feature_fullres'] = feat_fr
+            result['ut_fullres']      = ut_fr_pad
+            result['grid_fullres']    = grid_fr
             result['mask_fullres']    = mask_fr
             result['size_fullres']    = torch.tensor([[H_fr, W_fr]], dtype=torch.int32)
+            result['t']               = torch.tensor(t, dtype=torch.float32)
 
         return result
         
@@ -253,28 +316,34 @@ def packed_collate_fn(samples, pad_to_multiple: int = 128):
     )
 
     # Propagate full-res fields when the dataset was built with return_fullres=True.
+    # All images in a pack share one full-res size, so the full-res side is
+    # collated as a *dense* (n_pack, N_fr, ...) batch (one row per image) rather
+    # than packed. The low-res side stays packed (variable per-image sizes).
     if 'feature_fullres' in samples[0]:
-        raw_len_fr = sum(int(s['mask_fullres'].sum()) for s in samples)
-        N_total_fr = math.ceil(raw_len_fr / pad_to_multiple) * pad_to_multiple
+        seq_fr = int(samples[0]['mask_fullres'].sum())   # common across the pack
+        assert all(int(s['mask_fullres'].sum()) == seq_fr for s in samples), \
+            "all packed images must share the same full-res size"
 
-        feat_fr_batch = torch.zeros(1, N_total_fr, 16, dtype=dtype_feat)
-        mask_fr_batch = torch.zeros(1, N_total_fr, dtype=torch.uint8)
-        doc_fr_batch  = torch.full((1, N_total_fr), -1, dtype=torch.int32)
+        feat_fr_batch = torch.zeros(n_pack, seq_fr, 16, dtype=dtype_feat)
+        ut_fr_batch   = torch.zeros(n_pack, seq_fr, 16, dtype=dtype_feat)
+        grid_fr_batch = torch.zeros(n_pack, 2, seq_fr, dtype=dtype_grid)
+        mask_fr_batch = torch.ones(n_pack, seq_fr, dtype=torch.uint8)
         size_fr_batch = torch.zeros(1, n_pack, 2, dtype=torch.int32)
+        t_batch       = torch.zeros(1, n_pack, dtype=torch.float32)
 
-        offset_fr = 0
         for img_idx, s in enumerate(samples):
-            slen_fr = int(s['mask_fullres'].sum())
-            feat_fr_batch[0, offset_fr:offset_fr + slen_fr] = s['feature_fullres'][:slen_fr]
-            mask_fr_batch[0, offset_fr:offset_fr + slen_fr] = 1
-            doc_fr_batch[0, offset_fr:offset_fr + slen_fr]  = img_idx
-            size_fr_batch[0, img_idx]                        = s['size_fullres'].squeeze(0)
-            offset_fr += slen_fr
+            feat_fr_batch[img_idx] = s['feature_fullres'][:seq_fr]
+            ut_fr_batch[img_idx]   = s['ut_fullres'][:seq_fr]
+            grid_fr_batch[img_idx] = s['grid_fullres'][:, :seq_fr]
+            size_fr_batch[0, img_idx] = s['size_fullres'].squeeze(0)
+            t_batch[0, img_idx]       = s['t']
 
-        result['feature_fullres'] = feat_fr_batch  # (1, N_total_fr, 16)
-        result['mask_fullres']    = mask_fr_batch  # (1, N_total_fr)
-        result['doc_ids_fr']      = doc_fr_batch   # (1, N_total_fr)
+        result['feature_fullres'] = feat_fr_batch  # (n_pack, N_fr, 16)
+        result['ut_fullres']      = ut_fr_batch    # (n_pack, N_fr, 16)
+        result['grid_fullres']    = grid_fr_batch  # (n_pack, 2, N_fr)
+        result['mask_fullres']    = mask_fr_batch  # (n_pack, N_fr)
         result['size_fullres']    = size_fr_batch  # (1, n_pack, 2)
+        result['t']               = t_batch        # (1, n_pack)
 
     return result
 
@@ -314,6 +383,9 @@ class INLatentLoader():
             self.train_config.random,
             resize_range=getattr(self.train_config, 'resize_range', None),
             return_fullres=getattr(self.train_config, 'return_fullres', False),
+            snr_type=getattr(self.train_config, 'snr_type', 'lognorm'),
+            train_eps=getattr(self.train_config, 'train_eps', None),
+            sample_eps=getattr(self.train_config, 'sample_eps', None),
         )
         
         

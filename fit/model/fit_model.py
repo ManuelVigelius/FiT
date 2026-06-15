@@ -4,7 +4,7 @@ from typing import Optional
 
 from fit.model.modules import (
     PatchEmbedder, TimestepEmbedder, LabelEmbedder, SizeEmbedder,
-    ResNetUpsampler, FiTBlock, FinalLayer
+    FiTBlock, FinalLayer
 )
 from fit.model.utils import get_parameter_dtype
 from fit.utils.eval_utils import init_from_ckpt
@@ -83,8 +83,21 @@ class FiT(nn.Module):
         if use_size_cond:
             self.size_embedder = SizeEmbedder(hidden_size)
         self.use_upsampler = use_upsampler
+        # Number of trailing blocks that operate at full resolution. The first
+        # (depth - upsampler_split) blocks run on the low-res latents; after
+        # them the latents are bicubically upsampled to full resolution,
+        # enriched with the projected full-res noisy image, and the remaining
+        # `upsampler_split` blocks run at full resolution.
+        self.upsampler_split = 4
         if use_upsampler:
-            self.upsampler = ResNetUpsampler()
+            assert depth > self.upsampler_split, \
+                "depth must exceed upsampler_split for the upsampler path"
+            # Projects the patchified full-res noisy image into the inner
+            # dimension. Zero-initialized in initialize_weights() so the
+            # full-res enrichment starts as a no-op when fine-tuning.
+            self.fr_embedder = PatchEmbedder(
+                in_channels * patch_size**2, hidden_size, bias=True
+            )
 
 
         self.rel_pos_embed = VisionRotaryEmbedding(
@@ -171,13 +184,45 @@ class FiT(nn.Module):
             nn.init.constant_(self.size_embedder.mlp[2].weight, 0)
             nn.init.constant_(self.size_embedder.mlp[2].bias, 0)
 
-        # Zero-init upsampler output projection so it starts as a no-op.
+        # Zero-init the full-res embedder so the full-res enrichment starts as
+        # a no-op (the upsampled low-res latents pass through unchanged).
+        # Must run after init_from_ckpt so checkpoint weights don't overwrite.
         if self.use_upsampler:
-            nn.init.constant_(self.upsampler.output_proj.weight, 0)
-            nn.init.constant_(self.upsampler.output_proj.bias, 0)
+            nn.init.constant_(self.fr_embedder.proj.weight, 0)
+            nn.init.constant_(self.fr_embedder.proj.bias, 0)
 
 
-    def forward(self, x, t, y, grid, mask, size=None, doc_ids=None, block_mask=None):
+    def _rope_freqs(self, grid, size):
+        """Compute RoPE cos/sin frequencies for a token grid.
+
+        Returns (freqs_cos, freqs_sin), each (B, 1, N, head_dim).
+        """
+        if self.online_rope:
+            # online_get_2d_rope_from_grid expects size (B, 1, 2).
+            # In packed mode size is (B, max_n_pack, 2); use the per-batch max
+            # so the RoPE scale covers the largest image in each pack.
+            if size is not None and size.dim() == 3 and size.shape[1] > 1:
+                rope_size = size.max(dim=1, keepdim=True).values  # (B, 1, 2)
+            else:
+                rope_size = size
+            freqs_cos, freqs_sin = self.rel_pos_embed.online_get_2d_rope_from_grid(grid, rope_size)
+        else:
+            freqs_cos, freqs_sin = self.rel_pos_embed.get_cached_2d_rope_from_grid(grid)
+        return freqs_cos.unsqueeze(1), freqs_sin.unsqueeze(1)
+
+    def _run_blocks(self, blocks, x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask):
+        if not self.use_checkpoint:
+            for block in blocks:
+                x = block(x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask)
+        else:
+            for block in blocks:
+                x = torch.utils.checkpoint.checkpoint(
+                    self.ckpt_wrapper(block), x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask
+                )
+        return x
+
+    def forward(self, x, t, y, grid, mask, size=None, doc_ids=None, block_mask=None,
+                x_fullres=None, grid_fullres=None, mask_fullres=None, size_fullres=None):
         """
         Forward pass of FiT.
 
@@ -201,13 +246,33 @@ class FiT(nn.Module):
             doc_ids: (B, N_total)  — image index within sequence, -1 for padding
             block_mask: precomputed FlexAttention BlockMask (built outside the compiled region)
 
-        return: same shape as x.
+        Upsampler mode (use_upsampler=True):
+            The low-res inputs are *packed* (variable per-image sizes) and feed
+            the first (depth - upsampler_split) blocks exactly like the packed
+            path above (B=1, doc_ids + block_mask). After those blocks the
+            per-image latents are bicubically upsampled to the common full-res
+            grid and stacked into a *dense* (n_pack, N_fr, D) batch; the last
+            upsampler_split blocks then run densely at full resolution.
+            x:            (1, N_total_lr, p**2*C_in) — packed low-res noisy
+            doc_ids:      (1, N_total_lr)
+            x_fullres:    (n_pack, N_fr, p**2*C_in)  — dense full-res noisy
+            grid_fullres: (n_pack, 2, N_fr)          — all images share one size
+            mask_fullres: (n_pack, N_fr)
+            size_fullres: (1, n_pack, 2)
+            Output is dense with shape (n_pack, N_fr, p**2*C_out).
+
+        return: (B, N, p**2*C_out), or (n_pack, N_fr, p**2*C_out) in upsampler mode.
         """
+        upsample = self.use_upsampler and x_fullres is not None
+        if upsample:
+            assert doc_ids is not None, "upsampler path requires packed low-res inputs"
+            assert x.shape[0] == 1, "upsampler path expects B=1 packed low-res batch"
         B = x.shape[0]
         D = self.hidden_size
 
         x = self.x_embedder(x)                          # (B, N, D)
 
+        c_pack = None  # (B, max_n_pack, D) per-image conditioning, set in packed path
         if doc_ids is not None:
             # ---- Packed path ------------------------------------------------
             # t and y are (B, max_n_pack); embed each, then expand to per-token.
@@ -256,31 +321,60 @@ class FiT(nn.Module):
                 global_adaln = 0.0
 
         # get RoPE frequencies in advance, then calculate attention.
-        if self.online_rope:
-            # online_get_2d_rope_from_grid expects size (B, 1, 2).
-            # In packed mode size is (B, max_n_pack, 2); use the per-batch max
-            # so the RoPE scale covers the largest image in each pack.
-            if size is not None and size.dim() == 3 and size.shape[1] > 1:
-                rope_size = size.max(dim=1, keepdim=True).values  # (B, 1, 2)
-            else:
-                rope_size = size
-            freqs_cos, freqs_sin = self.rel_pos_embed.online_get_2d_rope_from_grid(grid, rope_size)
-            freqs_cos, freqs_sin = freqs_cos.unsqueeze(1), freqs_sin.unsqueeze(1)
-        else:
-            freqs_cos, freqs_sin = self.rel_pos_embed.get_cached_2d_rope_from_grid(grid)
-            freqs_cos, freqs_sin = freqs_cos.unsqueeze(1), freqs_sin.unsqueeze(1)
+        freqs_cos, freqs_sin = self._rope_freqs(grid, size)
 
-        if not self.use_checkpoint:
-            for block in self.blocks:
-                x = block(x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask)
-        else:
-            for block in self.blocks:
-                x = torch.utils.checkpoint.checkpoint(
-                    self.ckpt_wrapper(block), x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask
-                )
+        if not upsample:
+            x = self._run_blocks(self.blocks, x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask)
+            x = self.final_layer(x, c)                  # (B, N, p**2 * C_out)
+            x = x * mask[..., None]                     # zero out padding tokens
+            return x
 
-        x = self.final_layer(x, c)                      # (B, N, p**2 * C_out)
-        x = x * mask[..., None]                         # zero out padding tokens
+        # ---- Upsampler path ------------------------------------------------
+        # 1. Run the first (depth - upsampler_split) blocks on the *packed*
+        #    low-res latents (variable per-image sizes).
+        split = self.depth - self.upsampler_split
+        x = self._run_blocks(
+            self.blocks[:split], x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask
+        )
+
+        # 2. Per image: bicubically upsample its low-res latents to the common
+        #    full-res grid, then stack into a dense (n_pack, N_fr, D) batch.
+        n_pack = c_pack.shape[1]
+        H_fr = int(size_fullres[0, 0, 0]); W_fr = int(size_fullres[0, 0, 1])
+        N_fr = H_fr * W_fr
+        doc_ids_lr = doc_ids[0]                                 # (N_total_lr,)
+        x_fr = x.new_zeros(n_pack, N_fr, D)
+        for i in range(n_pack):
+            H_lr = int(size[0, i, 0]); W_lr = int(size[0, i, 1])
+            tok_i = x[0, doc_ids_lr == i]                       # (H_lr*W_lr, D)
+            sp_i = tok_i.transpose(0, 1).reshape(1, D, H_lr, W_lr)
+            sp_i = nn.functional.interpolate(
+                sp_i.float(), size=(H_fr, W_fr), mode='bicubic', align_corners=True
+            ).to(x.dtype)
+            x_fr[i] = sp_i.reshape(D, N_fr).transpose(0, 1)     # (N_fr, D)
+
+        # 3. Project the full-res noisy image and add it to the upsampled latents.
+        x = x_fr + self.fr_embedder(x_fullres)                  # (n_pack, N_fr, D)
+
+        # 4. Dense conditioning for the full-res blocks: one vector per image.
+        c_fr = c_pack[0]                                         # (n_pack, D)
+        if self.global_adaLN_modulation is not None:
+            global_adaln_fr = self.global_adaLN_modulation(c_fr)  # (n_pack, 6*D)
+        else:
+            global_adaln_fr = 0.0
+
+        # 5. Run the last upsampler_split blocks densely at full resolution.
+        #    The dense FR batch has n_pack rows (all the same size), so RoPE
+        #    needs a per-row size of shape (n_pack, 1, 2).
+        rope_size_fr = size_fullres[0].unsqueeze(1)             # (n_pack, 1, 2)
+        freqs_cos_fr, freqs_sin_fr = self._rope_freqs(grid_fullres, rope_size_fr)
+        x = self._run_blocks(
+            self.blocks[split:], x, c_fr, mask_fullres, freqs_cos_fr, freqs_sin_fr,
+            global_adaln_fr, None,
+        )
+
+        x = self.final_layer(x, c_fr)               # (n_pack, N_fr, p**2 * C_out)
+        x = x * mask_fullres[..., None]             # zero out padding tokens
         return x
     
     def ckpt_wrapper(self, module):
