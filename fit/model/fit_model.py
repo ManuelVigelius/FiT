@@ -337,21 +337,59 @@ class FiT(nn.Module):
             self.blocks[:split], x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask
         )
 
-        # 2. Per image: bicubically upsample its low-res latents to the common
-        #    full-res grid, then stack into a dense (n_pack, N_fr, D) batch.
+        # 2. Bicubically upsample every image's low-res latents to the common
+        #    full-res grid, in a single batched grid_sample call.
+        #    Each packed image has a variable (H_lr, W_lr); we scatter them into
+        #    a dense (n_pack, D, H_max, W_max) tensor (top-left aligned, with the
+        #    valid border replicated into the padding so bicubic overshoot at the
+        #    far edge never reads zeros) and sample each with its own grid that
+        #    maps the full-res output coordinates back into that image's valid
+        #    region. The normalized-coordinate map reproduces
+        #    interpolate(mode='bicubic', align_corners=True).
         n_pack = c_pack.shape[1]
         H_fr = int(size_fullres[0, 0, 0]); W_fr = int(size_fullres[0, 0, 1])
         N_fr = H_fr * W_fr
         doc_ids_lr = doc_ids[0]                                 # (N_total_lr,)
-        x_fr = x.new_zeros(n_pack, N_fr, D)
+        sizes_lr = size[0, :n_pack].to(torch.long)              # (n_pack, 2) -> (H_lr, W_lr)
+        H_max = int(sizes_lr[:, 0].max()); W_max = int(sizes_lr[:, 1].max())
+
+        # Scatter packed tokens into a dense (n_pack, D, H_max, W_max) grid.
+        sp = x.new_zeros(n_pack, D, H_max, W_max)
         for i in range(n_pack):
-            H_lr = int(size[0, i, 0]); W_lr = int(size[0, i, 1])
+            H_lr = int(sizes_lr[i, 0]); W_lr = int(sizes_lr[i, 1])
             tok_i = x[0, doc_ids_lr == i]                       # (H_lr*W_lr, D)
-            sp_i = tok_i.transpose(0, 1).reshape(1, D, H_lr, W_lr)
-            sp_i = nn.functional.interpolate(
-                sp_i.float(), size=(H_fr, W_fr), mode='bicubic', align_corners=True
-            ).to(x.dtype)
-            x_fr[i] = sp_i.reshape(D, N_fr).transpose(0, 1)     # (N_fr, D)
+            grid_i = tok_i.transpose(0, 1).reshape(D, H_lr, W_lr)
+            if H_lr < H_max or W_lr < W_max:
+                # replicate the valid border into the padding region
+                grid_i = nn.functional.pad(
+                    grid_i.unsqueeze(0), (0, W_max - W_lr, 0, H_max - H_lr),
+                    mode='replicate',
+                ).squeeze(0)
+            sp[i] = grid_i
+
+        # Per-image sampling grid: output pixel j -> input coord
+        # j * (size_lr - 1) / (size_fr - 1), normalized over the padded extent.
+        device = x.device
+        ys = torch.arange(H_fr, device=device, dtype=torch.float32)   # (H_fr,)
+        xs = torch.arange(W_fr, device=device, dtype=torch.float32)   # (W_fr,)
+        H_lr_f = sizes_lr[:, 0].to(torch.float32).clamp(min=1)        # (n_pack,)
+        W_lr_f = sizes_lr[:, 1].to(torch.float32).clamp(min=1)
+        # input coords in pixel space, per image
+        in_y = ys[None, :] * ((H_lr_f - 1).clamp(min=0) / max(H_fr - 1, 1))[:, None]  # (n_pack, H_fr)
+        in_x = xs[None, :] * ((W_lr_f - 1).clamp(min=0) / max(W_fr - 1, 1))[:, None]  # (n_pack, W_fr)
+        # normalize to [-1, 1] over the padded extent (align_corners=True)
+        gy = 2.0 * in_y / max(H_max - 1, 1) - 1.0                     # (n_pack, H_fr)
+        gx = 2.0 * in_x / max(W_max - 1, 1) - 1.0                     # (n_pack, W_fr)
+        samp_grid = torch.stack([
+            gx[:, None, :].expand(n_pack, H_fr, W_fr),
+            gy[:, :, None].expand(n_pack, H_fr, W_fr),
+        ], dim=-1)                                                   # (n_pack, H_fr, W_fr, 2)
+
+        sp_fr = nn.functional.grid_sample(
+            sp.float(), samp_grid, mode='bicubic',
+            padding_mode='border', align_corners=True,
+        ).to(x.dtype)                                                # (n_pack, D, H_fr, W_fr)
+        x_fr = sp_fr.reshape(n_pack, D, N_fr).transpose(1, 2)        # (n_pack, N_fr, D)
 
         # 3. Project the full-res noisy image and add it to the upsampled latents.
         x = x_fr + self.fr_embedder(x_fullres)                  # (n_pack, N_fr, D)

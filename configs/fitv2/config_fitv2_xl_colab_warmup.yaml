@@ -45,7 +45,7 @@ diffusion:
       adaln_type: lora
       adaln_lora_dim: 288
       use_size_cond: true
-      use_upsampler: true      # ResNetUpsampler for Loss C
+      use_upsampler: true      # split FiT blocks + in-model bicubic upsampler
       pretrain_ckpt: checkpoints/fitv2_xl.safetensors
 
 data:

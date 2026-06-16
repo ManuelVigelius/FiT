@@ -71,7 +71,7 @@ accelerate:
   gradient_accumulation_steps: 1
   mixed_precision: 'bf16'
   num_train_epochs:
-  max_train_steps: 200000
+  max_train_steps: 10000
   learning_rate: 1.0e-4
   learning_rate_base_batch_size: 256
   max_grad_norm: 1.0
@@ -86,6 +86,6 @@ accelerate:
   logger: wandb
   checkpointing_epochs: False
   checkpointing_steps: 4000
-  checkpointing_steps_list: [50000, 100000, 200000]
+  checkpointing_steps_list: [10000]
   checkpoints_total_limit: 2
   logging_steps: 100

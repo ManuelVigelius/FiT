@@ -1,10 +1,11 @@
 #!/bin/bash
 # Cluster training runner for FiT on visinf lab nodes.
-# Usage: bash tools/cluster_train.sh [A|B|C|WA|WC] [--reset-optimizer]
+# Usage: bash tools/cluster_train.sh [A|C|WA] [--reset-optimizer]
 #
-#   A / B / C         — full training for the respective loss variant
-#   WA                — warmup for Loss A (freeze everything except size_embedder)
-#   WC                — warmup for Loss C (freeze everything except size_embedder + upsampler)
+#   A                 — full training for the low-res velocity loss
+#   C                 — full training for the upsampler velocity loss (no warmup)
+#   WA                — warmup for Loss A (freeze everything except size_embedder),
+#                       then automatically continues into full A training
 #   --reset-optimizer — reset the optimizer state on start (use when transitioning warmup→full)
 #
 # Storage layout:
@@ -17,7 +18,7 @@
 
 set -e
 
-LOSS="${1:?Usage: cluster_train.sh [A|B|C|WA|WC] [--reset-optimizer]}"
+LOSS="${1:?Usage: cluster_train.sh [A|C|WA] [--reset-optimizer]}"
 RESET_OPTIMIZER=false
 if [ "${2}" = "--reset-optimizer" ]; then
   RESET_OPTIMIZER=true
@@ -46,12 +47,10 @@ echo "GPUs         : $GPUS_PER_NODE"
 
 IS_WARMUP=false
 case "${LOSS^^}" in
-  A)  CONFIG="$REPO_DIR/configs/fitv2/config_fitv2_xl_colab_a.yaml";       BASE_LOSS="a" ;;
-  B)  CONFIG="$REPO_DIR/configs/fitv2/config_fitv2_xl_colab_b.yaml";       BASE_LOSS="b" ;;
-  C)  CONFIG="$REPO_DIR/configs/fitv2/config_fitv2_xl_colab_c.yaml";       BASE_LOSS="c" ;;
+  A)  CONFIG="$REPO_DIR/configs/fitv2/config_fitv2_xl_colab_a.yaml";        BASE_LOSS="a" ;;
+  C)  CONFIG="$REPO_DIR/configs/fitv2/config_fitv2_xl_colab_c.yaml";        BASE_LOSS="c" ;;
   WA) CONFIG="$REPO_DIR/configs/fitv2/config_fitv2_xl_colab_warmup_a.yaml"; BASE_LOSS="a"; IS_WARMUP=true ;;
-  WC) CONFIG="$REPO_DIR/configs/fitv2/config_fitv2_xl_colab_warmup.yaml";   BASE_LOSS="c"; IS_WARMUP=true ;;
-  *)  echo "Unknown loss variant '${LOSS}'. Must be A, B, C, WA, or WC."; exit 1 ;;
+  *)  echo "Unknown loss variant '${LOSS}'. Must be A, C, or WA."; exit 1 ;;
 esac
 
 PROJECT="fitv2_xl_cluster_${BASE_LOSS}"
@@ -94,7 +93,6 @@ fi
 EXTRA_FLAGS=""
 case "${LOSS^^}" in
   WA) EXTRA_FLAGS="--freeze_new_layers size_embedder" ;;
-  WC) EXTRA_FLAGS="--freeze_new_layers size_embedder,upsampler" ;;
   *)  EXTRA_FLAGS="--use_ema --ema_decay 0.9995" ;;
 esac
 if [ "$RESET_OPTIMIZER" = true ]; then
