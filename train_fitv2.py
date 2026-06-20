@@ -301,6 +301,14 @@ def main():
     # (pattern_matcher.py:2291) present in PyTorch 2.10 nightlies where the joint
     # forward+backward graph partition pass produces a cycle the sort can't resolve.
     torch._inductor.config.joint_graph_constant_folding = False
+    # optimize_ddp=False disables DDPOptimizer's graph-splitting at bucket/graph-break
+    # boundaries. With the upsampler path (graph break around the eager bicubic
+    # upsample) one of the split subgraphs returns a SymInt (n_pack), which trips an
+    # AOTAutograd bug: "AttributeError: 'int' object has no attribute 'meta'". Disabling
+    # the splitter keeps each compiled region tensor-only. We already run with
+    # find_unused_parameters=True, so the bucketed compute/comm overlap it would provide
+    # is limited anyway.
+    torch._dynamo.config.optimize_ddp = False
     model = torch.compile(model, dynamic=True, mode="default")
     if args.use_ema:
         ema_model = torch.compile(ema_model, dynamic=True, mode="default")

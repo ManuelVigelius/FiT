@@ -83,20 +83,37 @@ class FiT(nn.Module):
         if use_size_cond:
             self.size_embedder = SizeEmbedder(hidden_size)
         self.use_upsampler = use_upsampler
-        # Number of trailing blocks that operate at full resolution. The first
-        # (depth - upsampler_split) blocks run on the low-res latents; after
-        # them the latents are bicubically upsampled to full resolution,
-        # enriched with the projected full-res noisy image, and the remaining
-        # `upsampler_split` blocks run at full resolution.
-        self.upsampler_split = 4
+        # Number of brand-new full-resolution blocks appended after the full
+        # pretrained stack. All `depth` pretrained blocks run packed at low
+        # resolution; their pre-head hidden states are projected by `up_proj`,
+        # bicubically upsampled to full resolution, mixed with the projected
+        # full-res noisy image, then refined by `upsampler_split` new blocks and
+        # a new prediction head. The pretrained stack is left fully intact so
+        # its input distribution never shifts.
+        self.upsampler_split = 2
         if use_upsampler:
-            assert depth > self.upsampler_split, \
-                "depth must exceed upsampler_split for the upsampler path"
+            # Linear applied to the pre-head hidden states before upscaling.
+            # Keeps its default xavier init so real signal from the pretrained
+            # stack reaches the new tail from the first step.
+            self.up_proj = nn.Linear(hidden_size, hidden_size, bias=True)
             # Projects the patchified full-res noisy image into the inner
-            # dimension. Zero-initialized in initialize_weights() so the
-            # full-res enrichment starts as a no-op when fine-tuning.
+            # dimension. Zero-initialized so the full-res enrichment starts as
+            # a no-op when fine-tuning.
             self.fr_embedder = PatchEmbedder(
                 in_channels * patch_size**2, hidden_size, bias=True
+            )
+            # Brand-new full-resolution refinement blocks (same config as the
+            # main stack) plus a new prediction head. None of these load from
+            # the pretrained checkpoint.
+            self.up_blocks = nn.ModuleList([FiTBlock(
+                hidden_size, num_heads, mlp_ratio=mlp_ratio, swiglu=use_swiglu, swiglu_large=use_swiglu_large,
+                rel_pos_embed=rel_pos_embed, add_rel_pe_to_v=add_rel_pe_to_v, norm_layer=norm_type,
+                q_norm=q_norm, k_norm=k_norm, qk_norm_weight=qk_norm_weight, qkv_bias=qkv_bias, ffn_bias=ffn_bias,
+                adaln_bias=adaln_bias, adaln_type=adaln_type, adaln_lora_dim=adaln_lora_dim
+            ) for _ in range(self.upsampler_split)])
+            self.up_final_layer = FinalLayer(
+                hidden_size, patch_size, self.out_channels,
+                norm_layer=norm_type, adaln_bias=adaln_bias, adaln_type=adaln_type
             )
 
 
@@ -146,8 +163,10 @@ class FiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.blocks:
+        # Zero-out adaLN modulation layers in DiT blocks (main stack + the new
+        # full-res upsampler blocks, which start as identity residual blocks):
+        upsampler_blocks = list(self.up_blocks) if self.use_upsampler else []
+        for block in list(self.blocks) + upsampler_blocks:
             if self.adaln_type in ['normal', 'lora']:
                 nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
@@ -184,12 +203,26 @@ class FiT(nn.Module):
             nn.init.constant_(self.size_embedder.mlp[2].weight, 0)
             nn.init.constant_(self.size_embedder.mlp[2].bias, 0)
 
-        # Zero-init the full-res embedder so the full-res enrichment starts as
-        # a no-op (the upsampled low-res latents pass through unchanged).
-        # Must run after init_from_ckpt so checkpoint weights don't overwrite.
+        # Upsampler new layers. up_proj keeps its xavier init (from _basic_init)
+        # so real signal from the pretrained stack flows into the new tail from
+        # step 1 — zeroing it too would leave the head with a permanently zero
+        # input and no gradient to the feeders. The full-res embedder is
+        # zero-init so the full-res noisy enrichment ramps in gradually as a
+        # no-op at first. The new prediction head is zero-init (DiT-style) so it
+        # starts from a stable zero-velocity baseline, and the 2 new blocks have
+        # their adaLN zeroed above (identity residual). None of these load from
+        # the pretrained checkpoint. Must run after init_from_ckpt.
         if self.use_upsampler:
             nn.init.constant_(self.fr_embedder.proj.weight, 0)
             nn.init.constant_(self.fr_embedder.proj.bias, 0)
+            if self.adaln_type == 'swiglu':
+                nn.init.constant_(self.up_final_layer.adaLN_modulation.fc2.weight, 0)
+                nn.init.constant_(self.up_final_layer.adaLN_modulation.fc2.bias, 0)
+            else:
+                nn.init.constant_(self.up_final_layer.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(self.up_final_layer.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(self.up_final_layer.linear.weight, 0)
+            nn.init.constant_(self.up_final_layer.linear.bias, 0)
 
 
     def _rope_freqs(self, grid, size):
@@ -248,11 +281,12 @@ class FiT(nn.Module):
 
         Upsampler mode (use_upsampler=True):
             The low-res inputs are *packed* (variable per-image sizes) and feed
-            the first (depth - upsampler_split) blocks exactly like the packed
-            path above (B=1, doc_ids + block_mask). After those blocks the
-            per-image latents are bicubically upsampled to the common full-res
-            grid and stacked into a *dense* (n_pack, N_fr, D) batch; the last
-            upsampler_split blocks then run densely at full resolution.
+            the *full* pretrained block stack exactly like the packed path above
+            (B=1, doc_ids + block_mask). The pre-head hidden states are then
+            projected (up_proj), bicubically upsampled to the common full-res
+            grid and stacked into a *dense* (n_pack, N_fr, D) batch, mixed with
+            the projected full-res noisy image, refined by `upsampler_split`
+            brand-new blocks, and read out by a new prediction head.
             x:            (1, N_total_lr, p**2*C_in) — packed low-res noisy
             doc_ids:      (1, N_total_lr)
             x_fullres:    (n_pack, N_fr, p**2*C_in)  — dense full-res noisy
@@ -330,23 +364,67 @@ class FiT(nn.Module):
             return x
 
         # ---- Upsampler path ------------------------------------------------
-        # 1. Run the first (depth - upsampler_split) blocks on the *packed*
-        #    low-res latents (variable per-image sizes).
-        split = self.depth - self.upsampler_split
+        # 1. Run the *full* pretrained block stack on the *packed* low-res
+        #    latents (variable per-image sizes). The stack is left intact so its
+        #    input distribution is identical to pretraining.
         x = self._run_blocks(
-            self.blocks[:split], x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask
+            self.blocks, x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask
         )
 
-        # 2. Bicubically upsample every image's low-res latents to the common
-        #    full-res grid, in a single batched grid_sample call.
-        #    Each packed image has a variable (H_lr, W_lr); we scatter them into
-        #    a dense (n_pack, D, H_max, W_max) tensor (top-left aligned, with the
-        #    valid border replicated into the padding so bicubic overshoot at the
-        #    far edge never reads zeros) and sample each with its own grid that
-        #    maps the full-res output coordinates back into that image's valid
-        #    region. The normalized-coordinate map reproduces
-        #    interpolate(mode='bicubic', align_corners=True).
+        # 2. Project the pre-head hidden states, then bicubically upsample every
+        #    image to the common full-res grid. The upsampling helper is
+        #    excluded from torch.compile (see _upsample_packed) because it relies
+        #    on data-dependent Python ints and a per-image loop that Dynamo
+        #    cannot trace under dynamic=True.
+        x = self.up_proj(x)                                     # (1, N_total_lr, D)
         n_pack = c_pack.shape[1]
+        x_fr = self._upsample_packed(x, doc_ids, size, size_fullres, n_pack, D)  # (n_pack, N_fr, D)
+
+        # 3. Project the full-res noisy image and add it to the upsampled latents.
+        x = x_fr + self.fr_embedder(x_fullres)                  # (n_pack, N_fr, D)
+
+        # 4. Dense conditioning for the full-res blocks: one vector per image.
+        c_fr = c_pack[0]                                         # (n_pack, D)
+        if self.global_adaLN_modulation is not None:
+            global_adaln_fr = self.global_adaLN_modulation(c_fr)  # (n_pack, 6*D)
+        else:
+            global_adaln_fr = 0.0
+
+        # 5. Run the brand-new full-resolution blocks densely. The dense FR batch
+        #    has n_pack rows (all the same size), so RoPE needs a per-row size of
+        #    shape (n_pack, 1, 2).
+        rope_size_fr = size_fullres[0].unsqueeze(1)             # (n_pack, 1, 2)
+        freqs_cos_fr, freqs_sin_fr = self._rope_freqs(grid_fullres, rope_size_fr)
+        x = self._run_blocks(
+            self.up_blocks, x, c_fr, mask_fullres, freqs_cos_fr, freqs_sin_fr,
+            global_adaln_fr, None,
+        )
+
+        x = self.up_final_layer(x, c_fr)            # (n_pack, N_fr, p**2 * C_out)
+        x = x * mask_fullres[..., None]             # zero out padding tokens
+        return x
+    
+    @torch.compiler.disable
+    def _upsample_packed(self, x, doc_ids, size, size_fullres, n_pack, D):
+        """Bicubically upsample each packed low-res image to the common full-res grid.
+
+        Excluded from torch.compile: it relies on data-dependent Python ints
+        (extracted via int(tensor)), boolean indexing with data-dependent
+        sizes, and a per-image Python loop — none of which Dynamo can trace
+        under dynamic=True (it raised during graph capture, dumping the whole
+        model FX graph). The work here is pure resampling with no learnable
+        params, so running it eagerly costs essentially nothing.
+
+        Each packed image has a variable (H_lr, W_lr); we scatter them into a
+        dense (n_pack, D, H_max, W_max) tensor (top-left aligned, with the valid
+        border replicated into the padding so bicubic overshoot at the far edge
+        never reads zeros) and sample each with its own grid that maps the
+        full-res output coordinates back into that image's valid region. The
+        normalized-coordinate map reproduces
+        interpolate(mode='bicubic', align_corners=True).
+
+        Returns x_fr: (n_pack, N_fr, D).
+        """
         H_fr = int(size_fullres[0, 0, 0]); W_fr = int(size_fullres[0, 0, 1])
         N_fr = H_fr * W_fr
         doc_ids_lr = doc_ids[0]                                 # (N_total_lr,)
@@ -389,32 +467,8 @@ class FiT(nn.Module):
             sp.float(), samp_grid, mode='bicubic',
             padding_mode='border', align_corners=True,
         ).to(x.dtype)                                                # (n_pack, D, H_fr, W_fr)
-        x_fr = sp_fr.reshape(n_pack, D, N_fr).transpose(1, 2)        # (n_pack, N_fr, D)
+        return sp_fr.reshape(n_pack, D, N_fr).transpose(1, 2)        # (n_pack, N_fr, D)
 
-        # 3. Project the full-res noisy image and add it to the upsampled latents.
-        x = x_fr + self.fr_embedder(x_fullres)                  # (n_pack, N_fr, D)
-
-        # 4. Dense conditioning for the full-res blocks: one vector per image.
-        c_fr = c_pack[0]                                         # (n_pack, D)
-        if self.global_adaLN_modulation is not None:
-            global_adaln_fr = self.global_adaLN_modulation(c_fr)  # (n_pack, 6*D)
-        else:
-            global_adaln_fr = 0.0
-
-        # 5. Run the last upsampler_split blocks densely at full resolution.
-        #    The dense FR batch has n_pack rows (all the same size), so RoPE
-        #    needs a per-row size of shape (n_pack, 1, 2).
-        rope_size_fr = size_fullres[0].unsqueeze(1)             # (n_pack, 1, 2)
-        freqs_cos_fr, freqs_sin_fr = self._rope_freqs(grid_fullres, rope_size_fr)
-        x = self._run_blocks(
-            self.blocks[split:], x, c_fr, mask_fullres, freqs_cos_fr, freqs_sin_fr,
-            global_adaln_fr, None,
-        )
-
-        x = self.final_layer(x, c_fr)               # (n_pack, N_fr, p**2 * C_out)
-        x = x * mask_fullres[..., None]             # zero out padding tokens
-        return x
-    
     def ckpt_wrapper(self, module):
         def ckpt_forward(*inputs):
             outputs = module(*inputs)
