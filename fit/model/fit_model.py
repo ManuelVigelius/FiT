@@ -93,8 +93,8 @@ class FiT(nn.Module):
         self.upsampler_split = 2
         if use_upsampler:
             # Linear applied to the pre-head hidden states before upscaling.
-            # Keeps its default xavier init so real signal from the pretrained
-            # stack reaches the new tail from the first step.
+            # Identity-initialized (see init_weights) so the pretrained hidden
+            # states pass through unchanged at the start of fine-tuning.
             self.up_proj = nn.Linear(hidden_size, hidden_size, bias=True)
             # Projects the patchified full-res noisy image into the inner
             # dimension. Zero-initialized so the full-res enrichment starts as
@@ -103,7 +103,10 @@ class FiT(nn.Module):
                 in_channels * patch_size**2, hidden_size, bias=True
             )
             # Brand-new full-resolution refinement blocks (same config as the
-            # main stack) plus a new prediction head. None of these load from
+            # main stack). The prediction head is shared with the low-res path
+            # (self.final_layer) so that, at native resolution with an identity
+            # up_proj and zero fr_embedder, the upsampler path reproduces the
+            # base model's output exactly. None of these load separately from
             # the pretrained checkpoint.
             self.up_blocks = nn.ModuleList([FiTBlock(
                 hidden_size, num_heads, mlp_ratio=mlp_ratio, swiglu=use_swiglu, swiglu_large=use_swiglu_large,
@@ -111,10 +114,6 @@ class FiT(nn.Module):
                 q_norm=q_norm, k_norm=k_norm, qk_norm_weight=qk_norm_weight, qkv_bias=qkv_bias, ffn_bias=ffn_bias,
                 adaln_bias=adaln_bias, adaln_type=adaln_type, adaln_lora_dim=adaln_lora_dim
             ) for _ in range(self.upsampler_split)])
-            self.up_final_layer = FinalLayer(
-                hidden_size, patch_size, self.out_channels,
-                norm_layer=norm_type, adaln_bias=adaln_bias, adaln_type=adaln_type
-            )
 
 
         self.rel_pos_embed = VisionRotaryEmbedding(
@@ -203,26 +202,19 @@ class FiT(nn.Module):
             nn.init.constant_(self.size_embedder.mlp[2].weight, 0)
             nn.init.constant_(self.size_embedder.mlp[2].bias, 0)
 
-        # Upsampler new layers. up_proj keeps its xavier init (from _basic_init)
-        # so real signal from the pretrained stack flows into the new tail from
-        # step 1 — zeroing it too would leave the head with a permanently zero
-        # input and no gradient to the feeders. The full-res embedder is
-        # zero-init so the full-res noisy enrichment ramps in gradually as a
-        # no-op at first. The new prediction head is zero-init (DiT-style) so it
-        # starts from a stable zero-velocity baseline, and the 2 new blocks have
-        # their adaLN zeroed above (identity residual). None of these load from
-        # the pretrained checkpoint. Must run after init_from_ckpt.
+        # Upsampler new layers. up_proj is identity-initialized so the
+        # pretrained pre-head hidden states pass through unchanged. The full-res
+        # embedder is zero-init so the full-res noisy enrichment ramps in
+        # gradually as a no-op at first, and the new blocks have their adaLN
+        # zeroed above (identity residual). Combined with the shared low-res
+        # prediction head (self.final_layer) and the no-op bicubic upsampling
+        # when low-res == full-res, the upsampler path reproduces the base
+        # model's output exactly at init. Must run after init_from_ckpt.
         if self.use_upsampler:
+            nn.init.eye_(self.up_proj.weight)
+            nn.init.constant_(self.up_proj.bias, 0)
             nn.init.constant_(self.fr_embedder.proj.weight, 0)
             nn.init.constant_(self.fr_embedder.proj.bias, 0)
-            if self.adaln_type == 'swiglu':
-                nn.init.constant_(self.up_final_layer.adaLN_modulation.fc2.weight, 0)
-                nn.init.constant_(self.up_final_layer.adaLN_modulation.fc2.bias, 0)
-            else:
-                nn.init.constant_(self.up_final_layer.adaLN_modulation[-1].weight, 0)
-                nn.init.constant_(self.up_final_layer.adaLN_modulation[-1].bias, 0)
-            nn.init.constant_(self.up_final_layer.linear.weight, 0)
-            nn.init.constant_(self.up_final_layer.linear.bias, 0)
 
 
     def _rope_freqs(self, grid, size):
@@ -400,7 +392,7 @@ class FiT(nn.Module):
             global_adaln_fr, None,
         )
 
-        x = self.up_final_layer(x, c_fr)            # (n_pack, N_fr, p**2 * C_out)
+        x = self.final_layer(x, c_fr)              # (n_pack, N_fr, p**2 * C_out)
         x = x * mask_fullres[..., None]             # zero out padding tokens
         return x
     

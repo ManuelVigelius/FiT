@@ -183,8 +183,9 @@ from fit.scheduler.transport.utils import patchify, unpatchify
 def model_cfg_for(loss_type: str) -> dict:
     cfg = dict(_BASE_MODEL_CFG)
     cfg["use_size_cond"] = (loss_type not in ("baseline", "virtual_resize"))
-    # Loss C builds the learned-upsampler tail (up_proj, fr_embedder, up_blocks,
-    # up_final_layer); without this the checkpoint's upsampler weights would be
+    # Loss C builds the learned-upsampler tail (up_proj, fr_embedder, up_blocks;
+    # the prediction head is shared with the low-res path). Without this the
+    # checkpoint's upsampler weights would be
     # reported as unexpected keys and the model would run the plain low-res head.
     cfg["use_upsampler"] = (loss_type == "C")
     return cfg
