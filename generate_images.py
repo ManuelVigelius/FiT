@@ -16,6 +16,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import json
+import math
 import shutil
 import sys
 import zipfile
@@ -124,6 +125,12 @@ CHECKPOINTS = [ # cluster paths
         loss_type="A",
         use_ema=True,
     ),
+    dict(
+        name="loss_c_10k_ema",
+        dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_c/checkpoints/checkpoint-8000",
+        loss_type="C",
+        use_ema=True,
+    ),
     # dict(
     #     name="loss_a_8k_train",
     #     dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
@@ -159,11 +166,15 @@ CHECKPOINTS = [ # cluster paths
 PATCH_SIZE = 2
 VAE_SCALE  = 8   # SD VAE 8× spatial downsampling
 C_IN       = 4   # VAE latent channels
+PAD_TO_MULTIPLE = 128  # packed-sequence padding (matches packed_collate_fn)
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from fit.model.fit_model import FiT
-from fit.noise_field_sampler.noise_field_sampler import sample as noise_field_sample
+from fit.noise_field_sampler.noise_field_sampler import (
+    sample as noise_field_sample,
+    sample_upsampler as noise_field_sample_upsampler,
+)
 from fit.scheduler.transport.utils import patchify, unpatchify
 
 
@@ -172,6 +183,10 @@ from fit.scheduler.transport.utils import patchify, unpatchify
 def model_cfg_for(loss_type: str) -> dict:
     cfg = dict(_BASE_MODEL_CFG)
     cfg["use_size_cond"] = (loss_type not in ("baseline", "virtual_resize"))
+    # Loss C builds the learned-upsampler tail (up_proj, fr_embedder, up_blocks,
+    # up_final_layer); without this the checkpoint's upsampler weights would be
+    # reported as unexpected keys and the model would run the plain low-res head.
+    cfg["use_upsampler"] = (loss_type == "C")
     return cfg
 
 
@@ -198,6 +213,79 @@ def make_grid_and_mask(H_g: int, W_g: int, B: int, device: torch.device, dtype: 
     mask = torch.ones(B, H_g * W_g, device=device, dtype=dtype)
     size = torch.tensor((H_g, W_g), dtype=torch.int32, device=device).repeat(B, 1).unsqueeze(1)
     return grid, mask, size
+
+
+def _single_grid(H_g: int, W_g: int, device, dtype) -> torch.Tensor:
+    """(2, H_g*W_g) integer grid, w-fast/h-slow — matches the dataset convention."""
+    hs = torch.arange(H_g, dtype=dtype)
+    ws = torch.arange(W_g, dtype=dtype)
+    gh, gw = torch.meshgrid(hs, ws, indexing='ij')
+    return torch.stack([gw.reshape(-1), gh.reshape(-1)]).to(device=device, dtype=dtype)
+
+
+def build_upsampler_inputs(x_lr_sp, x_fr_sp, y_full, k_grid, H_fr, W_fr, device, dtype):
+    """Assemble the model's two-resolution forward inputs for one CFG-doubled batch.
+
+    Each batch element is one image in the pack (n_pack = batch size). The
+    low-res side is packed into a single B=1 sequence (doc_ids + block_mask);
+    the full-res side is a dense (n_pack, N_fr, ·) batch — exactly the layout
+    packed_collate_fn produces for return_fullres data.
+
+    All sizes here are *grid* (token) sizes, not spatial: a k_grid×k_grid grid
+    has k_grid² tokens and corresponds to a (k_grid·p)×(k_grid·p) latent.
+
+    Args:
+        x_lr_sp: (n_pack, C, k_grid*p, k_grid*p)   low-res noisy latent (spatial)
+        x_fr_sp: (n_pack, C, H_fr*p, W_fr*p)       full-res noisy latent (spatial)
+        y_full:  (n_pack,)                         labels (cond + null concatenated)
+        k_grid:  low-res grid size
+    Returns dict of model_kwargs plus the packed low-res token tensor `x`.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    n_pack = x_lr_sp.shape[0]
+    seq_lr = k_grid * k_grid
+    N_total = math.ceil((n_pack * seq_lr) / PAD_TO_MULTIPLE) * PAD_TO_MULTIPLE
+
+    # --- packed low-res tokens ---
+    x_lr_tok = patchify(x_lr_sp, PATCH_SIZE)          # (n_pack, seq_lr, p**2*C)
+    Dtok = x_lr_tok.shape[-1]
+    feat = torch.zeros(1, N_total, Dtok, device=device, dtype=dtype)
+    grid = torch.zeros(1, 2, N_total, device=device, dtype=torch.long)
+    mask = torch.zeros(1, N_total, device=device, dtype=dtype)
+    doc_ids = torch.full((1, N_total), -1, device=device, dtype=torch.int32)
+    size_lr = torch.zeros(1, n_pack, 2, device=device, dtype=torch.int32)
+    t_pack = torch.zeros(1, n_pack, device=device, dtype=dtype)  # filled by caller's t
+    y_pack = y_full.to(torch.int).view(1, n_pack)
+
+    g_lr = _single_grid(k_grid, k_grid, device, torch.long)     # (2, seq_lr)
+    offset = 0
+    for img_idx in range(n_pack):
+        feat[0, offset:offset + seq_lr] = x_lr_tok[img_idx]
+        grid[0, :, offset:offset + seq_lr] = g_lr
+        mask[0, offset:offset + seq_lr] = 1
+        doc_ids[0, offset:offset + seq_lr] = img_idx
+        size_lr[0, img_idx] = torch.tensor([k_grid, k_grid], device=device)
+        offset += seq_lr
+
+    def doc_mask_mod(b, h, q_idx, kv_idx):
+        return doc_ids[b, q_idx] == doc_ids[b, kv_idx]
+    block_mask = create_block_mask(doc_mask_mod, 1, None, N_total, N_total, device=device)
+
+    # --- dense full-res inputs ---
+    x_fr_tok = patchify(x_fr_sp, PATCH_SIZE)          # (n_pack, N_fr, p**2*C)
+    grid_fr = _single_grid(H_fr, W_fr, device, torch.long)        # (2, N_fr)
+    grid_fr = grid_fr.unsqueeze(0).repeat(n_pack, 1, 1)          # (n_pack, 2, N_fr)
+    mask_fr = torch.ones(n_pack, H_fr * W_fr, device=device, dtype=dtype)
+    size_fr = torch.tensor([H_fr, W_fr], device=device, dtype=torch.int32)
+    size_fr = size_fr.view(1, 1, 2).repeat(1, n_pack, 1)         # (1, n_pack, 2)
+
+    return dict(
+        x=feat, grid=grid, mask=mask, size=size_lr, doc_ids=doc_ids,
+        block_mask=block_mask, y=y_pack, t_pack=t_pack,
+        x_fullres=x_fr_tok, grid_fullres=grid_fr, mask_fullres=mask_fr,
+        size_fullres=size_fr,
+    )
 
 # ──────────────────────────── main ───────────────────────────────────────────
 
@@ -268,36 +356,74 @@ def main():
                 bs = min(BATCH_SIZE, N_IMAGES - generated)
                 y = all_labels[generated:generated + bs]
                 y_null = torch.full_like(y, NUM_CLASSES)
-
-                def model_fn(x_sp: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-                    H_g = x_sp.shape[-2] // PATCH_SIZE
-                    W_g = x_sp.shape[-1] // PATCH_SIZE
-                    grid, mask, size = make_grid_and_mask(H_g, W_g, bs, DEVICE, dtype)
-                    x_tok = patchify(x_sp, PATCH_SIZE)
-                    v = model(
-                        torch.cat([x_tok, x_tok], 0),
-                        torch.cat([t, t], 0),
-                        torch.cat([y, y_null], 0),
-                        torch.cat([grid, grid], 0),
-                        torch.cat([mask, mask], 0),
-                        torch.cat([size, size], 0),
-                    )
-                    v_cond, v_uncond = v.chunk(2, dim=0)
-                    v_pred = v_uncond + CFG_SCALE * (v_cond - v_uncond)
-                    return unpatchify(v_pred, (H_g * PATCH_SIZE, W_g * PATCH_SIZE), PATCH_SIZE)
+                y_full = torch.cat([y, y_null], 0)        # (2*bs,) cond + null
 
                 # Deterministic per batch: sampler draws its own noise fields internally.
                 # The sampler treats schedule entries as spatial sizes; convert from
                 # packed grid sizes by multiplying with PATCH_SIZE.
                 torch.manual_seed(GLOBAL_SEED + generated)
-                x1_sp = noise_field_sample(
-                    model_fn,
-                    scale_schedule=[g * PATCH_SIZE for g in grid_sizes],
-                    b=bs,
-                    d=C_IN,
-                    device=DEVICE,
-                    dtype=dtype,
-                )
+
+                if loss_type == "C":
+                    # Learned-upsampler model: the integration state stays full-res;
+                    # the schedule size only sets the resolution of the low-res
+                    # conditioning input. model_fn receives both resolutions and
+                    # always returns a full-res velocity.
+                    def model_fn(x_lr_sp, x_fr_sp, t, k):
+                        # k is a *spatial* size (schedule entries are spatial);
+                        # convert to the low-res grid size for the packed branch.
+                        k_grid = k // PATCH_SIZE
+                        # CFG-double both resolutions and the labels.
+                        x_lr2 = torch.cat([x_lr_sp, x_lr_sp], 0)
+                        x_fr2 = torch.cat([x_fr_sp, x_fr_sp], 0)
+                        kw = build_upsampler_inputs(
+                            x_lr2, x_fr2, y_full, k_grid, H_fr, W_fr, DEVICE, dtype
+                        )
+                        n_pack = x_lr2.shape[0]
+                        t_pack = t[:1].repeat(1, n_pack)   # shared timestep per image
+                        v = model(
+                            kw['x'], t_pack, kw['y'], kw['grid'], kw['mask'],
+                            kw['size'], doc_ids=kw['doc_ids'], block_mask=kw['block_mask'],
+                            x_fullres=kw['x_fullres'], grid_fullres=kw['grid_fullres'],
+                            mask_fullres=kw['mask_fullres'], size_fullres=kw['size_fullres'],
+                        )                                   # (n_pack, N_fr, p**2*C)
+                        v_cond, v_uncond = v.chunk(2, dim=0)
+                        v_pred = v_uncond + CFG_SCALE * (v_cond - v_uncond)
+                        return unpatchify(v_pred, (H_fr * PATCH_SIZE, W_fr * PATCH_SIZE), PATCH_SIZE)
+
+                    x1_sp = noise_field_sample_upsampler(
+                        model_fn,
+                        scale_schedule=[g * PATCH_SIZE for g in grid_sizes],
+                        b=bs,
+                        d=C_IN,
+                        device=DEVICE,
+                        dtype=dtype,
+                    )
+                else:
+                    def model_fn(x_sp: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+                        H_g = x_sp.shape[-2] // PATCH_SIZE
+                        W_g = x_sp.shape[-1] // PATCH_SIZE
+                        grid, mask, size = make_grid_and_mask(H_g, W_g, bs, DEVICE, dtype)
+                        x_tok = patchify(x_sp, PATCH_SIZE)
+                        v = model(
+                            torch.cat([x_tok, x_tok], 0),
+                            torch.cat([t, t], 0),
+                            torch.cat([y, y_null], 0),
+                            torch.cat([grid, grid], 0),
+                            torch.cat([mask, mask], 0),
+                            torch.cat([size, size], 0),
+                        )
+                        v_cond, v_uncond = v.chunk(2, dim=0)
+                        v_pred = v_uncond + CFG_SCALE * (v_cond - v_uncond)
+                        return unpatchify(v_pred, (H_g * PATCH_SIZE, W_g * PATCH_SIZE), PATCH_SIZE)
+
+                    x1_sp = noise_field_sample(
+                        model_fn,
+                        scale_schedule=[g * PATCH_SIZE for g in grid_sizes],
+                        b=bs,
+                        d=C_IN,
+                        device=DEVICE,
+                        dtype=dtype,
+                    )
 
                 with torch.no_grad():
                     imgs = vae.decode(x1_sp / vae.config.scaling_factor).sample
