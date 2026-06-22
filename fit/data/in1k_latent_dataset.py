@@ -7,7 +7,7 @@ import random
 from functools import partial
 from torch.utils.data import DataLoader, Dataset, BatchSampler
 from safetensors.torch import load_file
-from fit.scheduler.transport.utils import spatial_resize
+from fit.scheduler.transport.utils import spatial_resize, patchify
 from fit.noise_field_sampler.noise_field_generator import sample_noise_fields_2d
 
 
@@ -141,15 +141,34 @@ class IN1kLatentDataset(Dataset):
             x1_lr = feat_hw.reshape(seq_len, 16).to(torch.float32)          # (seq_len, 16)
             x1_fr = feat_hw_fullres.reshape(seq_fr, 16).to(torch.float32)   # (seq_fr, 16)
 
-            # Consistent noise at both resolutions: fields are (1, 16, k, k).
-            nf_lr, nf_fr = sample_noise_fields_2d([H_g, H_fr], d=16, b=1)
-            x0_lr = nf_lr[0].permute(1, 2, 0).reshape(seq_len, 16)          # (seq_len, 16)
-            x0_fr = nf_fr[0].permute(1, 2, 0).reshape(seq_fr, 16)          # (seq_fr, 16)
+            # Consistent noise at both resolutions. The stored features are
+            # patchified (p=2): each token packs a 2x2 patch of the true
+            # C=4 latent, so the real latent grids are 2*H_g and 2*H_fr. Draw
+            # the noise on those *unpacked* C=4 grids — the consistent-family
+            # construction (cross-resolution sum-consistency, per-pixel std-1
+            # rescale by k) is defined on the real spatial resolution — then
+            # patchify into the (seq, 16) token layout the same way as features.
+            p = 2
+            nf_lr, nf_fr = sample_noise_fields_2d([p * H_g, p * H_fr], d=16 // (p * p), b=1)
+            x0_lr = patchify(nf_lr, p)[0]                                   # (seq_len, 16)
+            x0_fr = patchify(nf_fr, p)[0]                                   # (seq_fr, 16)
 
             t = _sample_t(self.snr_type, self.t0, self.t1)
 
-            # ICPlan interpolation: xt = t * x1 + (1 - t) * x0.
-            xt_lr = (t * x1_lr + (1.0 - t) * x0_lr).to(dtype)
+            # The low-res field is a coarsening of the full-res one, so a low-res
+            # noisy input at global sigma sits at a *different* effective time.
+            # Mirror the inference sampler's noise rescale (see
+            # noise_field_sampler.sample): with r = low-res / full-res grid,
+            #   sigma_inj = sigma * r / (1 - sigma * (1 - r)),  t_model = 1 - sigma_inj.
+            sigma = 1.0 - t
+            r = H_g / H_fr
+            sigma_inj = sigma * r / (1.0 - sigma * (1.0 - r))
+            t_model = 1.0 - sigma_inj
+
+            # ICPlan interpolation. Full-res uses the shared global t; low-res
+            # uses the resolution-adjusted t_model so its noise level matches
+            # what the model is conditioned on at inference.
+            xt_lr = (t_model * x1_lr + (1.0 - t_model) * x0_lr).to(dtype)
             xt_fr = (t * x1_fr + (1.0 - t) * x0_fr).to(dtype)
 
             # Overwrite the low-res feature with the noised low-res input.
@@ -180,6 +199,9 @@ class IN1kLatentDataset(Dataset):
             result['mask_fullres']    = mask_fr
             result['size_fullres']    = torch.tensor([[H_fr, W_fr]], dtype=torch.int32)
             result['t']               = torch.tensor(t, dtype=torch.float32)
+            # Resolution-adjusted timestep the model is conditioned on for the
+            # low-res input (see sigma_inj above). _loss_upsampler forwards this.
+            result['t_model']         = torch.tensor(t_model, dtype=torch.float32)
 
         return result
         
@@ -330,6 +352,7 @@ def packed_collate_fn(samples, pad_to_multiple: int = 128):
         mask_fr_batch = torch.ones(n_pack, seq_fr, dtype=torch.uint8)
         size_fr_batch = torch.zeros(1, n_pack, 2, dtype=torch.int32)
         t_batch       = torch.zeros(1, n_pack, dtype=torch.float32)
+        t_model_batch = torch.zeros(1, n_pack, dtype=torch.float32)
 
         for img_idx, s in enumerate(samples):
             feat_fr_batch[img_idx] = s['feature_fullres'][:seq_fr]
@@ -337,6 +360,7 @@ def packed_collate_fn(samples, pad_to_multiple: int = 128):
             grid_fr_batch[img_idx] = s['grid_fullres'][:, :seq_fr]
             size_fr_batch[0, img_idx] = s['size_fullres'].squeeze(0)
             t_batch[0, img_idx]       = s['t']
+            t_model_batch[0, img_idx] = s['t_model']
 
         result['feature_fullres'] = feat_fr_batch  # (n_pack, N_fr, 16)
         result['ut_fullres']      = ut_fr_batch    # (n_pack, N_fr, 16)
@@ -344,6 +368,7 @@ def packed_collate_fn(samples, pad_to_multiple: int = 128):
         result['mask_fullres']    = mask_fr_batch  # (n_pack, N_fr)
         result['size_fullres']    = size_fr_batch  # (1, n_pack, 2)
         result['t']               = t_batch        # (1, n_pack)
+        result['t_model']         = t_model_batch  # (1, n_pack)
 
     return result
 

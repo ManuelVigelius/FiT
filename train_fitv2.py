@@ -577,6 +577,7 @@ def main():
                     model_kwargs['mask_fullres']    = batch['mask_fullres'].to(device=device)
                     model_kwargs['size_fullres']    = batch['size_fullres'].to(device=device)
                     model_kwargs['t']               = batch['t'].to(device=device)
+                    model_kwargs['t_model']         = batch['t_model'].to(device=device)
                 with torch.cuda.nvtx.range("forward") if _profiling_active else contextlib.nullcontext():
                     # forward model and compute loss
                     with accelerator.autocast():

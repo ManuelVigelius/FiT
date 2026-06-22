@@ -127,10 +127,17 @@ def sample_upsampler(
 
     Per step at schedule size k (full size F = max(scale_schedule)):
         sigma     = 1 - t
-        x_fr      = (1 - sigma) * (x_0_hat / t) + sigma * noise_F     (full-res noisy)
-        x_lr      = downsample(x_0_hat, k);  combined with noise_k the same way
-        v_fr      = model(x_lr [low-res cond], x_fr [full-res], t_model=1-sigma)
+        r         = k / F
+        sigma_inj = sigma * r / (1 - sigma * (1 - r))         (low-res noise rescale)
+        t_model   = 1 - sigma_inj
+        x_fr      = (1 - sigma) * (x_0_hat / t) + sigma * noise_F          (full-res, time t)
+        x_lr      = (1 - sigma_inj) * down(x_0_hat, k) + sigma_inj * noise_k  (low-res, time t_model)
+        v_fr      = model(x_lr [low-res cond], x_fr [full-res], t_model)
         x_0_hat  += dt * (noise_F + v_fr)
+
+    The low-res branch is noised at the adjusted level sigma_inj (not sigma): the
+    coarse noise field carries lower variance, so the model is conditioned on the
+    resolution-adjusted t_model. This matches the Loss C training data.
 
     The low-res and full-res noise come from one cross-resolution-consistent
     family (drawn jointly via :func:`sample_noise_fields_2d`), mirroring how the
@@ -174,23 +181,33 @@ def sample_upsampler(
         cur_size = scale_schedule[i]
         noise_cur = noise_fields[cur_size]
 
-        # Full-res noisy input: convex-combine the (unit-scale) clean estimate
-        # with the full-res noise. Loss C shares one timestep across both
-        # resolutions, so no per-resolution noise rescaling here (the schedule
-        # size is a conditioning resolution, not the integration resolution).
+        # The low-res noise field is a coarsening of the full-res one and so
+        # carries a lower effective noise level: at global sigma the low-res
+        # input actually sits at sigma_inj < sigma, i.e. a different time. Mirror
+        # the noise rescale used in :func:`sample` (and matched by the Loss C
+        # training data in in1k_latent_dataset):
+        #   r = cur_size / full_size
+        #   sigma_inj = sigma * r / (1 - sigma * (1 - r)),  t_model = 1 - sigma_inj.
+        r = cur_size / full_size
+        sigma_inj = sigma * r / (1.0 - sigma * (1.0 - r))
+        t_model = 1.0 - sigma_inj
+
         if float(t) > 0.0:
             x0_unit = x_0_hat / t
+            # Full-res noisy input at the global timestep t.
             x_fr = (1.0 - sigma) * x0_unit + sigma * noise_fr
-            # Low-res input: downsample the *clean estimate* to k×k, then add the
-            # matching low-res noise from the consistent family.
+            # Low-res input: downsample the *clean estimate* to k×k, then convex-
+            # combine with the matching low-res noise at the *adjusted* level
+            # sigma_inj (= 1 - t_model), consistent with how the model is
+            # conditioned below.
             x0_lr = area_resample_ref(x0_unit, cur_size, cur_size)
-            x_lr = (1.0 - sigma) * x0_lr + sigma * noise_cur
+            x_lr = (1.0 - sigma_inj) * x0_lr + sigma_inj * noise_cur
         else:
             x_fr = noise_fr
             x_lr = noise_cur
 
-        t_model = float(t)  # Loss C uses the shared image timestep directly
-        t_batch = torch.full((b,), t_model, device=device, dtype=dtype)
+        # Condition the model on the resolution-adjusted low-res timestep.
+        t_batch = torch.full((b,), float(t_model), device=device, dtype=dtype)
         v_fr = model(x_lr, x_fr, t_batch, cur_size)
 
         x_0_hat = x_0_hat + dt * (noise_fr + v_fr)

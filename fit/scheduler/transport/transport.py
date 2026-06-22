@@ -293,22 +293,30 @@ class Transport:
 
         x1 (the positional arg) is the packed low-res noisy input xt_lr.
         """
-        t = model_kwargs['t']                       # (1, n_pack)
+        # The model is conditioned on the resolution-adjusted timestep t_model
+        # (not the shared image t): the low-res input xt_lr was built at the
+        # effective noise level sigma_inj = 1 - t_model, matching the inference
+        # sampler's noise rescale. See in1k_latent_dataset for the derivation.
+        t_model = model_kwargs['t_model']           # (1, n_pack)
         ut_fr = model_kwargs['ut_fullres']          # (n_pack, N_fr, 16)
         mask_fr = model_kwargs['mask_fullres']      # (n_pack, N_fr)
 
         # Map dataset fields to the model's forward signature and strip the
         # loss-only / transport-only keys.
         fwd = {k: v for k, v in model_kwargs.items()
-               if k not in ('ut_fullres', 'n_pack', 't', 'feature_fullres')}
+               if k not in ('ut_fullres', 'n_pack', 't', 't_model', 'feature_fullres')}
         fwd['x_fullres'] = model_kwargs['feature_fullres']
 
-        v_fr = model(xt_lr, t, **fwd)               # (n_pack, N_fr, 16)
+        v_fr = model(xt_lr, t_model, **fwd)         # (n_pack, N_fr, 16)
 
         mask = mask_fr[..., None].to(v_fr.dtype)
         sq_err = ((v_fr - ut_fr) * mask) ** 2
-        # Per-image mean over valid tokens, then mean over images.
-        denom = mask.sum(dim=(1, 2)).clamp(min=1)
+        # Per-image mean over valid elements, then mean over images. The
+        # denominator must count tokens * channels (not just tokens): sq_err is
+        # summed over both the token and the 16-channel axis, so the mask is
+        # broadcast to the channel dim before summing. Counting tokens only here
+        # under-counts by a factor of C (=16), inflating the loss 16x.
+        denom = mask.expand_as(sq_err).sum(dim=(1, 2)).clamp(min=1)
         per_image = sq_err.sum(dim=(1, 2)) / denom  # (n_pack,)
         return {'loss': per_image.mean().unsqueeze(0), 'pred': v_fr}
     

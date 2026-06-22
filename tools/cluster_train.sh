@@ -59,7 +59,21 @@ case "${LOSS^^}" in
 esac
 
 PROJECT="fitv2_xl_cluster_${BASE_LOSS}"
-WORKDIR="$WORKDIR_FAST/workdir/$PROJECT"
+# train_fitv2.py writes to os.path.join(--workdir, project_name), so the actual
+# output dir is "$WORKDIR_FAST/$PROJECT". Keep that as the single source of truth.
+WORKDIR="$WORKDIR_FAST/$PROJECT"
+# Final persistent destination the workdir is moved to after training.
+WORKDIR_OUT="$PERSISTENT_OUT/workdir/${PROJECT}"
+
+# Fail fast: if the persistent destination already exists, the post-training mv
+# would nest the new workdir inside it. Refuse to start so we don't burn GPU
+# hours only to fail at the move (and so the user can delete the stale dir).
+if [ -e "$WORKDIR_OUT" ]; then
+  echo "ERROR: persistent destination already exists: $WORKDIR_OUT" >&2
+  echo "       Delete or rename it before training, e.g.:" >&2
+  echo "         rm -r \"$WORKDIR_OUT\"" >&2
+  exit 1
+fi
 
 
 echo "Config       : $CONFIG"
@@ -136,7 +150,7 @@ python -m torch.distributed.run \
   --rdzv_endpoint "localhost:$MASTER_PORT" \
   train_fitv2.py \
     --project_name "$PROJECT" \
-    --workdir "$WORKDIR_FAST/workdir" \
+    --workdir "$WORKDIR_FAST" \
     --cfgdir "$CONFIG" "$OVERRIDE_CFG" \
     --seed 0 --scale_lr --allow_tf32 \
     --resume_from_checkpoint latest \
@@ -151,7 +165,6 @@ fi
 
 # --- Move workdir to persistent storage ---
 echo ""
-WORKDIR_OUT="$PERSISTENT_OUT/workdir/${PROJECT}"
 echo "Moving workdir to persistent storage: $WORKDIR_OUT ..."
 mkdir -p "$PERSISTENT_OUT/workdir"
 mv "$WORKDIR" "$WORKDIR_OUT"
