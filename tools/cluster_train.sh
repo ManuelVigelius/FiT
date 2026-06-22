@@ -7,8 +7,9 @@
 #   WA                — warmup for Loss A (freeze everything except size_embedder),
 #                       then automatically continues into full A training
 #   WC                — warmup for Loss C (train only the new upsampler layers:
-#                       up_proj, fr_embedder, up_blocks, up_final_layer), then
-#                       automatically continues into full C training
+#                       up_proj, fr_embedder, up_blocks, and the shared
+#                       final_layer head), then automatically continues into
+#                       full C training
 #   --reset-optimizer — reset the optimizer state on start (use when transitioning warmup→full)
 #
 # Storage layout:
@@ -97,7 +98,7 @@ fi
 EXTRA_FLAGS=""
 case "${LOSS^^}" in
   WA) EXTRA_FLAGS="--freeze_new_layers size_embedder" ;;
-  WC) EXTRA_FLAGS="--freeze_new_layers up_proj,fr_embedder,up_blocks,up_final_layer" ;;
+  WC) EXTRA_FLAGS="--freeze_new_layers up_proj,fr_embedder,up_blocks,final_layer" ;;
   *)  EXTRA_FLAGS="--use_ema --ema_decay 0.9995" ;;
 esac
 if [ "$RESET_OPTIMIZER" = true ]; then
@@ -121,6 +122,11 @@ mkdir -p "$WORKDIR"
 cd "$REPO_DIR"
 
 export WANDB_MODE=offline
+
+# Restrict to specific physical GPUs (override with CUDA_VISIBLE_DEVICES=... in the
+# environment). torch sees the selected devices as cuda:0..N-1, so nproc_per_node
+# must match the count of devices listed here.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3,4}"
 
 python -m torch.distributed.run \
   --nnodes 1 \
