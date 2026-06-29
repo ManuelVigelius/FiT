@@ -247,7 +247,8 @@ class FiT(nn.Module):
         return x
 
     def forward(self, x, t, y, grid, mask, size=None, doc_ids=None, block_mask=None,
-                x_fullres=None, grid_fullres=None, mask_fullres=None, size_fullres=None):
+                x_fullres=None, grid_fullres=None, mask_fullres=None, size_fullres=None,
+                cells=None):
         """
         Forward pass of FiT.
 
@@ -370,7 +371,13 @@ class FiT(nn.Module):
         #    cannot trace under dynamic=True.
         x = self.up_proj(x)                                     # (1, N_total_lr, D)
         n_pack = c_pack.shape[1]
-        x_fr = self._upsample_packed(x, doc_ids, size, size_fullres, n_pack, D)  # (n_pack, N_fr, D)
+        if cells is None:
+            # Uniform low-res: one rectangle per image stretched to the full frame.
+            x_fr = self._upsample_packed(x, doc_ids, size, size_fullres, n_pack, D)  # (n_pack, N_fr, D)
+        else:
+            # Quadtree (mixed resolution): each image's tokens are partitioned into
+            # rectangular cells, each upsampled into its own full-res sub-window.
+            x_fr = self._upsample_quadtree(x, doc_ids, size_fullres, n_pack, D, cells)
 
         # 3. Project the full-res noisy image and add it to the upsampled latents.
         x = x_fr + self.fr_embedder(x_fullres)                  # (n_pack, N_fr, D)
@@ -460,6 +467,106 @@ class FiT(nn.Module):
             padding_mode='border', align_corners=True,
         ).to(x.dtype)                                                # (n_pack, D, H_fr, W_fr)
         return sp_fr.reshape(n_pack, D, N_fr).transpose(1, 2)        # (n_pack, N_fr, D)
+
+    @torch.compiler.disable
+    def _upsample_quadtree(self, x, doc_ids, size_fullres, n_pack, D, cells):
+        """Mixed-resolution upsample: place each quadtree cell into its sub-window.
+
+        Counterpart to :meth:`_upsample_packed` for the quadtree path. Instead of
+        one low-res rectangle per image stretched over the whole frame, each
+        image's tokens are partitioned into rectangular cells, and every cell is
+        bicubically upsampled into *its own* sub-window of the full-res grid. The
+        cells tile the frame exactly (quadtree partition), so the windows cover
+        every output token once with no gaps or overlaps.
+
+        Excluded from torch.compile for the same reasons as :meth:`_upsample_packed`
+        (data-dependent Python ints); it is pure resampling.
+
+        All cells across all images are resampled in a *single* batched
+        ``grid_sample`` call (no per-cell Python kernel launches): each cell is
+        scattered into a dense (M, D, k_max_h, k_max_w) source batch (top-left
+        aligned, border-replicated into padding so bicubic overshoot reads valid
+        values), sampled with its own coordinate map into a common (h_max, w_max)
+        output, then the valid (h, w) crop is written into its window. The
+        per-cell coordinate map reproduces interpolate(mode='bicubic',
+        align_corners=True) from (k_h, k_w) to (h, w) — the same convention as
+        :meth:`_upsample_packed` — so for a single full-frame cell this matches
+        the uniform path exactly.
+
+        Args:
+            x:        (1, N_total_lr, D) packed low-res tokens (after up_proj).
+            doc_ids:  (1, N_total_lr) image index per token, -1 for padding.
+            size_fullres: (1, n_pack, 2) full-res grid size (shared by all images).
+            cells:    list of length n_pack; cells[i] is a list of tuples
+                      (offset, k_h, k_w, y0, x0, h, w) for image i, where `offset`
+                      indexes into image i's own token block (the tokens with
+                      doc_id == i, in packed order) and (y0, x0, h, w) is the cell's
+                      window in the full-res grid.
+
+        Returns:
+            x_fr: (n_pack, N_fr, D).
+        """
+        H_fr = int(size_fullres[0, 0, 0]); W_fr = int(size_fullres[0, 0, 1])
+        N_fr = H_fr * W_fr
+        device = x.device
+        doc_ids_lr = doc_ids[0]                                  # (N_total_lr,)
+
+        # Flatten all cells across all images, recording per-cell geometry.
+        flat = []                       # (img, offset, k_h, k_w, y0, x0, h, w)
+        for i in range(n_pack):
+            for (offset, k_h, k_w, y0, x0, h, w) in cells[i]:
+                flat.append((i, offset, k_h, k_w, y0, x0, h, w))
+        M = len(flat)
+        k_max_h = max(c[2] for c in flat)
+        k_max_w = max(c[3] for c in flat)
+        h_max = max(c[6] for c in flat)
+        w_max = max(c[7] for c in flat)
+
+        # Per-image token blocks (one boolean-gather per image, not per cell).
+        tok_imgs = [x[0, doc_ids_lr == i] for i in range(n_pack)]   # (N_lr_i, D)
+
+        # Scatter each cell's tokens into the dense source batch, border-replicated.
+        sp = x.new_zeros(M, D, k_max_h, k_max_w)
+        for m, (i, offset, k_h, k_w, y0, x0, h, w) in enumerate(flat):
+            n = k_h * k_w
+            cell = tok_imgs[i][offset:offset + n].transpose(0, 1).reshape(D, k_h, k_w)
+            if k_h < k_max_h or k_w < k_max_w:
+                cell = nn.functional.pad(
+                    cell.unsqueeze(0), (0, k_max_w - k_w, 0, k_max_h - k_h),
+                    mode='replicate',
+                ).squeeze(0)
+            sp[m] = cell
+
+        # Per-cell sampling grid into a common (h_max, w_max) output. Output pixel
+        # j maps to input coord j * (k - 1) / (out - 1) (align_corners=True),
+        # normalized over the padded extent (k_max - 1).
+        ks_h = torch.tensor([c[2] for c in flat], device=device, dtype=torch.float32)
+        ks_w = torch.tensor([c[3] for c in flat], device=device, dtype=torch.float32)
+        hs   = torch.tensor([c[6] for c in flat], device=device, dtype=torch.float32)
+        ws   = torch.tensor([c[7] for c in flat], device=device, dtype=torch.float32)
+        oy = torch.arange(h_max, device=device, dtype=torch.float32)   # (h_max,)
+        ox = torch.arange(w_max, device=device, dtype=torch.float32)   # (w_max,)
+        # input coord per cell (pixel space): clamp out-1 to >=1 to avoid /0.
+        in_y = oy[None, :] * ((ks_h - 1).clamp(min=0) / (hs - 1).clamp(min=1))[:, None]
+        in_x = ox[None, :] * ((ks_w - 1).clamp(min=0) / (ws - 1).clamp(min=1))[:, None]
+        gy = 2.0 * in_y / max(k_max_h - 1, 1) - 1.0                    # (M, h_max)
+        gx = 2.0 * in_x / max(k_max_w - 1, 1) - 1.0                    # (M, w_max)
+        samp_grid = torch.stack([
+            gx[:, None, :].expand(M, h_max, w_max),
+            gy[:, :, None].expand(M, h_max, w_max),
+        ], dim=-1)                                                    # (M, h_max, w_max, 2)
+
+        sampled = nn.functional.grid_sample(
+            sp.float(), samp_grid, mode='bicubic',
+            padding_mode='border', align_corners=True,
+        ).to(x.dtype)                                                # (M, D, h_max, w_max)
+
+        # Write each cell's valid (h, w) crop into its window.
+        out = x.new_zeros(n_pack, D, H_fr, W_fr)
+        for m, (i, offset, k_h, k_w, y0, x0, h, w) in enumerate(flat):
+            out[i, :, y0:y0 + h, x0:x0 + w] = sampled[m, :, :h, :w]
+
+        return out.reshape(n_pack, D, N_fr).transpose(1, 2)     # (n_pack, N_fr, D)
 
     def ckpt_wrapper(self, module):
         def ckpt_forward(*inputs):

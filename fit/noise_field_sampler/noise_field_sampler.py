@@ -4,6 +4,24 @@ from .area_resampling import area_resample_nn_correction, area_resample_ref
 from .noise_field_generator import sample_noise_fields_2d
 
 
+def _coarsen_window(field_fr, y0, x0, h, w, k_h, k_w):
+    """Area-consistent coarsening of a full-res noise window to (k_h, k_w).
+
+    Restricts `field_fr` (b, d, H_fr, W_fr) to the full-res window
+    [y0:y0+h, x0:x0+w] and area-resamples it to (k_h, k_w). Area resampling
+    *averages* (weights sum to 1), reducing per-pixel std by 1/sqrt(block area),
+    so we rescale by sqrt((h*w)/(k_h*k_w)) to restore unit per-pixel std. The
+    result is the cross-resolution-consistent coarse noise for that window — the
+    same property sample_noise_fields_2d guarantees globally (avg of a fine block
+    == coarse / scale), here obtained directly from the full-res field so it
+    works for arbitrary windows and non-square cells.
+    """
+    win = field_fr[:, :, y0:y0 + h, x0:x0 + w]
+    coarse = area_resample_ref(win, k_h, k_w)
+    scale = ((h * w) / (k_h * k_w)) ** 0.5
+    return coarse * scale
+
+
 @torch.no_grad()
 def sample(
     model,
@@ -209,6 +227,109 @@ def sample_upsampler(
         # Condition the model on the resolution-adjusted low-res timestep.
         t_batch = torch.full((b,), float(t_model), device=device, dtype=dtype)
         v_fr = model(x_lr, x_fr, t_batch, cur_size)
+
+        x_0_hat = x_0_hat + dt * (noise_fr + v_fr)
+
+    return x_0_hat
+
+
+@torch.no_grad()
+def sample_upsampler_quadtree(
+    model,
+    qt,
+    num_steps: int,
+    b: int,
+    d: int,
+    *,
+    patch_size: int = 1,
+    per_leaf_sigma: bool = True,
+    t0: float = 0.0,
+    t1: float = 1.0,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Mixed-resolution (quadtree) Euler sampler for the learned-upsampler model.
+
+    Like :func:`sample_upsampler`, the integration state ``x_0_hat`` stays at full
+    resolution (F = qt.H_fr, assumed square: qt.H_fr == qt.W_fr) for the whole
+    trajectory. The difference: the low-res conditioning input is *non-uniform* —
+    each quadtree cell carries its own resolution (k_h, k_w). Per step:
+
+        x_fr      = (1 - sigma) * x0_unit + sigma * noise_F            (full-res, time t)
+        for each cell c (window y0,x0,h,w at density k_h,k_w):
+            r_c         = mean(k_h/h_full, k_w/w_full)   (cell coarsening ratio)
+            sigma_inj_c = sigma * r_c / (1 - sigma * (1 - r_c))   [per-leaf]
+                        = single global value                     [if per_leaf_sigma=False]
+            x0_c        = downsample(x0_unit[window], k_h, k_w)
+            noise_c     = area-consistent coarsening of noise_F[window] to (k_h,k_w)
+            x_lr_c      = (1 - sigma_inj_c) * x0_c + sigma_inj_c * noise_c
+        v_fr      = model(cell_blocks, x_fr, t_model, qt)            (full-res velocity)
+        x_0_hat  += dt * (noise_F + v_fr)
+
+    Per-token timestep is *not* implemented (a single scalar t_model is passed,
+    derived from a representative full-res ratio r=1 -> t_model=t). With
+    per_leaf_sigma=True each cell is noised at its own level while the model sees
+    one t — a deliberate, flagged mismatch for the demo (set per_leaf_sigma=False
+    to noise every cell at one global level instead).
+
+    ``model`` is a callable ``model(cell_blocks, x_fr, t, qt) -> v_fr`` where
+    ``cell_blocks`` is a list of (b, d, k_h*p, k_w*p)-equivalent spatial blocks
+    (here returned as (b, d, k_h, k_w) latents; the caller patchifies). It
+    handles all packing/patchifying and returns the full-res velocity (b, d, F, F).
+
+    Returns:
+        Tensor of shape (b, d, F, F).
+    """
+    assert qt.H_fr == qt.W_fr, "quadtree sampler assumes a square full-res frame"
+    p = patch_size
+    full_size = qt.H_fr * p          # spatial latent size (state/noise live here)
+
+    # Full-res noise field. Cell noise is derived from it directly (area-consistent
+    # coarsening per window), so the whole family stays cross-resolution-consistent
+    # without enumerating per-cell sizes.
+    noise_fr = sample_noise_fields_2d([full_size], d, b)[0].to(device=device, dtype=dtype)
+
+    ts = torch.linspace(t0, t1, num_steps + 1, device=device, dtype=dtype)
+    x_0_hat = ts[0] * noise_fr                       # full-res state throughout
+
+    for i in range(num_steps):
+        t = ts[i]
+        dt = ts[i + 1] - t
+        sigma = 1.0 - t
+
+        # Single scalar t_model for the model (per-token timestep skipped). Use
+        # the full-res ratio r=1 -> sigma_inj=sigma -> t_model=t.
+        t_model = float(t)
+
+        if float(t) > 0.0:
+            x0_unit = x_0_hat / t
+            x_fr = (1.0 - sigma) * x0_unit + sigma * noise_fr
+            cell_blocks = []
+            for c in qt.cells:
+                # Cell geometry is in grid (token) units; the latent state is
+                # spatial (p× larger). Scale window + resolution to spatial.
+                y0, x0, h, w = c.y0 * p, c.x0 * p, c.h * p, c.w * p
+                kh, kw = c.k_h * p, c.k_w * p
+                r_c = 0.5 * (c.k_h / c.h + c.k_w / c.w)
+                if per_leaf_sigma:
+                    sigma_inj = sigma * r_c / (1.0 - sigma * (1.0 - r_c))
+                else:
+                    sigma_inj = sigma
+                x0_c = area_resample_ref(
+                    x0_unit[:, :, y0:y0 + h, x0:x0 + w], kh, kw
+                )
+                noise_c = _coarsen_window(noise_fr, y0, x0, h, w, kh, kw)
+                cell_blocks.append((1.0 - sigma_inj) * x0_c + sigma_inj * noise_c)
+        else:
+            x_fr = noise_fr
+            cell_blocks = []
+            for c in qt.cells:
+                y0, x0, h, w = c.y0 * p, c.x0 * p, c.h * p, c.w * p
+                kh, kw = c.k_h * p, c.k_w * p
+                cell_blocks.append(_coarsen_window(noise_fr, y0, x0, h, w, kh, kw))
+
+        t_batch = torch.full((b,), t_model, device=device, dtype=dtype)
+        v_fr = model(cell_blocks, x_fr, t_batch, qt)
 
         x_0_hat = x_0_hat + dt * (noise_fr + v_fr)
 

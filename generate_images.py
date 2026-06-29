@@ -57,6 +57,22 @@ def _make_schedules():
 
 SCHEDULES = {0: [16] * 16}
 
+# ── Quadtree (mixed-resolution) demo (Loss-C / use_upsampler models only) ────
+# When USE_QUADTREE is True, the Loss-C path ignores SCHEDULES and instead runs
+# the mixed-resolution sampler: the whole frame is conditioned at base_k token
+# density, with the listed refine windows rendered at higher density. Windows
+# are in *grid (token)* units on the H_fr×W_fr full-res grid and must align to
+# the base cell grid (see build_refinement_quadtree).
+USE_QUADTREE = True
+QUADTREE_STEPS = 16          # number of Euler steps
+QUADTREE_PER_LEAF_SIGMA = True  # noise each cell at its own level (vs one global)
+QUADTREE = dict(
+    base_k=8,                # base density over the full 16×16 grid (coarse)
+    refine=[                 # (y0, x0, h, w, k) in grid units; here: sharp center box
+        (4, 4, 8, 8, 8),
+    ],
+)
+
 # Number of images to generate per (checkpoint, schedule) pair.
 N_IMAGES = 16
 
@@ -174,7 +190,9 @@ from fit.model.fit_model import FiT
 from fit.noise_field_sampler.noise_field_sampler import (
     sample as noise_field_sample,
     sample_upsampler as noise_field_sample_upsampler,
+    sample_upsampler_quadtree as noise_field_sample_upsampler_quadtree,
 )
+from fit.noise_field_sampler.quadtree import build_refinement_quadtree
 from fit.scheduler.transport.utils import patchify, unpatchify
 
 
@@ -288,6 +306,79 @@ def build_upsampler_inputs(x_lr_sp, x_fr_sp, y_full, k_grid, H_fr, W_fr, device,
         size_fullres=size_fr,
     )
 
+
+def build_upsampler_inputs_quadtree(cell_blocks, qt, x_fr_sp, y_full, H_fr, W_fr, device, dtype):
+    """Quadtree counterpart of :func:`build_upsampler_inputs`.
+
+    Every image in the pack shares one quadtree `qt`. Per image, the low-res
+    tokens are the concatenation of its cells' patchified blocks (cell order),
+    forming one document; RoPE uses the physical-center grid so coarse and fine
+    cells live in one coordinate frame. The full-res side is dense as before.
+
+    Args:
+        cell_blocks: list (len = len(qt.cells)) of (n_pack, C, k_h*p, k_w*p)
+            low-res noisy spatial latents, one per cell, already at the cell's
+            own resolution (built by the sampler).
+        qt:    Quadtree shared by all n_pack images.
+        x_fr_sp: (n_pack, C, H_fr*p, W_fr*p) full-res noisy latent.
+        y_full:  (n_pack,) labels (cond + null concatenated).
+    Returns dict of model_kwargs (including `cells` for FiT._upsample_quadtree).
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+    from fit.noise_field_sampler.quadtree import quadtree_grid
+
+    n_pack = x_fr_sp.shape[0]
+    seq_lr = qt.n_tokens                                    # tokens per image
+    N_total = math.ceil((n_pack * seq_lr) / PAD_TO_MULTIPLE) * PAD_TO_MULTIPLE
+
+    # Per-image packed low-res tokens: concatenate each cell's patchified tokens
+    # in cell order (matches Quadtree.placement_cells offsets).
+    per_cell_tok = [patchify(blk, PATCH_SIZE) for blk in cell_blocks]  # each (n_pack, k_h*k_w, Dtok)
+    tok_img = torch.cat(per_cell_tok, dim=1)               # (n_pack, seq_lr, Dtok)
+    Dtok = tok_img.shape[-1]
+
+    feat = torch.zeros(1, N_total, Dtok, device=device, dtype=dtype)
+    grid = torch.zeros(1, 2, N_total, device=device, dtype=dtype)   # float: physical coords
+    mask = torch.zeros(1, N_total, device=device, dtype=dtype)
+    doc_ids = torch.full((1, N_total), -1, device=device, dtype=torch.int32)
+    # RoPE scale uses size.max over the pack; the physical grid spans the full
+    # frame, so report each image's size as the full-res size.
+    size_lr = torch.tensor([H_fr, W_fr], dtype=torch.int32, device=device)
+    size_lr = size_lr.view(1, 1, 2).repeat(1, n_pack, 1)   # (1, n_pack, 2)
+    y_pack = y_full.to(torch.int).view(1, n_pack)
+    t_pack = torch.zeros(1, n_pack, device=device, dtype=dtype)
+
+    g_phys = quadtree_grid(qt, device, dtype)              # (2, seq_lr) physical centers
+    offset = 0
+    for img_idx in range(n_pack):
+        feat[0, offset:offset + seq_lr] = tok_img[img_idx]
+        grid[0, :, offset:offset + seq_lr] = g_phys
+        mask[0, offset:offset + seq_lr] = 1
+        doc_ids[0, offset:offset + seq_lr] = img_idx
+        offset += seq_lr
+
+    def doc_mask_mod(b, h, q_idx, kv_idx):
+        return doc_ids[b, q_idx] == doc_ids[b, kv_idx]
+    block_mask = create_block_mask(doc_mask_mod, 1, None, N_total, N_total, device=device)
+
+    # --- dense full-res inputs (unchanged) ---
+    x_fr_tok = patchify(x_fr_sp, PATCH_SIZE)               # (n_pack, N_fr, Dtok)
+    grid_fr = _single_grid(H_fr, W_fr, device, torch.long)
+    grid_fr = grid_fr.unsqueeze(0).repeat(n_pack, 1, 1)
+    mask_fr = torch.ones(n_pack, H_fr * W_fr, device=device, dtype=dtype)
+    size_fr = torch.tensor([H_fr, W_fr], device=device, dtype=torch.int32)
+    size_fr = size_fr.view(1, 1, 2).repeat(1, n_pack, 1)
+
+    # One cell list per image (all share the same quadtree).
+    cells = [qt.placement_cells() for _ in range(n_pack)]
+
+    return dict(
+        x=feat, grid=grid, mask=mask, size=size_lr, doc_ids=doc_ids,
+        block_mask=block_mask, y=y_pack, t_pack=t_pack,
+        x_fullres=x_fr_tok, grid_fullres=grid_fr, mask_fullres=mask_fr,
+        size_fullres=size_fr, cells=cells,
+    )
+
 # ──────────────────────────── main ───────────────────────────────────────────
 
 def main():
@@ -364,7 +455,49 @@ def main():
                 # packed grid sizes by multiplying with PATCH_SIZE.
                 torch.manual_seed(GLOBAL_SEED + generated)
 
-                if loss_type == "C":
+                if loss_type == "C" and USE_QUADTREE:
+                    # Mixed-resolution (quadtree) learned-upsampler path. The
+                    # state stays full-res; the low-res conditioning is built
+                    # per-cell at varying densities. model_fn receives the list
+                    # of per-cell spatial blocks + the quadtree and returns the
+                    # full-res velocity.
+                    qt = build_refinement_quadtree(
+                        H_fr, W_fr, QUADTREE["base_k"], QUADTREE["refine"]
+                    )
+
+                    def model_fn_qt(cell_blocks, x_fr_sp, t, qt):
+                        # CFG-double the full-res input, the per-cell blocks, and
+                        # the labels (cond + null), mirroring build_upsampler_inputs.
+                        x_fr2 = torch.cat([x_fr_sp, x_fr_sp], 0)
+                        cell_blocks2 = [torch.cat([cb, cb], 0) for cb in cell_blocks]
+                        kw = build_upsampler_inputs_quadtree(
+                            cell_blocks2, qt, x_fr2, y_full, H_fr, W_fr, DEVICE, dtype
+                        )
+                        n_pack = x_fr2.shape[0]
+                        t_pack = t[:1].repeat(1, n_pack)
+                        v = model(
+                            kw['x'], t_pack, kw['y'], kw['grid'], kw['mask'],
+                            kw['size'], doc_ids=kw['doc_ids'], block_mask=kw['block_mask'],
+                            x_fullres=kw['x_fullres'], grid_fullres=kw['grid_fullres'],
+                            mask_fullres=kw['mask_fullres'], size_fullres=kw['size_fullres'],
+                            cells=kw['cells'],
+                        )                                   # (n_pack, N_fr, p**2*C)
+                        v_cond, v_uncond = v.chunk(2, dim=0)
+                        v_pred = v_uncond + CFG_SCALE * (v_cond - v_uncond)
+                        return unpatchify(v_pred, (H_fr * PATCH_SIZE, W_fr * PATCH_SIZE), PATCH_SIZE)
+
+                    x1_sp = noise_field_sample_upsampler_quadtree(
+                        model_fn_qt,
+                        qt,
+                        num_steps=QUADTREE_STEPS,
+                        b=bs,
+                        d=C_IN,
+                        patch_size=PATCH_SIZE,
+                        per_leaf_sigma=QUADTREE_PER_LEAF_SIGMA,
+                        device=DEVICE,
+                        dtype=dtype,
+                    )
+                elif loss_type == "C":
                     # Learned-upsampler model: the integration state stays full-res;
                     # the schedule size only sets the resolution of the low-res
                     # conditioning input. model_fn receives both resolutions and
