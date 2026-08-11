@@ -93,13 +93,32 @@ class Quadtree:
         return out
 
 
-def quadtree_grid(qt: Quadtree, device, dtype=torch.float32) -> torch.Tensor:
-    """Physical-center RoPE grid for one quadtree's packed token sequence.
+def quadtree_grid(qt: Quadtree, device, dtype=torch.float32,
+                  convention: str = "physical") -> torch.Tensor:
+    """RoPE grid for one quadtree's packed token sequence.
 
     Returns a (2, n_tokens) tensor [w_coord; h_coord] (w-fast/h-slow within each
-    cell, cells concatenated in order) holding each token's physical *center*
-    coordinate in full-res token units. This matches the dataset grid layout
+    cell, cells concatenated in order). This matches the dataset grid layout
     (w first, h second) consumed by VisionRotaryEmbedding.
+
+    Two conventions:
+
+    * ``"physical"`` (default): each token's physical *center* coordinate in
+      full-res token units, ``c.y0 + (a + 0.5) * c.h / c.k_h``. Coarse cells get
+      spacing > 1 (the true physical spacing) so coarse and fine cells share one
+      frame. NOTE: this is *out of distribution* for the pretrained model — the
+      dataset always uses integer-index grids with spacing 1 (see
+      in1k_latent_dataset; verified against the stored .safetensors grids, which
+      are plain arange(H) x arange(W) for every image size). Resolution is
+      carried by the size embedder, not by RoPE spacing.
+
+    * ``"index"``: the physical-center grid rescaled so the finest spacing
+      becomes 1, i.e. the in-distribution integer-index convention. For a uniform
+      quadtree this is bit-identical to ``_single_grid(k, k)`` (the uniform
+      half-res path), so it lets us A/B test whether RoPE spacing drives the
+      mixed-resolution artifacts. For mixed densities it collapses the per-axis
+      coordinates onto the finest grid (coarse and fine tokens no longer
+      physically registered — but the model never used RoPE for that anyway).
 
     Float dtype is required: coarse-cell centers are fractional, and the model
     must run the *online* RoPE path (online_rope=True), which multiplies grid by
@@ -116,6 +135,19 @@ def quadtree_grid(qt: Quadtree, device, dtype=torch.float32) -> torch.Tensor:
         h_coords.append(gh.reshape(-1))
         w_coords.append(gw.reshape(-1))
     grid = torch.stack([torch.cat(w_coords), torch.cat(h_coords)])
+
+    if convention == "index":
+        # Rescale each axis so the finest spacing maps to integer steps of 1,
+        # anchored at 0 — the dataset's plain arange convention. For a uniform
+        # quadtree (single density) this reproduces _single_grid(k, k) exactly.
+        for ax in (0, 1):
+            vals = grid[ax]
+            uniq = torch.unique(vals)
+            step = torch.diff(uniq).min() if uniq.numel() > 1 else torch.tensor(1.0)
+            grid[ax] = ((vals - uniq.min()) / step).round()
+    elif convention != "physical":
+        raise ValueError(f"unknown grid convention {convention!r}")
+
     return grid.to(device=device, dtype=dtype)
 
 

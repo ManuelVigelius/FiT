@@ -297,9 +297,19 @@ def sample_upsampler_quadtree(
         dt = ts[i + 1] - t
         sigma = 1.0 - t
 
-        # Single scalar t_model for the model (per-token timestep skipped). Use
-        # the full-res ratio r=1 -> sigma_inj=sigma -> t_model=t.
-        t_model = float(t)
+        # Single scalar t_model for the model (per-token timestep skipped).
+        # TEMP: instead of the full-res ratio (r=1 -> t_model=t), use an
+        # area-weighted effective ratio so the announced timestep matches the
+        # cells' actual noise level. For a *uniform* quadtree every cell shares
+        # one ratio r, so r_eff == r and t_model == 1 - sigma_inj exactly matches
+        # the working sample_upsampler path. For mixed quadtrees this is a single
+        # -scalar approximation (the real fix is a per-token timestep).
+        total_area = sum(c.h * c.w for c in qt.cells)
+        r_eff = sum((c.h * c.w) * (0.5 * (c.k_h / c.h + c.k_w / c.w))
+                    for c in qt.cells) / total_area
+        sigma_inj_eff = sigma * r_eff / (1.0 - sigma * (1.0 - r_eff))
+        t_model = float(1.0 - sigma_inj_eff)
+
 
         if float(t) > 0.0:
             x0_unit = x_0_hat / t

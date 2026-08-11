@@ -8,8 +8,9 @@ rectangle per image and stretches it over the whole full-res output
 want a *quadtree*: one image is partitioned into rectangular cells, each cell
 carrying its own low-res token resolution. The transformer and packing are
 unchanged (one image = one document); only the upsample/placement step changes —
-each cell's tokens are bicubically upsampled into *its own sub-window* of the
-full-res grid and composited.
+each cell's tokens are placed into *its own sub-window* of the full-res grid by
+nearest-neighbour block fill (each token covers an (h/k_h)x(w/k_w) block) and
+composited.
 
 This script isolates that placement step. It does NOT touch the model: it
 reimplements the per-cell windowed grid_sample as a standalone function
@@ -19,14 +20,12 @@ and checks two properties that must hold before we graft it into the model:
   1. **Degenerate equivalence.** A single full-cell quadtree (one cell covering
      the whole frame at full-res token density) reproduces the identity: the
      output equals the input tokens, laid out on the full-res grid. (And a single
-     cell at a *coarse* density reproduces the existing single-rectangle
-     `_upsample_packed` behaviour — checked against a direct grid_sample.)
+     coarse cell reproduces NN block fill — each token a constant block.)
 
   2. **Partition / placement correctness.** For a multi-cell quadtree that tiles
      the frame exactly, every full-res output token is written exactly once
-     (no gaps, no overlaps), and each cell's window contains the bicubic
-     upsampling of *that cell's* tokens (matched against an independent
-     per-window grid_sample).
+     (no gaps, no overlaps), and each cell's window contains the NN block fill of
+     *that cell's* tokens (matched against an independent per-window reference).
 
 Cell representation (full-res token units on the H_fr x W_fr grid):
     Cell = (offset, k_h, k_w, y0, x0, h, w)
@@ -53,7 +52,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # The placement function under test (model-free reimplementation).
 # --------------------------------------------------------------------------- #
 def upsample_quadtree(x, cells, H_fr, W_fr, D):
-    """Bicubically upsample each quadtree cell into its full-res window.
+    """Quadtree nearest-neighbour block fill: place each cell into its window.
+
+    Each token of a cell owns an (h/k_h) x (w/k_w) full-res block and its value
+    is copied to every position in that block (no interpolation). A full-res
+    (k==window) cell is the identity; a 1-token cell becomes a constant block.
 
     Args:
         x:     (1, N_total, D) packed low-res tokens for ONE image (one document).
@@ -68,7 +71,7 @@ def upsample_quadtree(x, cells, H_fr, W_fr, D):
         written: (H_fr, W_fr) int tensor counting writes per output cell
                  (returned for the test's partition check; the model would drop it).
     """
-    device, dtype = x.device, x.dtype
+    device = x.device
     out = x.new_zeros(D, H_fr, W_fr)
     written = torch.zeros(H_fr, W_fr, dtype=torch.long, device=device)
 
@@ -77,15 +80,10 @@ def upsample_quadtree(x, cells, H_fr, W_fr, D):
         tok = x[0, offset:offset + n]                       # (k_h*k_w, D)
         cell = tok.transpose(0, 1).reshape(D, k_h, k_w)     # (D, k_h, k_w)
 
-        # Upsample this cell from (k_h, k_w) to its window extent (h, w) with the
-        # same bicubic/align_corners convention as _upsample_packed.
-        if (k_h, k_w) == (h, w):
-            win = cell                                      # no-op at native density
-        else:
-            win = nn.functional.interpolate(
-                cell.unsqueeze(0).float(), size=(h, w),
-                mode='bicubic', align_corners=True,
-            ).squeeze(0).to(dtype)                          # (D, h, w)
+        # NN block fill: each token covers an (h/k_h) x (w/k_w) block.
+        assert h % k_h == 0 and w % k_w == 0
+        rh, rw = h // k_h, w // k_w
+        win = cell.repeat_interleave(rh, dim=1).repeat_interleave(rw, dim=2)
 
         out[:, y0:y0 + h, x0:x0 + w] = win
         written[y0:y0 + h, x0:x0 + w] += 1
@@ -136,18 +134,16 @@ def main():
     ok = torch.allclose(x_fr, x) and (written == 1).all()
     all_ok &= report("output equals input, every pixel written once", ok)
 
-    # --- Test 2: single coarse cell == direct full-frame grid_sample --------
-    print("Test 2: single coarse cell matches a direct bicubic upsample")
+    # --- Test 2: single coarse cell == NN block fill ------------------------
+    print("Test 2: single coarse cell matches NN block fill")
     H_fr = W_fr = 16
     x, cells, blocks = pack_cells([(4, 4, 0, 0, 16, 16)], D)
     x_fr, written = upsample_quadtree(x, cells, H_fr, W_fr, D)
-    ref = nn.functional.interpolate(
-        blocks[0].unsqueeze(0).float(), size=(16, 16),
-        mode='bicubic', align_corners=True,
-    ).squeeze(0)                                            # (D,16,16)
+    # 4x4 tokens over a 16x16 window -> each token a constant 4x4 block.
+    ref = blocks[0].repeat_interleave(4, dim=1).repeat_interleave(4, dim=2)  # (D,16,16)
     ref_tok = ref.reshape(D, 256).transpose(0, 1).unsqueeze(0).to(x.dtype)
-    ok = torch.allclose(x_fr, ref_tok, atol=1e-6) and (written == 1).all()
-    all_ok &= report("coarse cell upsample matches reference grid_sample", ok)
+    ok = torch.allclose(x_fr, ref_tok) and (written == 1).all()
+    all_ok &= report("coarse cell upsample matches NN block fill", ok)
 
     # --- Test 3: multi-cell quadtree, exact partition + per-cell content ----
     print("Test 3: 4-quadrant quadtree (mixed resolution) tiles exactly")
@@ -166,27 +162,24 @@ def main():
     part_ok = (written == 1).all()
     report("partition: every full-res token written exactly once", part_ok)
 
-    # 3b. each window holds the independent upsample of its own cell.
+    # 3b. each window holds the NN block fill of its own cell.
     out = x_fr[0].transpose(0, 1).reshape(D, H_fr, W_fr)
     content_ok = True
     for (block, (offset, k_h, k_w, y0, x0, h, w)) in zip(blocks, cells):
-        if (k_h, k_w) == (h, w):
-            ref_win = block.to(out.dtype)
-        else:
-            ref_win = nn.functional.interpolate(
-                block.unsqueeze(0).float(), size=(h, w),
-                mode='bicubic', align_corners=True,
-            ).squeeze(0).to(out.dtype)
+        ref_win = block.repeat_interleave(h // k_h, dim=1).repeat_interleave(
+            w // k_w, dim=2).to(out.dtype)
         got_win = out[:, y0:y0 + h, x0:x0 + w]
-        content_ok &= torch.allclose(got_win, ref_win, atol=1e-6)
-    report("content: each window = independent upsample of its cell", content_ok)
+        content_ok &= torch.allclose(got_win, ref_win)
+    report("content: each window = NN block fill of its cell", content_ok)
     all_ok &= part_ok and content_ok
 
     # --- Test 4: the actual model method FiT._upsample_quadtree --------------
-    # Validates the graft end-to-end: (4a) a single full-frame cell reproduces
-    # the existing _upsample_packed output exactly (regression guard for the
-    # uniform path), and (4b) the model method agrees with the standalone
-    # reference on a mixed-resolution quadtree.
+    # Validates the graft end-to-end: (4a) a single full-*resolution* cell (k ==
+    # frame) reproduces _upsample_packed exactly — at native density both paths
+    # are the identity, so this still guards the no-op case; and (4b) the model
+    # method agrees with the standalone NN reference on a mixed-resolution
+    # quadtree. (A *coarse* single cell no longer matches _upsample_packed: the
+    # quadtree path is NN block fill, the packed path is bicubic — intentional.)
     print("Test 4: FiT._upsample_quadtree (model method)")
     from fit.model.fit_model import FiT
 
@@ -202,33 +195,31 @@ def main():
     ).eval()
     size_fr = torch.tensor([H_fr, W_fr], dtype=torch.int32).view(1, 1, 2)
 
-    # 4a. Single full-frame coarse cell (k=4 over the whole 16x16 frame), one
-    # image. Build packed inputs both ways and compare the two model methods.
-    k = 4
+    # 4a. Single full-*resolution* cell (k == frame): both paths are the identity
+    # placement, so the NN quadtree path and bicubic packed path coincide.
+    k = H_fr
     tok = torch.randn(1, k * k, D, dtype=torch.float64)
-    # _upsample_packed inputs: doc_ids + per-image size (k, k).
     doc_ids = torch.zeros(1, k * k, dtype=torch.int32)
     size_lr = torch.tensor([k, k], dtype=torch.int32).view(1, 1, 2)
     with torch.no_grad():
         ref = model._upsample_packed(tok, doc_ids, size_lr, size_fr, 1, D)
-        # _upsample_quadtree inputs: one cell covering the whole frame.
         cells = [[(0, k, k, 0, 0, H_fr, W_fr)]]
         got = model._upsample_quadtree(tok, doc_ids, size_fr, 1, D, cells)
-    reg_ok = torch.allclose(got, ref, atol=1e-6)
-    all_ok &= report("single full-frame cell == _upsample_packed (regression)", reg_ok)
+    # _upsample_packed bicubic-resamples even at native density, leaving ~2e-6
+    # float noise; the NN quadtree path is exact identity. Compare loosely.
+    reg_ok = torch.allclose(got, ref, atol=1e-5)
+    all_ok &= report("single full-res cell == _upsample_packed (identity)", reg_ok)
 
-    # 4b. Mixed quadtree through the model method (batched grid_sample) vs the
-    # standalone interpolate reference. The model uses grid_sample for parallelism
-    # while the reference uses interpolate; the two bicubic implementations agree
-    # up to float noise (~3e-6), so compare with a loosened tolerance.
+    # 4b. Mixed quadtree through the model method vs the standalone NN reference
+    # (both are exact integer copies — no resampling — so this is exact).
     x, cells_flat, _ = pack_cells(specs, D)               # reuse Test-3 specs
     doc_ids = torch.zeros(1, x.shape[1], dtype=torch.int32)
     cells_model = [cells_flat]                            # one image
     with torch.no_grad():
         got = model._upsample_quadtree(x, doc_ids, size_fr, 1, D, cells_model)
     ref_fr, _ = upsample_quadtree(x, cells_flat, H_fr, W_fr, D)
-    match_ok = torch.allclose(got, ref_fr, atol=1e-5)
-    all_ok &= report("model method (grid_sample) matches interpolate reference", match_ok)
+    match_ok = torch.allclose(got, ref_fr)
+    all_ok &= report("model method matches NN block-fill reference", match_ok)
 
     all_ok &= test_quadtree_grid()
     all_ok &= test_end_to_end()
