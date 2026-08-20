@@ -99,7 +99,7 @@ def compress(model, x_t, t, threshold):
     return compress_from_variance(x_t, var, threshold)
 
 
-def compress_from_variance(x_t, var, threshold):
+def compress_from_variance(x_t, var, threshold, x_target=None):
     """Patchified quadtree compression from *precomputed* per-scale variance grids.
 
     x_t       : (C, H, W) noisy latent, H == W (32 for this model).
@@ -107,8 +107,14 @@ def compress_from_variance(x_t, var, threshold):
                 (H/N_s, W/N_s) for N_s in REGION_SIZES (2, 4, 8) — i.e. exactly one
                 image's slice of `predict_variance`'s output.
     threshold : regions with predicted variance < threshold are compressible.
+    x_target  : optional (C, H, W) *second* latent (e.g. the clean x0) to compress
+                on the SAME quadtree structure. Its leaf values are mean-pooled
+                identically and emitted token-aligned with `tokens`. Used to build
+                a clean-target training signal without re-deciding the tree.
 
-    Returns (tokens, positions, sizes); see module docstring for shapes/semantics.
+    Returns (tokens, positions, sizes) — or (tokens, positions, sizes, targets)
+    when `x_target` is given, where `targets` is (num_tokens, 4*C) aligned with
+    `tokens`. See the module docstring for shapes/semantics.
 
     Split out from `compress` so the variance predictor can be run once on a whole
     batch and the (per-image, variable-length) quadtree walk done separately.
@@ -120,12 +126,18 @@ def compress_from_variance(x_t, var, threshold):
     # Per-size leaf values (channel-mean pooled latent) on each leaf grid; n=1 is
     # the identity, i.e. the raw per-pixel latent (lossless level).
     val_by_size = {n: _region_means(x_t, n) for n in LEAF_SIZES}     # (C, H/n, W/n)
+    # Same pooling for the optional parallel target latent (same tree, same means).
+    tgt_by_size = (
+        {n: _region_means(x_target, n) for n in LEAF_SIZES}
+        if x_target is not None else None
+    )
 
     # "flat[n][i, j]" : is the n x n region (i, j) compressible on its own? Only the
     # model's predicted sizes have a flatness test; size 1 has none (never compressed).
     flat_by_size = {n: (var_by_size[n] < threshold) for n in REGION_SIZES}
 
     tokens, positions, sizes = [], [], []
+    targets = [] if x_target is not None else None
 
     def patch_is_flat(n, ly, lx):
         """Are all four size-n leaves of the patch anchored at leaf (ly, lx) flat?
@@ -137,13 +149,16 @@ def compress_from_variance(x_t, var, threshold):
         f = flat_by_size[n]
         return bool(f[ly:ly + 2, lx:lx + 2].all())
 
-    def emit(n, ly, lx):
-        """Emit one token for the patch of four size-n leaves at leaf-grid (ly, lx)."""
-        vals = val_by_size[n]                        # (C, H/n, W/n)
+    def _leaf_token(vals, ly, lx):
         # row-major 2x2 leaf block -> concat 4 leaves along channel axis
         block = vals[:, ly:ly + 2, lx:lx + 2]        # (C, 2, 2)
-        token = block.permute(1, 2, 0).reshape(4 * C)  # (2,2,C)->(4C,), row-major
-        tokens.append(token)
+        return block.permute(1, 2, 0).reshape(4 * C)  # (2,2,C)->(4C,), row-major
+
+    def emit(n, ly, lx):
+        """Emit one token for the patch of four size-n leaves at leaf-grid (ly, lx)."""
+        tokens.append(_leaf_token(val_by_size[n], ly, lx))
+        if targets is not None:
+            targets.append(_leaf_token(tgt_by_size[n], ly, lx))
         # center of the patch footprint in latent-pixel coords: 2 leaves * n px wide,
         # anchored at leaf (ly, lx) which starts at pixel (ly*n, lx*n).
         cy = ly * n + n                              # (ly*n + (ly+2)*n) / 2
@@ -180,6 +195,8 @@ def compress_from_variance(x_t, var, threshold):
     tokens = torch.stack(tokens)                     # (num_tokens, 4C)
     positions = torch.stack(positions)               # (num_tokens, 2)
     sizes = torch.tensor(sizes, dtype=torch.long, device=device)  # (num_tokens,)
+    if targets is not None:
+        return tokens, positions, sizes, torch.stack(targets)
     return tokens, positions, sizes
 
 

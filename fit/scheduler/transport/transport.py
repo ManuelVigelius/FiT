@@ -264,6 +264,15 @@ class Transport:
         if 'feature_fullres' in model_kwargs:
             return self._loss_upsampler(model, x1, model_kwargs)
 
+        # Quadtree path: the dataset noised the latent *before* compression (the
+        # tree structure depends on the noise draw), so we cannot re-noise here.
+        # The model input x1 is the already-noisy compressed feature, and the
+        # clean x0 compressed on the same tree is supplied as `target`. The model
+        # predicts the clean tokens; the velocity objective is recovered by a
+        # 1/(1-t)^2 weight (see _loss_quadtree).
+        if 'target' in model_kwargs:
+            return self._loss_quadtree(model, x1, model_kwargs)
+
         # Run the appropriate forward pass.
         t_expanded = sigma_t = None
         if doc_ids is not None:
@@ -319,7 +328,54 @@ class Transport:
         denom = mask.expand_as(sq_err).sum(dim=(1, 2)).clamp(min=1)
         per_image = sq_err.sum(dim=(1, 2)) / denom  # (n_pack,)
         return {'loss': per_image.mean().unsqueeze(0), 'pred': v_fr}
-    
+
+    def _loss_quadtree(self, model, feature, model_kwargs):
+        """Clean-target (x1-prediction) loss for the packed quadtree path.
+
+        The dataset already noised the latent and compressed it; `feature` is the
+        packed *noisy* tokens (xt) and `target` is the *clean* tokens (x1) on the
+        same tree. The model predicts x1 directly (so the upsampling stack never
+        has to reproduce high-frequency noise). We recover the velocity objective
+        in expectation with a time-dependent weight:
+
+            xt = t·x1 + (1-t)·x0,   v = x1 - x0 = (x1 - xt)/(1-t)
+            a model predicting x̂1 implies v̂ = (x̂1 - xt)/(1-t), hence
+            ‖v̂ - v‖² = ‖x̂1 - x1‖² / (1-t)²
+
+        so the velocity loss equals a clean-target MSE weighted by 1/(1-t)².
+
+        Timestep convention: the dataset stores t_ds with t_ds=0 clean, t_ds=1
+        noise (xt = (1-t_ds)·x1 + t_ds·x0). We convert to the transport ICPlan
+        convention t = 1 - t_ds (t=0 noise, t=1 clean) so x1 is weighted by t and
+        the noise weight is (1-t) = t_ds. The model is conditioned on the same
+        transport-convention t. As t→1 (clean) the weight 1/(1-t)² diverges, so we
+        clamp (1-t) with the transport's train_eps, exactly as the standard path.
+        """
+        target = model_kwargs['target']                  # (1, N, 4C) clean x1
+        doc_ids = model_kwargs['doc_ids']
+        t_ds = model_kwargs['t']                          # (1, n_pack) dataset t
+        t = 1.0 - t_ds                                    # transport convention
+
+        # Forward: model predicts x1 from the noisy feature, conditioned on t.
+        fwd = {k: v for k, v in model_kwargs.items()
+               if k not in ('target', 'n_pack', 't')}
+        x1_hat = model(feature, t, **fwd)                 # (1, N, 4C)
+
+        # Per-token velocity weight 1/(1-t)² = 1/t_ds², expanded from per-image t.
+        # The weight diverges as t_ds→0 (clean end), so floor the noise weight with
+        # a fixed epsilon. check_interval's t0 is 0 on the ICPlan velocity path, so
+        # we clamp with train_eps directly rather than relying on it.
+        eps = self.train_eps if self.train_eps else 1e-3
+        B = feature.shape[0]
+        safe_ids = doc_ids.clamp(min=0).long()            # (1, N)
+        t_ds_tok = t_ds[torch.arange(B, device=feature.device)[:, None], safe_ids]
+        noise_w = t_ds_tok.clamp(min=eps)                 # (1, N)  == (1 - t)
+        weight = (1.0 / (noise_w ** 2)).unsqueeze(-1)     # (1, N, 1)
+
+        sq_err = weight * (x1_hat - target) ** 2          # (1, N, 4C)
+        loss = self._mean_per_image(sq_err, doc_ids, model_kwargs, feature)
+        return {'loss': loss, 'pred': x1_hat}
+
 
     def get_drift(
         self

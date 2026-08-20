@@ -142,7 +142,9 @@ class QuadtreeRawLatentDataset(Dataset):
 
         # label: stored per-file (see LatentVarianceDataset / safetensors "label").
         label = self._load_label(idx)
-        return dict(x_t=x_t, t=t.float(), label=label)
+        # x0 (the clean latent) rides along: the packer compresses it on the SAME
+        # quadtree structure decided from x_t to produce the clean training target.
+        return dict(x_t=x_t, x0=x0, t=t.float(), label=label)
 
     def _load_label(self, idx):
         from safetensors import safe_open
@@ -158,9 +160,10 @@ class QuadtreeRawLatentDataset(Dataset):
 def _raw_collate(samples):
     """Stack a plain batch of raw latents for a single GPU forward pass."""
     x_t = torch.stack([s['x_t'] for s in samples])          # (B, C, H, W)
+    x0 = torch.stack([s['x0'] for s in samples])            # (B, C, H, W) clean
     t = torch.stack([s['t'] for s in samples])              # (B,)
     label = torch.stack([s['label'] for s in samples])      # (B,)
-    return dict(x_t=x_t, t=t, label=label)
+    return dict(x_t=x_t, x0=x0, t=t, label=label)
 
 
 # --------------------------------------------------------------------------- #
@@ -193,25 +196,30 @@ class QuadtreePackedIterator:
     next `max_seq_len` sequence.
 
     Emitted sequence dict (B=1, packed) — mirrors `packed_collate_fn`:
-        feature  (1, N_total, 4C)   packed quadtree tokens
-        grid     (1, 2, N_total)    per-token (y, x) center positions
+        feature  (1, N_total, 4C)   packed quadtree tokens (noisy x_t)
+        target   (1, N_total, 4C)   clean x0 compressed on the SAME tree (loss target)
+        grid     (1, 2, N_total)    per-token (y, x) center in patch units
         tsize    (1, N_total)       per-token leaf side (1/2/4/8) — compression level
         mask     (1, N_total)       1 for valid tokens, 0 for padding
         doc_ids  (1, N_total)       image index within sequence, -1 for padding
         label    (1, n_pack)        class label per packed image
         t        (1, n_pack)        timestep per packed image
+        size     (1, n_pack, 2)     finest (size-1) patch grid extent — RoPE scale
         n_pack   (1,)               number of images packed
     """
 
     def __init__(self, raw_loader, model, *, max_seq_len=1024,
                  pad_to_multiple=128, device='cuda',
-                 refill_target=None, latent_channels=4):
+                 refill_target=None, latent_channels=4, crop=32):
         self.raw_loader = raw_loader
         self.model = model.to(device).eval()
         self.device = device
         self.max_seq_len = max_seq_len
         self.pad_to_multiple = pad_to_multiple
         self.latent_channels = latent_channels
+        # Latent crop side (latent px). The finest patch grid is crop/2 per side
+        # (patchify pairs 2x2 latent px into one token); used as the RoPE scale.
+        self.crop = crop
         # Pool must be able to cover one full sequence before we emit. Refill until
         # the pooled token count is at least this many tokens (or the source drips
         # dry). Default: overshoot max_seq_len by 50% so a single refill usually
@@ -237,6 +245,7 @@ class QuadtreePackedIterator:
                 break
 
             x_t = batch['x_t'].to(self.device, non_blocking=True)   # (B, C, H, W)
+            x0 = batch['x0'].to(self.device, non_blocking=True)     # (B, C, H, W) clean
             t = batch['t'].to(self.device, non_blocking=True)       # (B,)
             labels = batch['label']                                 # (B,) cpu
 
@@ -244,13 +253,15 @@ class QuadtreePackedIterator:
             # is the expensive part and is trivially batched). The quadtree walk is
             # inherently per-image / variable length, so we loop over the batch and
             # feed each image its own slice of the variance grids to
-            # `compress_from_variance` — no per-image model calls.
+            # `compress_from_variance` — no per-image model calls. The clean latent
+            # x0 rides along as `x_target` so it is compressed on the SAME tree,
+            # giving a token-aligned clean training target.
             threshold = self._threshold()
             var = predict_variance(self.model, x_t, t)   # list of (B, H/N, W/N)
             for i in range(x_t.shape[0]):
                 var_i = [v[i] for v in var]              # per-image variance grids
-                tokens, positions, sizes = compress_from_variance(
-                    x_t[i], var_i, threshold=threshold)
+                tokens, positions, sizes, targets = compress_from_variance(
+                    x_t[i], var_i, threshold=threshold, x_target=x0[i])
                 n_i = int(tokens.shape[0])
                 # Guard: an image whose *minimum* token count already exceeds the
                 # sequence budget can never be packed whole. Skip with a warning
@@ -258,7 +269,7 @@ class QuadtreePackedIterator:
                 if n_i > self.max_seq_len:
                     continue
                 self._pool.append(dict(
-                    tokens=tokens, positions=positions, sizes=sizes,
+                    tokens=tokens, positions=positions, sizes=sizes, targets=targets,
                     label=labels[i], t=t[i].detach().float().cpu()))
                 self._pool_tokens += n_i
 
@@ -300,29 +311,42 @@ class QuadtreePackedIterator:
 
         dev = self.device
         feat = torch.zeros(1, N_total, C4, device=dev)
+        tgt = torch.zeros(1, N_total, C4, device=dev)   # clean target, same layout
         grid = torch.zeros(1, 2, N_total, device=dev)
         tsize = torch.zeros(1, N_total, dtype=torch.long, device=dev)
         mask = torch.zeros(1, N_total, dtype=torch.uint8, device=dev)
         doc = torch.full((1, N_total), -1, dtype=torch.int32, device=dev)
         label = torch.full((1, n_pack), -1, dtype=torch.int64, device=dev)
         tvec = torch.zeros(1, n_pack, dtype=torch.float32, device=dev)
+        # Per-image RoPE scale: the finest (size-1) patch grid extent. The
+        # quadtree tiles a `crop`-latent-pixel image and patchify pairs 2x2 latent
+        # pixels into one finest token, so the finest grid is (crop/2) per side.
+        size = torch.zeros(1, n_pack, 2, dtype=torch.float32, device=dev)
+        grid_side = float(self.crop // 2)
 
         offset = 0
         for img_idx, p in enumerate(packed):
             n_i = int(p['tokens'].shape[0])
             sl = slice(offset, offset + n_i)
             feat[0, sl] = p['tokens'].to(dev)
-            grid[0, :, sl] = p['positions'].to(dev).transpose(0, 1)   # (2, n_i)
+            tgt[0, sl] = p['targets'].to(dev)
+            # `positions` are patch centers in latent-pixel coords; dividing by 2
+            # maps them to patch-unit coordinates where two adjacent uncompressed
+            # (size-1) tokens are distance 1 apart and a size-N token is N apart,
+            # matching the area each covers. Coarse tokens land on half-cell
+            # midpoints (handled by online RoPE, which accepts fractional coords).
+            grid[0, :, sl] = p['positions'].to(dev).transpose(0, 1) / 2.0   # (2, n_i)
             tsize[0, sl] = p['sizes'].to(dev)
             mask[0, sl] = 1
             doc[0, sl] = img_idx
             label[0, img_idx] = p['label'].to(dev)
             tvec[0, img_idx] = p['t'].to(dev)
+            size[0, img_idx] = grid_side
             offset += n_i
 
         return dict(
-            feature=feat, grid=grid, tsize=tsize, mask=mask, doc_ids=doc,
-            label=label, t=tvec,
+            feature=feat, target=tgt, grid=grid, tsize=tsize, mask=mask, doc_ids=doc,
+            label=label, t=tvec, size=size,
             n_pack=torch.tensor([n_pack], dtype=torch.int32, device=dev),
         )
 
@@ -384,6 +408,7 @@ class INQuadtreeLatentLoader:
             pad_to_multiple=self.pad_to_multiple,
             device=device,
             latent_channels=self.latent_channels,
+            crop=self.crop,
         )
         it.threshold = self.threshold
         return it
@@ -408,13 +433,14 @@ def _smoke_test():
         def __getitem__(self, i):
             g = torch.Generator().manual_seed(i)
             return dict(x_t=torch.randn(C, H, H, generator=g),
+                        x0=torch.randn(C, H, H, generator=g),
                         t=torch.rand((), generator=g).float(),
                         label=torch.tensor(i % 10, dtype=torch.long))
 
     raw_loader = DataLoader(_FakeRaw(), batch_size=8, collate_fn=_raw_collate)
     it = QuadtreePackedIterator(raw_loader, model, max_seq_len=512,
                                 pad_to_multiple=128, device=device,
-                                latent_channels=C)
+                                latent_channels=C, crop=H)
     it.threshold = 0.5
 
     seen_docs = 0
@@ -423,8 +449,11 @@ def _smoke_test():
         n_pack = int(batch['n_pack'])
         valid = int(batch['mask'].sum())
         assert batch['feature'].shape == (1, N, 4 * C)
+        assert batch['target'].shape == (1, N, 4 * C)
         assert batch['grid'].shape == (1, 2, N)
         assert batch['tsize'].shape == (1, N)
+        assert batch['size'].shape == (1, n_pack, 2)
+        assert (batch['size'] == H // 2).all()       # finest patch grid = crop/2
         assert N % 128 == 0
         assert valid <= 512
         # doc_ids consistent with n_pack and mask
