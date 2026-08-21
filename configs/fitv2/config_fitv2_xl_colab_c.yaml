@@ -1,26 +1,5 @@
 diffusion:
   pretrained_first_stage_model_path: stabilityai/sd-vae-ft-ema
-  transport:
-    path_type: Linear
-    prediction: velocity
-    loss_weight: null
-    sample_eps: null
-    train_eps: null
-    snr_type: lognorm
-  sampler:
-    mode: ODE
-    sde:
-      sampling_method: Euler
-      diffusion_form: sigma
-      diffusion_norm: 1.0
-      last_step: Mean
-      last_step_size: 0.04
-    ode:
-      sampling_method: dopri5
-      atol: 1.0e-06
-      rtol: 0.001
-      reverse: false
-      likelihood: false
   network_config:
     target: fit.model.fit_model.FiT
     params:

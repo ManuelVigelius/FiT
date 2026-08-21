@@ -7,7 +7,7 @@ from fit.model.modules import (
     FiTBlock, FinalLayer
 )
 from fit.model.utils import get_parameter_dtype
-from fit.utils.eval_utils import init_from_ckpt
+from fit.utils.utils import init_from_ckpt
 from fit.model.rope import VisionRotaryEmbedding
 
 #################################################################################

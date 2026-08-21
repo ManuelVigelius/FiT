@@ -36,12 +36,11 @@ from accelerate.utils import ProjectConfiguration, set_seed, DistributedDataPara
 from tqdm.auto import tqdm
 from copy import deepcopy
 
-from fit.scheduler.transport import create_transport
+from fit.utils.transport import Transport
 from fit.utils.utils import (
-    instantiate_from_config, default, get_obj_from_str, update_ema,
+    instantiate_from_config, default, get_obj_from_str, update_ema, init_from_ckpt,
 )
 from fit.utils.lr_scheduler import get_scheduler
-from fit.utils.eval_utils import init_from_ckpt
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -186,7 +185,7 @@ def main():
     if args.use_ema:
         ema_model = torch.compile(ema_model, dynamic=True, mode="default")
 
-    transport = create_transport(**OmegaConf.to_container(diffusion_cfg.transport))
+    transport = Transport()
 
     # ---- Frozen variance predictor + quadtree packer ------------------------
     vp = _build_variance_predictor(data_cfg.params.train.variance_predictor, device)

@@ -7,7 +7,7 @@ import random
 from functools import partial
 from torch.utils.data import DataLoader, Dataset, BatchSampler
 from safetensors.torch import load_file
-from fit.scheduler.transport.utils import spatial_resize, patchify
+from fit.utils.utils import spatial_resize, patchify
 from fit.noise_field_sampler.noise_field_generator import sample_noise_fields_2d
 
 

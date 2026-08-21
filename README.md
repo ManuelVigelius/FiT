@@ -41,110 +41,21 @@ pip install -e .
 ```
 
 ## Sample
-### Basic Sampling
 
-Basically, the model is trained with images whose $H\times W\leqslant 256\times256$.
-Our FiTv1-XL/2 model and FiTv2-XL/2 model are trained with batch size of 256 for 2000K steps. 
-Our FiTv2-3B/2 model is trained with batch size of 256 for 1000K steps.
+Image generation is done with `generate_images.py`, which uses the noise-field
+sampler in `fit/noise_field_sampler/`. All configuration lives in the CONFIG
+block at the top of the script — checkpoints, schedules, CFG scale and output
+directory — so it takes no CLI arguments:
 
-The pre-trained FiT models can be downloaded directyl from huggingface:
-| FiT Model     | Checkpoint | FID-256x256 | FID-320x320 | Model Size | GFlOPS |
-|---------------|------------|---------|-----------------|------------| ------ |
-| [FiTv1-XL/2](https://huggingface.co/InfImagine/FiT/tree/main/FiTv1_xl) | [CKPT](https://huggingface.co/InfImagine/FiT/blob/main/FiTv1_xl/model_ema.bin) | 4.21 | 5.11 | 824M | 153 |
-| [FiTv2-XL/2](https://huggingface.co/InfImagine/FiTv2/tree/main/FiTv2_XL) | [CKPT](https://huggingface.co/InfImagine/FiTv2/resolve/main/FiTv2_XL/model_ema.safetensors?download=true) | 2.26 | 3.55 | 671M | 147 |
-| [FiTv2-3B/2](https://huggingface.co/InfImagine/FiT/tree/main/FiTv1_xl) | [CKPT](https://huggingface.co/InfImagine/FiTv2/resolve/main/FiTv2_3B/model_ema.bin?download=true) | 2.15 | 3.22 | 3B | 653 |
-
-
-#### Downloading the checkpoints
-Downloading via wget:
 ```
-mkdir checkpoints
-
-wget -c "https://huggingface.co/InfImagine/FiT/blob/main/FiTv1_xl/model_ema.bin" -O checkpoints/fitv1_xl.bin
-
-wget -c "https://huggingface.co/InfImagine/FiTv2/resolve/main/FiTv2_XL/model_ema.safetensors?download=true" -O checkpoints/fitv2_xl.safetensors
-
-wget -c "https://huggingface.co/InfImagine/FiTv2/resolve/main/FiTv2_3B/model_ema.bin?download=true" -O checkpoints/fitv2_3B.bin
+python generate_images.py
 ```
 
-#### Sampling 256x256 Images
-Sampling with FiTv1-XL/2 for $256\times 256$ Images:
-```
-python -m torch.distributed.run --nnodes=${NUM_NODE} --nproc_per_node=${NUM_GPU} --rdzv_endpoint localhost:$MASTER_PORT sample_fit_ddp.py --num-fid-samples 50000 --cfgdir configs/fit/config_fit_xl.yaml --ckpt checkpoints/fitv1_xl.bin --image-height 256 --image-width 256 --num-sampling-steps 250 --cfg-scale 1.5 --global-seed 0 --per-proc-batch-size 32
-```
-Sampling with FiTv2-XL/2 for $256\times 256$ Images:
-```
-python -m torch.distributed.run --nnodes=${NUM_NODE} --nproc_per_node=${NUM_GPU} --rdzv_endpoint localhost:$MASTER_PORT sample_fitv2_ddp.py --num-fid-samples 50000 --cfgdir configs/fitv2/config_fitv2_xl.yaml --ckpt checkpoints/fitv2_xl.safetensors --image-height 256 --image-width 256 --num-sampling-steps 250 --cfg-scale 1.5 --global-seed 0 --per-proc-batch-size 32  --sampler-mode ODE
-```
-Sampling with FiTv2-3B/2 for $256\times 256$ Images:
-```
-python -m torch.distributed.run --nnodes=${NUM_NODE} --nproc_per_node=${NUM_GPU} --rdzv_endpoint localhost:$MASTER_PORT sample_fitv2_ddp.py --num-fid-samples 50000 --cfgdir configs/fitv2/config_fitv2_3B.yaml --ckpt checkpoints/fitv2_3B.bin --image-height 256 --image-width 256 --num-sampling-steps 250 --cfg-scale 1.5 --global-seed 0 --per-proc-batch-size 32  --sampler-mode ODE
-```
-Note that *NUM_NODE*, *NUM_GPU* and *MASTER_PORT* need to be specified.
+FID against a reference batch is computed with `measure_fid.py`.
 
-
-#### Sampling Images with arbitrary resolutions
-We can assign the *image-height* and *image-width* with any value we want. And we need to specify the original maximum positional embedding length (*ori-max-pe-len*) and the interpolation method. 
-We show some examples as follows.
-
-Sampling with FiTv2-XL/2 for $160\times 320$ images:
-```
-python -m torch.distributed.run --nnodes=${NUM_NODE} --nproc_per_node=${NUM_GPU} --rdzv_endpoint localhost:$MASTER_PORT sample_fitv2_ddp.py --num-fid-samples 50000 --cfgdir configs/fitv2/config_fitv2_xl.yaml --ckpt checkpoints/fitv2_xl.safetensors --image-height 160 --image-width 320 --num-sampling-steps 250 --cfg-scale 1.5 --global-seed 0 --per-proc-batch-size 32  --sampler-mode ODE --ori-max-pe-len 16 --interpolation dynntk --decouple
-```
-Sampling with FiTv2-XL/2 for $320\times 320$ images:
-```
-python -m torch.distributed.run --nnodes=${NUM_NODE} --nproc_per_node=${NUM_GPU} --rdzv_endpoint localhost:$MASTER_PORT sample_fitv2_ddp.py --num-fid-samples 50000 --cfgdir configs/fitv2/config_fitv2_xl.yaml --ckpt checkpoints/fitv2_xl.safetensors --image-height 320 --image-width 320 --num-sampling-steps 250 --cfg-scale 1.5 --global-seed 0 --per-proc-batch-size 32  --sampler-mode ODE --ori-max-pe-len 16 --interpolation ntkpro2 --decouple
-```
-Note that *NUM_NODE*, *NUM_GPU* and *MASTER_PORT* need to be specified.
-
-
-### High-resolution Sampling
-
-For high-resolution image generation, we use images whose $H\times W \leqslant 512\times512$. 
-Our FiTv2-XL/2 is finetuned with batch size of 256 for 400K steps, while
-FiTv2-3B/2 is finetuned with batch size of 256 for 200K steps.
-
-The high-resolution fine-tuned FiT models can be downloaded directyl from huggingface:
-| FiT Model     | Checkpoint | FID-512x512 | FID-320x640 | Model Size | GFlOPS |
-|---------------|------------|---------|-----------------|------------| ------ |
-| [FiTv2-HR-XL/2](https://huggingface.co/InfImagine/FiTv2/tree/main/FiTv2_XL_HRFT) | [CKPT](https://huggingface.co/InfImagine/FiTv2/resolve/main/FiTv2_XL_HRFT/model_ema.safetensors?download=true) | 2.90 | 4.87 | 671M | 147 |
-| [FiTv2-HR-3B/2](https://huggingface.co/InfImagine/FiTv2/tree/main/FiTv2_3B_HRFT) | [CKPT](https://huggingface.co/InfImagine/FiTv2/resolve/main/FiTv2_3B_HRFT/model_ema.safetensors?download=true) | 2.41 | 4.54 | 3B | 653 |
-
-
-#### Downloading
-Downloading via wget:
-```
-mkdir checkpoints
-
-wget -c "https://huggingface.co/InfImagine/FiTv2/resolve/main/FiTv2_XL_HRFT/model_ema.safetensors?download=true" -O checkpoints/fitv2_hr_xl.safetensors
-
-wget -c "https://huggingface.co/InfImagine/FiTv2/resolve/main/FiTv2_3B_HRFT/model_ema.safetensors?download=true" -O checkpoints/fitv2_hr_3B.safetensors
-```
-
-#### Sampling 512x512 Images
-Sampling with FiTv2-HR-XL/2 for $512\times 512$ Images:
-```
-python -m torch.distributed.run --nnodes=${NUM_NODE} --nproc_per_node=${NUM_GPU} --rdzv_endpoint localhost:$MASTER_PORT sample_fitv2_ddp.py --num-fid-samples 50000 --cfgdir configs/fitv2/config_fitv2_hr_xl.yaml --ckpt checkpoints/fitv2_hr_xl.safetensors --image-height 512 --image-width 512 --num-sampling-steps 250 --cfg-scale 1.65 --global-seed 0 --per-proc-batch-size 32  --sampler-mode ODE --ori-max-pe-len 16 --interpolation dynntk --decouple
-```
-Sampling with FiTv2-HR-3B/2 for $512\times 512$ Images:
-```
-python -m torch.distributed.run --nnodes=${NUM_NODE} --nproc_per_node=${NUM_GPU} --rdzv_endpoint localhost:$MASTER_PORT sample_fitv2_ddp.py --num-fid-samples 50000 --cfgdir configs/fitv2/config_fitv2_hr_3B.yaml --ckpt checkpoints/fitv2_hr_3B.safetensors --image-height 512 --image-width 512 --num-sampling-steps 250 --cfg-scale 1.5 --global-seed 0 --per-proc-batch-size 32  --sampler-mode ODE --ori-max-pe-len 16 --interpolation dynntk --decouple
-```
-Note that *NUM_NODE*, *NUM_GPU* and *MASTER_PORT* need to be specified.
-
-#### Sampling Images with arbitrary resolutions
-Sampling with FiTv2-HR-XL/2 for $320\times 640$ images:
-```
-python -m torch.distributed.run --nnodes=${NUM_NODE} --nproc_per_node=${NUM_GPU} --rdzv_endpoint localhost:$MASTER_PORT sample_fitv2_ddp.py --num-fid-samples 50000 --cfgdir configs/fitv2/config_fitv2_hr_xl.yaml --ckpt checkpoints/fitv2_hr_xl.safetensors --image-height 320 --image-width 640 --num-sampling-steps 250 --cfg-scale 1.65 --global-seed 0 --per-proc-batch-size 32  --sampler-mode ODE --ori-max-pe-len 16 --interpolation dynntk --decouple
-```
-Note that *NUM_NODE*, *NUM_GPU* and *MASTER_PORT* need to be specified.
-
-## Evaluations
-The sampling generates a folder of samples as well as a `.npz` file which can be directly used with [ADM's TensorFlow
-evaluation suite](https://github.com/openai/guided-diffusion/tree/main/evaluations) to compute FID, Inception Score and
-other metrics. 
-
-
+> The original upstream DDP sampling script (`sample_fitv2_ddp.py`) and its
+> RoPE-interpolation modes (NTK / YaRN) have been removed from this fork.
+> For those, see the [upstream FiT repository](https://github.com/whlzy/FiT).
 
 ## Flexible Imagenet Latent Datasets
 

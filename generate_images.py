@@ -181,7 +181,7 @@ from fit.noise_field_sampler.noise_field_sampler import (
     sample as noise_field_sample,
     sample_upsampler as noise_field_sample_upsampler,
 )
-from fit.scheduler.transport.utils import patchify, unpatchify
+from fit.utils.utils import patchify, unpatchify
 
 
 # ──────────────────────────── helpers ────────────────────────────────────────

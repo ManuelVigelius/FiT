@@ -28,7 +28,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
-from fit.scheduler.transport.utils import patchify, unpatchify, spatial_resize
+from fit.utils.utils import patchify, unpatchify, spatial_resize
 from torch.utils.data import DataLoader, Subset
 
 # ─────────────────────────────── CONFIG ─────────────────────────────────────

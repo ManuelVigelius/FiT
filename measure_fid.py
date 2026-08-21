@@ -60,7 +60,7 @@ from generate_images import (
 )
 from fit.noise_field_sampler.noise_field_generator import sample_noise_fields_2d
 from fit.noise_field_sampler.noise_field_sampler import sample as noise_field_sample
-from fit.scheduler.transport.utils import patchify, unpatchify
+from fit.utils.utils import patchify, unpatchify
 
 # ─────────────────────────────── CONFIG ─────────────────────────────────────
 

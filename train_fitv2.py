@@ -15,15 +15,15 @@ from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed, DistributedDataParallelKwargs
 from tqdm.auto import tqdm
 from copy import deepcopy
-from fit.scheduler.transport import create_transport
+from fit.utils.transport import Transport
 from fit.utils.utils import (
     instantiate_from_config,
     default,
     get_obj_from_str,
-    update_ema
+    update_ema,
+    init_from_ckpt
 )
 from fit.utils.lr_scheduler import get_scheduler
-from fit.utils.eval_utils import init_from_ckpt
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -314,8 +314,7 @@ def main():
         ema_model = torch.compile(ema_model, dynamic=True, mode="default")
 
     # In SiT, we use transport instead of diffusion
-    transport = create_transport(**OmegaConf.to_container(diffusion_cfg.transport))  # default: velocity; 
-    # schedule_sampler = create_named_schedule_sampler()
+    transport = Transport()
 
     # Setup Dataloader
     # In packed mode the effective batch size per step is determined by max_tokens,

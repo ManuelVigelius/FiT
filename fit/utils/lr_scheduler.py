@@ -281,10 +281,6 @@ TYPE_TO_SCHEDULER_FUNCTION = {
 
 
 
-
-
-
-
 def get_scheduler(
     name: Union[str, SchedulerType],
     optimizer: Optimizer,
