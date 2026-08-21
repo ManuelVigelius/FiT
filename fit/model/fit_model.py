@@ -247,8 +247,7 @@ class FiT(nn.Module):
         return x
 
     def forward(self, x, t, y, grid, mask, size=None, doc_ids=None, block_mask=None,
-                x_fullres=None, grid_fullres=None, mask_fullres=None, size_fullres=None,
-                cells=None):
+                x_fullres=None, grid_fullres=None, mask_fullres=None, size_fullres=None):
         """
         Forward pass of FiT.
 
@@ -371,13 +370,8 @@ class FiT(nn.Module):
         #    cannot trace under dynamic=True.
         x = self.up_proj(x)                                     # (1, N_total_lr, D)
         n_pack = c_pack.shape[1]
-        if cells is None:
-            # Uniform low-res: one rectangle per image stretched to the full frame.
-            x_fr = self._upsample_packed(x, doc_ids, size, size_fullres, n_pack, D)  # (n_pack, N_fr, D)
-        else:
-            # Quadtree (mixed resolution): each image's tokens are partitioned into
-            # rectangular cells, each upsampled into its own full-res sub-window.
-            x_fr = self._upsample_quadtree(x, doc_ids, size_fullres, n_pack, D, cells)
+        # Uniform low-res: one rectangle per image stretched to the full frame.
+        x_fr = self._upsample_packed(x, doc_ids, size, size_fullres, n_pack, D)  # (n_pack, N_fr, D)
 
         # 3. Project the full-res noisy image and add it to the upsampled latents.
         x = x_fr + self.fr_embedder(x_fullres)                  # (n_pack, N_fr, D)
@@ -467,70 +461,6 @@ class FiT(nn.Module):
             padding_mode='border', align_corners=True,
         ).to(x.dtype)                                                # (n_pack, D, H_fr, W_fr)
         return sp_fr.reshape(n_pack, D, N_fr).transpose(1, 2)        # (n_pack, N_fr, D)
-
-    @torch.compiler.disable
-    def _upsample_quadtree(self, x, doc_ids, size_fullres, n_pack, D, cells):
-        """Mixed-resolution upsample: quadtree nearest-neighbour block fill.
-
-        Counterpart to :meth:`_upsample_packed` for the quadtree path. Instead of
-        one low-res rectangle per image stretched over the whole frame, each
-        image's tokens are partitioned into rectangular cells, and every cell's
-        tokens are placed into *its own* sub-window of the full-res grid.
-
-        Within a cell of token grid (k_h, k_w) over a window of extent (h, w),
-        token (a, b) owns the axis-aligned full-res sub-rectangle it covers — its
-        value is copied (nearest-neighbour) to every full-res position inside that
-        sub-rectangle. Because the builder keeps k_h | h and k_w | w, each token
-        owns an exact (h/k_h) x (w/k_w) block, so the fill is a clean
-        ``repeat_interleave`` with no interpolation, no seams from sample
-        starvation, and no resampling kernel. A full-res (k==window) cell is the
-        identity; a 1-token cell becomes a constant block — true quadtree NN.
-
-        This is deliberately *not* bicubic: the quadtree semantics are "this token
-        covers this region", so every covered position takes that token's value.
-        The refinement ``up_blocks`` (which also see the full-res noisy image) are
-        responsible for any smoothing across block boundaries.
-
-        Excluded from torch.compile for the same reasons as :meth:`_upsample_packed`
-        (data-dependent Python ints); it is a pure copy/scatter.
-
-        Args:
-            x:        (1, N_total_lr, D) packed low-res tokens (after up_proj).
-            doc_ids:  (1, N_total_lr) image index per token, -1 for padding.
-            size_fullres: (1, n_pack, 2) full-res grid size (shared by all images).
-            cells:    list of length n_pack; cells[i] is a list of tuples
-                      (offset, k_h, k_w, y0, x0, h, w) for image i, where `offset`
-                      indexes into image i's own token block (the tokens with
-                      doc_id == i, in packed order) and (y0, x0, h, w) is the cell's
-                      window in the full-res grid.
-
-        Returns:
-            x_fr: (n_pack, N_fr, D).
-        """
-        H_fr = int(size_fullres[0, 0, 0]); W_fr = int(size_fullres[0, 0, 1])
-        N_fr = H_fr * W_fr
-        doc_ids_lr = doc_ids[0]                                  # (N_total_lr,)
-
-        # Per-image token blocks (one boolean-gather per image, not per cell).
-        tok_imgs = [x[0, doc_ids_lr == i] for i in range(n_pack)]   # (N_lr_i, D)
-
-        out = x.new_zeros(n_pack, D, H_fr, W_fr)
-        for i in range(n_pack):
-            for (offset, k_h, k_w, y0, x0, h, w) in cells[i]:
-                n = k_h * k_w
-                # (D, k_h, k_w) cell content (w-fast / h-slow within the cell).
-                cell = tok_imgs[i][offset:offset + n].transpose(0, 1).reshape(D, k_h, k_w)
-                # NN block fill: each token covers an (h/k_h) x (w/k_w) block.
-                # Requires k_h | h and k_w | w so the blocks tile the window
-                # exactly (the builders enforce this; assert to fail loudly if a
-                # hand-built cell violates it rather than silently mis-tiling).
-                assert h % k_h == 0 and w % k_w == 0, \
-                    f"cell window {(h, w)} not divisible by density {(k_h, k_w)}"
-                rh, rw = h // k_h, w // k_w
-                win = cell.repeat_interleave(rh, dim=1).repeat_interleave(rw, dim=2)
-                out[i, :, y0:y0 + h, x0:x0 + w] = win
-
-        return out.reshape(n_pack, D, N_fr).transpose(1, 2)     # (n_pack, N_fr, D)
 
     def ckpt_wrapper(self, module):
         def ckpt_forward(*inputs):

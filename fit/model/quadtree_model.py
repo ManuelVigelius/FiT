@@ -388,6 +388,47 @@ class QuadtreeFiT(nn.Module):
             out[sel] = self.resampler.decode(x[sel], n).to(out.dtype)
         return out
 
+    def _build_conditioning(self, t, y, tsize, doc_ids, dtype):
+        """Build the per-token conditioning signal `c` that drives adaLN.
+
+        Combines the per-image (t + y) embedding — broadcast to every token of the
+        image it belongs to — with an optional per-token learned leaf-size embedding.
+        Padding tokens (doc_id < 0) are zeroed out.
+
+        t:        (B, max_n_pack)   timestep per packed image
+        y:        (B, max_n_pack)   class label per packed image
+        tsize:    (B, N)            per-token leaf side (1/2/4/8)
+        doc_ids:  (B, N)            image index per token, -1 for padding
+        dtype:                      compute dtype (matches the token embeddings)
+
+        return:   (B, N, D)
+        """
+        B, max_n_pack = t.shape
+        D = self.hidden_size
+
+        # ---- per-image conditioning (t + y), expanded to per-token -----------
+        t_flat = t.reshape(B * max_n_pack).to(dtype)
+        y_flat = y.reshape(B * max_n_pack).to(torch.int)
+
+        t_emb = self.t_embedder(t_flat).reshape(B, max_n_pack, D)   # (B, P, D)
+        y_emb = self.y_embedder(y_flat, self.training).reshape(B, max_n_pack, D)
+        c_pack = t_emb + y_emb                                        # (B, P, D)
+
+        # Expand conditioning to per-token: each token inherits the embedding of
+        # the image it belongs to. Padding tokens (doc_id=-1) are zeroed below.
+        safe_ids = doc_ids.clamp(min=0)                              # (B, N)
+        c = c_pack[torch.arange(B, device=doc_ids.device)[:, None], safe_ids]  # (B, N, D)
+
+        # ---- per-token leaf-size conditioning --------------------------------
+        # One learned vector per leaf size (1/2/4/8), added to the per-token c so
+        # adaLN in every block sees the token's compression level.
+        if self.use_size_cond and tsize is not None:
+            size_idx = self._size_to_idx[tsize.clamp(min=0).long()]  # (B, N)
+            c = c + self.size_embedder(size_idx)                     # (B, N, D)
+
+        c = c * (doc_ids >= 0).to(c.dtype).unsqueeze(-1)             # zero padding
+        return c
+
     def forward(self, x, t, y, grid, mask, size=None, tsize=None,
                 doc_ids=None, block_mask=None, **kwargs):
         """Packed forward pass.
@@ -405,33 +446,10 @@ class QuadtreeFiT(nn.Module):
         return:   (1, N_total, 4*C_out)
         """
         assert doc_ids is not None, "QuadtreeFiT only supports the packed path"
-        B = x.shape[0]
-        D = self.hidden_size
 
         x = self._embed_tokens(x, tsize)                    # (1, N, D)
 
-        # ---- per-image conditioning (t + y), expanded to per-token -----------
-        max_n_pack = t.shape[1]
-        t_flat = t.reshape(B * max_n_pack).to(x.dtype)
-        y_flat = y.reshape(B * max_n_pack).to(torch.int)
-
-        t_emb = self.t_embedder(t_flat).reshape(B, max_n_pack, D)   # (B, P, D)
-        y_emb = self.y_embedder(y_flat, self.training).reshape(B, max_n_pack, D)
-        c_pack = t_emb + y_emb                                        # (B, P, D)
-
-        # Expand conditioning to per-token: each token inherits the embedding of
-        # the image it belongs to. Padding tokens (doc_id=-1) are zeroed below.
-        safe_ids = doc_ids.clamp(min=0)                               # (B, N)
-        c = c_pack[torch.arange(B, device=x.device)[:, None], safe_ids]  # (B, N, D)
-
-        # ---- per-token leaf-size conditioning --------------------------------
-        # One learned vector per leaf size (1/2/4/8), added to the per-token c so
-        # adaLN in every block sees the token's compression level.
-        if self.use_size_cond and tsize is not None:
-            size_idx = self._size_to_idx[tsize.clamp(min=0).long()]  # (B, N)
-            c = c + self.size_embedder(size_idx)                     # (B, N, D)
-
-        c = c * (doc_ids >= 0).to(c.dtype).unsqueeze(-1)             # zero padding
+        c = self._build_conditioning(t, y, tsize, doc_ids, x.dtype)  # (B, N, D)
 
         if self.global_adaLN_modulation is not None:
             global_adaln = self.global_adaLN_modulation(c)           # (B, N, 6*D)
