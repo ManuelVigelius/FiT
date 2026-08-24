@@ -28,7 +28,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
-from fit.utils.utils import patchify, unpatchify, spatial_resize
+from fit.utils.utils import (patchify, unpatchify, spatial_resize,
+                            make_grid_batch)
 from torch.utils.data import DataLoader, Subset
 
 # ─────────────────────────────── CONFIG ─────────────────────────────────────
@@ -298,11 +299,8 @@ def evaluate_at_compression(
 
         # ── build model kwargs for low-res forward ──────────────────────────
         B = x1_lr.shape[0]
-        hs = torch.arange(H_lr, dtype=x1_lr.dtype, device=device)
-        ws = torch.arange(W_lr, dtype=x1_lr.dtype, device=device)
-        gh, gw = torch.meshgrid(hs, ws, indexing="ij")
         # grid[0]=width coords, grid[1]=height coords (matches dataset and rope convention)
-        grid_lr = torch.stack([gw.reshape(-1), gh.reshape(-1)]).unsqueeze(0).expand(B, -1, -1)
+        grid_lr = make_grid_batch(H_lr, W_lr, B, device=device, dtype=x1_lr.dtype)
 
         mask_lr_seq = torch.ones(B, seq_lr, dtype=torch.uint8, device=device)
 
@@ -440,11 +438,8 @@ def evaluate_at_compression_virtual_resize(
         mask_lr = torch.ones(B, g * g, 1, device=device, dtype=x1_fr.dtype)
 
         # ── build model kwargs for full-res forward (no size conditioning) ─────
-        hs = torch.arange(H_fr, dtype=x1_fr.dtype, device=device)
-        ws = torch.arange(W_fr, dtype=x1_fr.dtype, device=device)
-        gh, gw = torch.meshgrid(hs, ws, indexing="ij")
         # grid[0]=width coords, grid[1]=height coords (matches dataset and rope convention)
-        grid_fr = torch.stack([gw.reshape(-1), gh.reshape(-1)]).unsqueeze(0).expand(B, -1, -1)
+        grid_fr = make_grid_batch(H_fr, W_fr, B, device=device, dtype=x1_fr.dtype)
 
         mask_fr_seq = torch.ones(B, seq_fr, dtype=torch.uint8, device=device)
 

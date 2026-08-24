@@ -88,6 +88,16 @@ if GPU_ID is not None and "CUDA_VISIBLE_DEVICES" not in os.environ:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_ID)
 
 import math
+import sys
+from pathlib import Path
+
+# Import `fit.*` regardless of the working directory. Running this by absolute
+# path (`python /path/to/FiT/test_quadtree_generate.py`) puts the script's own
+# directory on sys.path, which happens to be the repo root — but that breaks the
+# moment the file is moved or invoked through a symlink, so make it explicit.
+_REPO_ROOT = Path(__file__).resolve().parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import torch
 from PIL import Image
@@ -99,7 +109,8 @@ from fit.quadtree_compression.quadtree_compression import (
     plan_from_variance, plan_to_masks, REGION_SIZES)
 from fit.quadtree_compression.predictive_compressor import (
     PredictiveVarianceCompressor)
-from fit.utils.utils import patchify, unpatchify
+from fit.utils.utils import (patchify, unpatchify, make_grid,
+                            positions_to_grid)
 
 
 # ─────────────────────────────── CONFIG ─────────────────────────────────────
@@ -109,8 +120,12 @@ from fit.utils.utils import patchify, unpatchify
 CKPT_PATH = "/visinf/projects_students/mb_mvigel/checkpoints/model_ema.safetensors"
 CKPT_FILE = "model_1.safetensors"      # used only when CKPT_PATH is a directory
 
-# Where the PNGs go.
-OUTPUT_DIR = "./quadtree_ckpt_test"
+# Where the PNGs go. Anchored to the repo root rather than the working
+# directory, so results land in the same place no matter where you launch from
+# (a bare relative path would follow your shell's cwd, or SLURM's under sbatch).
+# Set an absolute path to send them elsewhere, e.g. onto the project volume:
+#   OUTPUT_DIR = "/visinf/projects_students/mb_mvigel/quadtree_ckpt_test"
+OUTPUT_DIR = str(_REPO_ROOT / "quadtree_ckpt_test")
 
 # "patchify" | "encoder" | "both"  — see the module docstring.
 MODE = "both"
@@ -266,13 +281,34 @@ def check_premises(plan, order, g, device):
                    torch.zeros(n, device=device))
     kw, N, _ = pack_inputs(plan, order, g, n, device, torch.float32)
     assert N == ref['feature'].shape[1]
-    for key, got, want in (("grid", kw['grid'], ref['grid'].float()),
-                           ("tsize", kw['tsize'], ref['tsize']),
+    # NOTE: 'grid' is deliberately NOT compared against the compressor — see the
+    # axis-order check below. Everything else must match it exactly.
+    for key, got, want in (("tsize", kw['tsize'], ref['tsize']),
                            ("mask", kw['mask'], ref['mask'].float()),
                            ("doc_ids", kw['doc_ids'], ref['doc_ids'].long())):
         assert torch.equal(got, want), f"packed '{key}' differs from compressor"
 
-    print("Premises   : token order invertible, packing matches compressor  [ok]")
+    # (3) The grid must follow the convention RoPE actually reads —
+    #     grid[0] = width, grid[1] = height — i.e. the same layout
+    #     generate_images.py builds, up to the +0.5 patch-center offset.
+    #     A symmetric 16x16 grid is invariant to swapping the two rows as a SET,
+    #     so this compares the per-token pairing, which is what RoPE consumes.
+    gsz = LATENT_SIZE // PATCH_SIZE
+    baseline = make_grid(gsz, gsz, device=device) + 0.5              # (2, N) as (w,h)
+
+    inv = torch.empty_like(order)
+    inv[order] = torch.arange(order.shape[0], device=order.device)
+    ours = kw['grid'][0, :, :gsz * gsz][:, inv]        # -> row-major
+
+    if torch.allclose(ours, baseline.flip(0)):
+        raise AssertionError(
+            "grid axes are TRANSPOSED: grid[0] carries height but RoPE reads it "
+            "as width. Flip the two rows where positions (y,x) become (w,h).")
+    assert torch.allclose(ours, baseline), (
+        "grid does not match the (w, h) convention generate_images.py uses")
+
+    print("Premises   : token order invertible, packing matches compressor, "
+          "grid axes (w,h)  [ok]")
 
 
 def pack_inputs(plan, order, g, n_pack, device, dtype):
@@ -293,9 +329,9 @@ def pack_inputs(plan, order, g, n_pack, device, dtype):
     mask = torch.zeros(1, N, device=device, dtype=dtype)
     doc = torch.full((1, N), -1, dtype=torch.int32, device=device)
 
-    # Same convention as the compressor: patch centers in latent px, halved to
-    # patch units, so neighbouring size-1 tokens sit 1 apart.
-    g_one = plan['positions'].to(device).transpose(0, 1) / 2.0   # (2, n_tok)
+    # Patch centers -> RoPE grid. `positions_to_grid` owns the (y,x) -> (w,h)
+    # flip and the latent-px -> patch-unit scaling; see fit/utils/utils.py.
+    g_one = positions_to_grid(plan['positions'].to(device), patch_size=PATCH_SIZE)
     for i in range(n_pack):
         sl = slice(i * n_tok, (i + 1) * n_tok)
         grid[0, :, sl] = g_one.to(dtype)

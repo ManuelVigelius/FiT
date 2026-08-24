@@ -122,6 +122,64 @@ def unpatchify(x: torch.Tensor, hw: tuple, p: int) -> torch.Tensor:
                      h=h//p, w=w//p, p1=p, p2=p)
 
 
+#################################################################################
+#                          RoPE grid construction                               #
+#################################################################################
+# THE convention, in one place. `VisionRotaryEmbedding.online_get_2d_rope_from_grid`
+# reads a grid as:
+#
+#     grid[..., 0, :] = WIDTH  (x) coordinates
+#     grid[..., 1, :] = HEIGHT (y) coordinates
+#
+# i.e. width first. Tokens are ordered row-major (w fastest, h slowest), matching
+# `patchify` and the saved dataset .safetensors files.
+#
+# This is easy to get backwards, and a swap is close to invisible: on a square
+# grid the swapped coordinate SET is identical, so shape checks and set
+# comparisons pass while every token's position is transposed. The quadtree path
+# hit exactly this. Build grids through these helpers rather than open-coding
+# `meshgrid`, so the convention lives at one site.
+
+
+def make_grid(H_g: int, W_g: int, device=None, dtype=torch.float32) -> torch.Tensor:
+    """Row-major (w-fast) RoPE grid for a dense H_g x W_g token grid.
+
+    Args:
+        H_g, W_g: grid dims in TOKEN units (not latent pixels)
+    Returns:
+        (2, H_g*W_g) with row 0 = width coords, row 1 = height coords
+    """
+    hs = torch.arange(H_g, dtype=dtype, device=device)
+    ws = torch.arange(W_g, dtype=dtype, device=device)
+    gh, gw = torch.meshgrid(hs, ws, indexing='ij')
+    return torch.stack([gw.reshape(-1), gh.reshape(-1)])
+
+
+def make_grid_batch(H_g: int, W_g: int, B: int, device=None,
+                    dtype=torch.float32) -> torch.Tensor:
+    """`make_grid` expanded to a batch: (B, 2, H_g*W_g)."""
+    return make_grid(H_g, W_g, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+
+
+def positions_to_grid(positions: torch.Tensor, patch_size: int = 1) -> torch.Tensor:
+    """Quadtree leaf centers -> a RoPE grid in the (w, h) convention.
+
+    The quadtree planner (`plan_from_variance`) emits per-leaf centers as
+    **(y, x)** — height first — which is the opposite of what RoPE reads. This
+    flips them and lays them out as rows, so callers never have to remember the
+    mismatch.
+
+    Args:
+        positions:  (N, 2) leaf centers as (y, x), in latent-pixel units
+        patch_size: latent pixels per patch. Pass 2 to convert centers from
+                    latent-pixel units into patch units, where neighbouring
+                    size-1 tokens sit 1 apart. Default 1 leaves them unscaled.
+    Returns:
+        (2, N) with row 0 = width coords, row 1 = height coords
+    """
+    return positions.flip(1).transpose(0, 1) / patch_size
+
+
 def spatial_resize(x: torch.Tensor, H: int, W: int,
                    H_out: int, W_out: int,
                    p: int = 2,

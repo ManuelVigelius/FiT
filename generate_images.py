@@ -180,7 +180,7 @@ from fit.noise_field_sampler.noise_field_sampler import (
     sample as noise_field_sample,
     sample_upsampler as noise_field_sample_upsampler,
 )
-from fit.utils.utils import patchify, unpatchify
+from fit.utils.utils import patchify, unpatchify, make_grid
 
 
 # ──────────────────────────── helpers ────────────────────────────────────────
@@ -209,12 +209,8 @@ def load_model(ckpt_path: str, cfg: dict, device: str) -> FiT:
 
 def make_grid_and_mask(H_g: int, W_g: int, B: int, device: torch.device, dtype: torch.dtype):
     """Build grid, mask, and size tensors for a given grid shape."""
-    # ── identical to IN1kLatentDataset.__getitem__ grid construction ──────────
-    hs = torch.arange(H_g, dtype=dtype)
-    ws = torch.arange(W_g, dtype=dtype)
-    gh, gw = torch.meshgrid(hs, ws, indexing='ij')
-    grid = torch.stack([gw.reshape(-1), gh.reshape(-1)])
-    # ─────────────────────────────────────────────────────────────────────────
+    # Canonical (w, h) RoPE grid — see fit/utils/utils.make_grid.
+    grid = make_grid(H_g, W_g, dtype=dtype)
     # DIAGNOSTIC: stretch RoPE position deltas by ROPE_STRIDE (1 = normal). With
     # stride 2 the grid is 0,2,4,... — same image, same size conditioning, but
     # neighbouring tokens are 2 apart in RoPE space. Isolates whether >1 RoPE
@@ -229,10 +225,7 @@ def make_grid_and_mask(H_g: int, W_g: int, B: int, device: torch.device, dtype: 
 
 def _single_grid(H_g: int, W_g: int, device, dtype) -> torch.Tensor:
     """(2, H_g*W_g) integer grid, w-fast/h-slow — matches the dataset convention."""
-    hs = torch.arange(H_g, dtype=dtype)
-    ws = torch.arange(W_g, dtype=dtype)
-    gh, gw = torch.meshgrid(hs, ws, indexing='ij')
-    return torch.stack([gw.reshape(-1), gh.reshape(-1)]).to(device=device, dtype=dtype)
+    return make_grid(H_g, W_g, device=device, dtype=dtype)
 
 
 def build_upsampler_inputs(x_lr_sp, x_fr_sp, y_full, k_grid, H_fr, W_fr, device, dtype):

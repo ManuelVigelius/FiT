@@ -7,7 +7,7 @@ import random
 from functools import partial
 from torch.utils.data import DataLoader, Dataset, BatchSampler
 from safetensors.torch import load_file
-from fit.utils.utils import spatial_resize, patchify
+from fit.utils.utils import spatial_resize, patchify, make_grid
 from fit.noise_field_sampler.noise_field_generator import sample_noise_fields_2d
 
 
@@ -113,10 +113,7 @@ class IN1kLatentDataset(Dataset):
         # Recompute integer grid for the current resolution.
         # Convention matches dataset files: grid[0]=width coords (fast), grid[1]=height coords (slow).
         # Verified against saved .safetensors: w varies fastest (0,1,2,...,W-1,0,1,...).
-        hs = torch.arange(H_g, dtype=dtype)
-        ws = torch.arange(W_g, dtype=dtype)
-        gh, gw = torch.meshgrid(hs, ws, indexing='ij')
-        grid[:, :seq_len] = torch.stack([gw.reshape(-1), gh.reshape(-1)])
+        grid[:, :seq_len] = make_grid(H_g, W_g, dtype=dtype)
 
         mask[:seq_len] = 1
         size  = torch.tensor([[H_g, W_g]], dtype=torch.int32)
@@ -187,10 +184,7 @@ class IN1kLatentDataset(Dataset):
             ut_fr_pad[:seq_fr] = ut_fr
             mask_fr[:seq_fr]   = 1
 
-            hs_fr = torch.arange(H_fr, dtype=dtype)
-            ws_fr = torch.arange(W_fr, dtype=dtype)
-            gh_fr, gw_fr = torch.meshgrid(hs_fr, ws_fr, indexing='ij')
-            grid_fr[:, :seq_fr] = torch.stack([gw_fr.reshape(-1), gh_fr.reshape(-1)])
+            grid_fr[:, :seq_fr] = make_grid(H_fr, W_fr, dtype=dtype)
 
             result['feature']         = feature
             result['feature_fullres'] = feat_fr

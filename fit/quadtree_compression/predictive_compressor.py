@@ -49,6 +49,7 @@ from fit.quadtree_compression.adaptive_patch_pyramid import (
     PyramidEncoder, PyramidDecoder, gather_tokens)
 from fit.quadtree_compression.quadtree_compression import (
     LEAF_SIZES, plan_to_masks)
+from fit.utils.utils import positions_to_grid
 
 # LEAF_SIZES == (1, 2, 4, 8) -> encoder levels 0..3. A leaf of side N == 2**l is
 # one cell of the level-l grid (H / 2^(l+1) per side), so the ladders coincide.
@@ -205,10 +206,15 @@ class PredictiveVarianceCompressor(nn.Module):
         # `tokens` is already in packed order, so the whole prefix goes in at once
         # — no per-image slice-assign, and one autograd node instead of B.
         feat[0, :raw_len] = tokens
-        # positions are patch centers in latent px; /2 -> patch units, where two
-        # adjacent size-1 tokens are 1 apart and a size-N token spans N.
-        grid[0, :, :raw_len] = torch.cat(
-            [p['positions'].to(device) for p in plans], 0).transpose(0, 1) / 2.0
+        # Patch centers -> RoPE grid. `positions_to_grid` owns two conversions:
+        #   * (y, x) -> (w, h). The plan walk emits centers height-first, but
+        #     RoPE reads grid[0] as WIDTH. Without the flip every token sits at
+        #     its transposed position.
+        #   * latent px -> patch units, so two adjacent size-1 tokens are 1
+        #     apart and a size-N token spans N.
+        grid[0, :, :raw_len] = positions_to_grid(
+            torch.cat([p['positions'].to(device) for p in plans], 0),
+            patch_size=2)
         tsize[0, :raw_len] = torch.cat([p['sizes'].to(device) for p in plans], 0)
         mask[0, :raw_len] = 1
         doc[0, :raw_len] = torch.repeat_interleave(
