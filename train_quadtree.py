@@ -45,6 +45,43 @@ from fit.utils.lr_scheduler import get_scheduler
 logger = get_logger(__name__, log_level="INFO")
 
 
+def _pooled_targets(selection, packed):
+    """Mean-pooled clean-x0 tokens for the token-space (non-pyramid) loss.
+
+    The learned encoder no longer produces pooled leaf values, so the target for
+    the direct-readout path is built here: pool x0 over each leaf's N x N region
+    on the SAME tree the plan chose, patchified 2x2 exactly like the tokens.
+
+    Returns (1, N_total, 4*C) aligned with packed['feature'].
+    """
+    import torch.nn.functional as _F
+    x0 = selection['x0']                       # (B, C, H, W)
+    C = x0.shape[1]
+    device = x0.device
+    N = packed['feature'].shape[1]
+    out = torch.zeros(1, N, 4 * C, device=device, dtype=x0.dtype)
+
+    off = 0
+    for i, (plan, n_i) in enumerate(zip(selection['plans'], packed['counts'])):
+        sizes = plan['sizes']
+        pos = plan['positions']
+        # Pool once per distinct leaf size present, then gather each token's 2x2.
+        pooled = {}
+        for n in sizes.unique().tolist():
+            pooled[int(n)] = (x0[i] if n == 1 else
+                              _F.avg_pool2d(x0[i][None].float(), int(n),
+                                            stride=int(n))[0])
+        for k in range(n_i):
+            n = int(sizes[k])
+            cy, cx = float(pos[k, 0]), float(pos[k, 1])
+            ly = int(round((cy - n) / n))       # top-left leaf index on the n-grid
+            lx = int(round((cx - n) / n))
+            block = pooled[n][:, ly:ly + 2, lx:lx + 2]        # (C, 2, 2)
+            out[0, off + k] = block.permute(1, 2, 0).reshape(4 * C).to(out.dtype)
+        off += n_i
+    return out
+
+
 def resolve_tuple(*args):
     return tuple(args)
 OmegaConf.register_new_resolver("tuple", resolve_tuple)
@@ -190,16 +227,31 @@ def main():
     # ---- Frozen variance predictor + quadtree packer ------------------------
     vp = _build_variance_predictor(data_cfg.params.train.variance_predictor, device)
 
+    # ---- Learned compressor (PyramidEncoder [+ PyramidDecoder]) -------------
+    # Trained jointly with the diffusion model. It runs on exactly the images the
+    # plan pool selected for each sequence, so its gradients always belong to the
+    # loss computed in the same step.
+    use_pyramid_decoder = bool(getattr(
+        diffusion_cfg.network_config.params, 'use_pyramid_decoder', False))
+    compressor = instantiate_from_config(diffusion_cfg.compressor_config).to(device=device)
+    compressor = accelerator.prepare_model(compressor, device_placement=False)
+    logger.info(f"Compressor params: "
+                f"{sum(p.numel() for p in compressor.parameters())/1e6:.2f}M  "
+                f"(pyramid_decoder={use_pyramid_decoder})")
+
     logger.info("Building quadtree dataset/packer...")
     loader = instantiate_from_config(data_cfg)
     train_len = loader.train_len()
     logger.info(f"Dataset built ({train_len} feature files).")
 
     # ---- Optimizer / scheduler ----------------------------------------------
-    params = [p for p in model.parameters() if p.requires_grad]
+    # The compressor trains jointly with the diffusion model, so it shares the
+    # optimizer and the grad-norm clip.
+    trainable_params = ([p for p in model.parameters() if p.requires_grad]
+                        + [p for p in compressor.parameters() if p.requires_grad])
     optimizer_cfg = default(accelerate_cfg.optimizer, {"target": "torch.optim.AdamW"})
     optimizer = get_obj_from_str(optimizer_cfg["target"])(
-        params, lr=learning_rate, **optimizer_cfg.get("params", dict())
+        trainable_params, lr=learning_rate, **optimizer_cfg.get("params", dict())
     )
     lr_scheduler = get_scheduler(
         accelerate_cfg.lr_scheduler, optimizer=optimizer,
@@ -250,6 +302,7 @@ def main():
         ema_model.eval()
 
     model.train()
+    compressor.train()
     train_loss = None
 
     # The packer is an epoch-scoped iterator (its raw loader is a per-epoch shard).
@@ -261,11 +314,19 @@ def main():
     while not stop:
         packed_iter = loader.train_iter(vp, epoch, rank=rank, world_size=world_size,
                                         device=device)
-        for batch in packed_iter:
+        for selection in packed_iter:
             with accelerator.accumulate(model):
-                x = batch['feature']                        # (1, N, 4C) noisy
-                di = batch['doc_ids'].long()
-                y = batch['label'].to(torch.int).clamp(min=0)
+                # ---- learned compression (INSIDE the accumulate block) -------
+                # The plan pool already sized this image batch to the token
+                # budget using the FROZEN predictor, so every image whose encoder
+                # forward runs here also contributes to this step's loss. That is
+                # what keeps the compressor's gradients from being stranded by
+                # the zero_grad below. The batch size varies step to step.
+                packed = compressor(selection['x_t'], selection['plans'],
+                                    selection['label'], selection['t'],
+                                    x0=selection['x0'])
+
+                di = packed['doc_ids'].long()
 
                 # FlexAttention block mask, built outside the compiled model.
                 from torch.nn.attention.flex_attention import create_block_mask
@@ -275,18 +336,29 @@ def main():
                 N_bm = di.shape[1]
                 block_mask = create_block_mask(doc_mask_mod, 1, None, N_bm, N_bm, device=di.device)
 
-                model_kwargs = dict(
-                    y=y, grid=batch['grid'], mask=batch['mask'].float(),
-                    size=batch['size'], tsize=batch['tsize'], doc_ids=di,
-                    block_mask=block_mask,
-                    target=batch['target'], t=batch['t'], n_pack=batch['n_pack'],
-                )
                 with accelerator.autocast():
-                    loss_dict = transport.training_losses(model, x, model_kwargs)
+                    if use_pyramid_decoder:
+                        # Full-resolution loss: model tokens -> PyramidDecoder ->
+                        # dense latent, compared against the clean x0.
+                        packed['block_mask'] = block_mask
+                        loss_dict = transport.loss_quadtree_dense(
+                            model, compressor, selection, packed)
+                    else:
+                        # Token-space loss against the mean-pooled x0 tokens.
+                        model_kwargs = dict(
+                            y=packed['label'].to(torch.int).clamp(min=0),
+                            grid=packed['grid'], mask=packed['mask'].float(),
+                            size=packed['size'], tsize=packed['tsize'], doc_ids=di,
+                            block_mask=block_mask,
+                            target=_pooled_targets(selection, packed),
+                            t=packed['t'], n_pack=packed['n_pack'],
+                        )
+                        loss_dict = transport.training_losses(
+                            model, packed['feature'], model_kwargs)
                 loss = loss_dict["loss"].mean()
                 accelerator.backward(loss)
                 if accelerator.sync_gradients and accelerate_cfg.max_grad_norm > 0.:
-                    all_norm = accelerator.clip_grad_norm_(model.parameters(), accelerate_cfg.max_grad_norm)
+                    all_norm = accelerator.clip_grad_norm_(trainable_params, accelerate_cfg.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)

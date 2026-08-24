@@ -96,7 +96,7 @@ class PyramidEncoder(nn.Module):
     levels you mostly discard is cheaper than any ragged alternative.
     """
 
-    def __init__(self, latent_ch, c, d, n_levels=3, share_weights=True):
+    def __init__(self, latent_ch, c, d, n_levels=3, share_weights=False):
         super().__init__()
         self.n_levels = n_levels
         self.c = c
@@ -197,7 +197,7 @@ class PyramidDecoder(nn.Module):
     """
 
     def __init__(self, latent_ch, c, d, n_levels=3, c_head=None, t_dim=None,
-                 share_weights=True):
+                 share_weights=False, zero_init_out=True):
         super().__init__()
         self.n_levels = n_levels
         self.c = c
@@ -223,8 +223,18 @@ class PyramidDecoder(nn.Module):
         self.skip_proj = nn.Conv2d(c_head + latent_ch, c_head, 1)
         self.head_blend = Blend(c_head, k=7, t_dim=t_dim)
         self.out = nn.Conv2d(c_head, latent_ch, 1)
-        nn.init.zeros_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
+        # Zero-init makes x_hat identically zero at init — the usual DiT trick,
+        # safe when this decoder terminates one contiguous graph. It is NOT safe
+        # when the decoder sits between two separately-optimised modules (as in
+        # PredictiveVarianceCompressor): a zero here blocks ALL gradient to the
+        # transformer and the encoder upstream, not just to this layer. Pass
+        # zero_init_out=False in that setting.
+        if zero_init_out:
+            nn.init.zeros_(self.out.weight)
+            nn.init.zeros_(self.out.bias)
+        else:
+            nn.init.normal_(self.out.weight, std=0.02)
+            nn.init.zeros_(self.out.bias)
 
     def forward(self, tokens, masks, z, t_emb=None):
         """

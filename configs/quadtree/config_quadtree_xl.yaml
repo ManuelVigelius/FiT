@@ -12,7 +12,6 @@ diffusion:
       mlp_ratio: 4.0
       class_dropout_prob: 0.1
       num_classes: 1000
-      learn_sigma: false          # predict clean x1 only (no sigma head)
       use_swiglu: true
       use_swiglu_large: false
       q_norm: layernorm
@@ -27,8 +26,27 @@ diffusion:
       adaln_type: lora
       adaln_lora_dim: 288
       use_size_cond: true          # learned per-leaf-size embedding (1/2/4/8)
-      use_learned_resampling: false  # ablation toggle: false = raw patch embed/head
+      # Tokens arrive from the trained PyramidEncoder at width d; when this equals
+      # hidden_size the input projection is the identity.
+      token_input_dim: 1152
+      # ABLATION: false = per-token linear readout, loss on mean-pooled x0 tokens.
+      #           true  = tokens -> PyramidDecoder -> dense latent, full-res loss.
+      use_pyramid_decoder: false
       # pretrain_ckpt: checkpoints/fitv2_xl.safetensors
+
+  # Learned compression: frozen variance predictor decides the tree (see data),
+  # this module fills the tokens from the FULL-RESOLUTION latent and is trained
+  # jointly with the diffusion model.
+  compressor_config:
+    target: fit.quadtree_compression.predictive_compressor.PredictiveVarianceCompressor
+    params:
+      latent_channels: 4
+      c: 256                       # pyramid conv width
+      d: 1152                      # token width; must match token_input_dim
+      crop: 32
+      pad_to_multiple: 128
+      with_decoder: false          # must match use_pyramid_decoder above
+      share_weights: true          # one Merge/Split shared across all levels
 
 data:
   target: fit.data.in1k_quadtree_latent_dataset.INQuadtreeLatentLoader

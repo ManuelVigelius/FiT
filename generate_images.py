@@ -102,7 +102,6 @@ _BASE_MODEL_CFG = dict(
     mlp_ratio=4.0,
     class_dropout_prob=0.1,
     num_classes=1000,
-    learn_sigma=False,
     use_swiglu=True,
     use_swiglu_large=False,
     q_norm="layernorm",

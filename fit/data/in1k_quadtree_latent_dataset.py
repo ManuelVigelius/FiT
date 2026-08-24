@@ -8,32 +8,31 @@ turn needs a forward pass of the `VariancePredictor`. That breaks the
 pre-computed-length `TokenBudgetBatchSampler` used by the fixed-grid dataset — we
 can't pack by length before we know the lengths.
 
-Instead we pack lazily with a *sample pool*:
+Instead we pool *plans* and pack lazily:
 
     1.  A plain (sharded, shuffled) DataLoader yields batches of RAW noisy
-        latents (x_t, t, label) — cheap, length-agnostic.
-    2.  On the GPU, `QuadtreePackedIterator` maintains a pool of already-
-        compressed images (each a variable-length token/pos/size triple). Every
-        step it pops whole images into the current sequence until the next image
-        would exceed `max_seq_len`, then emits the packed sequence (padded to a
-        multiple) with per-image `doc_ids`. Leftover images stay in the pool.
-    3.  Whenever the pool can't guarantee it can fill one more `max_seq_len`
-        sequence, it pulls the next raw batch, runs the variance predictor +
-        `compress` on it (batched on the GPU), and refills the pool. The raw
-        batch is sized so a single refill very likely overshoots `max_seq_len`.
+        latents (x_t, x0, t, label) — cheap, length-agnostic.
+    2.  `QuadtreePlanPool` runs the FROZEN `VariancePredictor` on the GPU and
+        turns each image's variance grids into a quadtree *plan* — the tree
+        structure and hence the exact token count, with NO latent values read.
+    3.  Every step it pops whole images until the next would exceed
+        `max_seq_len`, and hands that image batch (plus plans) to the caller.
 
-Per-GPU disjointness: each rank consumes a strided shard of a globally shuffled
-index list (every `world_size`-th index), so no sample is ever seen by two ranks
-within an epoch.
+The caller then runs the TRAINED compressor (`PredictiveVarianceCompressor`) on
+exactly those images. This ordering is what keeps the learned compressor
+trainable: because the predictor is frozen, plans can be computed far ahead at
+any convenient batch size, but the trained encoder only ever runs on the images
+that are in this step's sequence — so no encoder gradient is stranded when
+`zero_grad` fires. The compressor's batch size is whatever the packing produced
+and changes every step.
 
 Whole images are never split across sequences (doc_id contiguity + the quadtree
 token grouping are preserved); the sequence tail is zero-padded.
 
-The compressed token layout (per image) comes straight from
-`quadtree_compression.compress`:
-    tokens    (n_i, 4 * latent_channels)   patchified quadtree leaf values
-    positions (n_i, 2)                      (y, x) center in latent-pixel coords
-    sizes     (n_i,)                        leaf side (1 / 2 / 4 / 8)
+The plan layout (per image) comes from `quadtree_compression.plan_from_variance`:
+    levels    (n_i,)     encoder level l, leaf side N == 2**l
+    positions (n_i, 2)   (y, x) center in latent-pixel coords
+    sizes     (n_i,)     leaf side (1 / 2 / 4 / 8)
 """
 
 import math
@@ -46,11 +45,13 @@ from torch.utils.data import DataLoader, Dataset
 # so this module can be imported for its dataset/loader pieces even if the compressor
 # package path isn't wired up yet at import time.
 try:
-    from fit.quadtree_compression.quadtree_compression import compress_from_variance
+    from fit.quadtree_compression.quadtree_compression import (
+        compress_from_variance, plan_from_variance)
     from fit.quadtree_compression.variance_prediction import (
         VariancePredictor, load_latent, predict_variance)  # load_latent: safetensors -> (4, 2H, 2W)
 except Exception:  # pragma: no cover - allows partial import in dev
     compress_from_variance = None
+    plan_from_variance = None
     VariancePredictor = None
     load_latent = None
     predict_variance = None
@@ -184,51 +185,52 @@ def build_shard_indices(num_files, rank, world_size, epoch, seed=42):
 
 
 # --------------------------------------------------------------------------- #
-# GPU-side pool + packing                                                      #
+# GPU-side plan pool + budget-aware image batching                            #
 # --------------------------------------------------------------------------- #
-class QuadtreePackedIterator:
-    """Lazily pack quadtree-compressed images into fixed-budget varlen sequences.
+class QuadtreePlanPool:
+    """Pool *quadtree plans* and hand out image batches that fit a token budget.
 
-    Wraps a plain raw-latent DataLoader. Holds the VariancePredictor on `device`.
-    Maintains a pool of compressed images; each `__next__` emits one packed
-    sequence dict (see below). Refills the pool by pulling raw batches and running
-    variance-predict + `compress` on the GPU whenever the pool might not cover the
-    next `max_seq_len` sequence.
+    This is the step that makes learned compression trainable. The variance
+    predictor is frozen, so it can run arbitrarily far ahead under `no_grad` on
+    whatever batch size is convenient. Its output fixes each image's quadtree
+    structure and therefore its exact token count — *before* any trained layer
+    touches the latent.
 
-    Emitted sequence dict (B=1, packed) — mirrors `packed_collate_fn`:
-        feature  (1, N_total, 4C)   packed quadtree tokens (noisy x_t)
-        target   (1, N_total, 4C)   clean x0 compressed on the SAME tree (loss target)
-        grid     (1, 2, N_total)    per-token (y, x) center in patch units
-        tsize    (1, N_total)       per-token leaf side (1/2/4/8) — compression level
-        mask     (1, N_total)       1 for valid tokens, 0 for padding
-        doc_ids  (1, N_total)       image index within sequence, -1 for padding
-        label    (1, n_pack)        class label per packed image
-        t        (1, n_pack)        timestep per packed image
-        size     (1, n_pack, 2)     finest (size-1) patch grid extent — RoPE scale
-        n_pack   (1,)               number of images packed
+    So we pool plans, not tokens. Each `__next__` selects the longest prefix of
+    pooled images whose token counts sum to <= `max_seq_len` and returns those
+    images together with their plans. The caller (the training loop) then runs the
+    trained compressor on exactly that image batch, so every image whose encoder
+    forward ran also contributes to this step's loss — no gradient is stranded
+    across a `zero_grad`.
+
+    The image batch size is whatever the arithmetic yields (41, 37, ...) and
+    changes every step. Nothing downstream depends on it being constant.
+
+    Yields dict:
+        x_t    (B, C, H, W)  noisy latents, full resolution (NOT pooled)
+        x0     (B, C, H, W)  clean latents, for the full-resolution loss
+        t      (B,)          timesteps
+        label  (B,)          class labels
+        plans  list of B dicts: levels (n,), positions (n,2), sizes (n,)
+        n_tok  int           total valid tokens across the batch
     """
 
-    def __init__(self, raw_loader, model, *, max_seq_len=1024,
-                 pad_to_multiple=128, device='cuda',
-                 refill_target=None, latent_channels=4, crop=32):
+    def __init__(self, raw_loader, model, *, max_seq_len=1024, device='cuda',
+                 refill_target=None, crop=32, threshold=0.0):
         self.raw_loader = raw_loader
         self.model = model.to(device).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
         self.device = device
         self.max_seq_len = max_seq_len
-        self.pad_to_multiple = pad_to_multiple
-        self.latent_channels = latent_channels
-        # Latent crop side (latent px). The finest patch grid is crop/2 per side
-        # (patchify pairs 2x2 latent px into one token); used as the RoPE scale.
         self.crop = crop
-        # Pool must be able to cover one full sequence before we emit. Refill until
-        # the pooled token count is at least this many tokens (or the source drips
-        # dry). Default: overshoot max_seq_len by 50% so a single refill usually
-        # suffices and we rarely block mid-pack.
+        self.threshold = threshold
+        # Overshoot the budget so one refill usually covers a full sequence.
         self.refill_target = refill_target or int(math.ceil(max_seq_len * 1.5))
 
         self._raw_iter = iter(raw_loader)
-        self._pool = []            # list of dict(tokens, positions, sizes, label, t)
-        self._pool_tokens = 0      # total valid tokens currently pooled
+        self._pool = []
+        self._pool_tokens = 0
         self._exhausted = False
 
     def __iter__(self):
@@ -236,7 +238,7 @@ class QuadtreePackedIterator:
 
     @torch.no_grad()
     def _refill(self):
-        """Pull raw batches, compress them, extend the pool until target/exhausted."""
+        """Pull raw batches, run the FROZEN predictor, pool the resulting plans."""
         while (not self._exhausted) and self._pool_tokens < self.refill_target:
             try:
                 batch = next(self._raw_iter)
@@ -244,110 +246,56 @@ class QuadtreePackedIterator:
                 self._exhausted = True
                 break
 
-            x_t = batch['x_t'].to(self.device, non_blocking=True)   # (B, C, H, W)
-            x0 = batch['x0'].to(self.device, non_blocking=True)     # (B, C, H, W) clean
-            t = batch['t'].to(self.device, non_blocking=True)       # (B,)
-            labels = batch['label']                                 # (B,) cpu
+            x_t = batch['x_t'].to(self.device, non_blocking=True)
+            x0 = batch['x0'].to(self.device, non_blocking=True)
+            t = batch['t'].to(self.device, non_blocking=True)
+            labels = batch['label']
 
-            # Run the variance predictor ONCE on the whole batch (the model forward
-            # is the expensive part and is trivially batched). The quadtree walk is
-            # inherently per-image / variable length, so we loop over the batch and
-            # feed each image its own slice of the variance grids to
-            # `compress_from_variance` — no per-image model calls. The clean latent
-            # x0 rides along as `x_target` so it is compressed on the SAME tree,
-            # giving a token-aligned clean training target.
-            threshold = self._threshold()
-            var = predict_variance(self.model, x_t, t)   # list of (B, H/N, W/N)
+            # One batched forward of the frozen predictor; the quadtree walk is
+            # per-image and variable-length, so it loops — but it only reads the
+            # variance grids, never the latent, and allocates no values.
+            var = predict_variance(self.model, x_t, t)
             for i in range(x_t.shape[0]):
-                var_i = [v[i] for v in var]              # per-image variance grids
-                tokens, positions, sizes, targets = compress_from_variance(
-                    x_t[i], var_i, threshold=threshold, x_target=x0[i])
-                n_i = int(tokens.shape[0])
-                # Guard: an image whose *minimum* token count already exceeds the
-                # sequence budget can never be packed whole. Skip with a warning
-                # rather than deadlock. (n_i is smallest at the coarsest split.)
+                var_i = [v[i] for v in var]
+                levels, positions, sizes = plan_from_variance(
+                    var_i, self.threshold, self.crop)
+                n_i = int(sizes.shape[0])
+                # An image whose token count alone exceeds the budget can never be
+                # packed whole; skip rather than deadlock.
                 if n_i > self.max_seq_len:
                     continue
                 self._pool.append(dict(
-                    tokens=tokens, positions=positions, sizes=sizes, targets=targets,
-                    label=labels[i], t=t[i].detach().float().cpu()))
+                    x_t=x_t[i], x0=x0[i], t=t[i], label=labels[i],
+                    plan=dict(levels=levels, positions=positions, sizes=sizes),
+                    n_tok=n_i))
                 self._pool_tokens += n_i
 
-    def _threshold(self):
-        # Compression threshold. Kept as a method so subclasses / configs can make
-        # it schedule-dependent (e.g. anneal over training). Constant by default.
-        return getattr(self, 'threshold', 0.0)
-
     def __next__(self):
-        # Ensure the pool can (likely) cover a full sequence.
         if self._pool_tokens < self.max_seq_len:
             self._refill()
         if not self._pool:
             raise StopIteration
 
-        # Greedily pack whole images until the next would overflow max_seq_len.
-        packed, raw_len = [], 0
+        # Greedily take whole images until the next would overflow the budget.
+        picked, n_tok = [], 0
         while self._pool:
-            n_i = int(self._pool[0]['tokens'].shape[0])
-            if packed and raw_len + n_i > self.max_seq_len:
+            n_i = self._pool[0]['n_tok']
+            if picked and n_tok + n_i > self.max_seq_len:
                 break
             item = self._pool.pop(0)
             self._pool_tokens -= n_i
-            packed.append(item)
-            raw_len += n_i
-            # A single image may itself reach the budget; emit it alone.
-            if raw_len >= self.max_seq_len:
+            picked.append(item)
+            n_tok += n_i
+            if n_tok >= self.max_seq_len:
                 break
 
-        return self._collate(packed)
-
-    def _collate(self, packed):
-        """Concatenate packed images into one padded sequence with doc_ids."""
-        C4 = 4 * self.latent_channels
-        n_pack = len(packed)
-        raw_len = sum(int(p['tokens'].shape[0]) for p in packed)
-        N_total = int(math.ceil(raw_len / self.pad_to_multiple) * self.pad_to_multiple)
-        N_total = max(N_total, self.pad_to_multiple)
-
-        dev = self.device
-        feat = torch.zeros(1, N_total, C4, device=dev)
-        tgt = torch.zeros(1, N_total, C4, device=dev)   # clean target, same layout
-        grid = torch.zeros(1, 2, N_total, device=dev)
-        tsize = torch.zeros(1, N_total, dtype=torch.long, device=dev)
-        mask = torch.zeros(1, N_total, dtype=torch.uint8, device=dev)
-        doc = torch.full((1, N_total), -1, dtype=torch.int32, device=dev)
-        label = torch.full((1, n_pack), -1, dtype=torch.int64, device=dev)
-        tvec = torch.zeros(1, n_pack, dtype=torch.float32, device=dev)
-        # Per-image RoPE scale: the finest (size-1) patch grid extent. The
-        # quadtree tiles a `crop`-latent-pixel image and patchify pairs 2x2 latent
-        # pixels into one finest token, so the finest grid is (crop/2) per side.
-        size = torch.zeros(1, n_pack, 2, dtype=torch.float32, device=dev)
-        grid_side = float(self.crop // 2)
-
-        offset = 0
-        for img_idx, p in enumerate(packed):
-            n_i = int(p['tokens'].shape[0])
-            sl = slice(offset, offset + n_i)
-            feat[0, sl] = p['tokens'].to(dev)
-            tgt[0, sl] = p['targets'].to(dev)
-            # `positions` are patch centers in latent-pixel coords; dividing by 2
-            # maps them to patch-unit coordinates where two adjacent uncompressed
-            # (size-1) tokens are distance 1 apart and a size-N token is N apart,
-            # matching the area each covers. Coarse tokens land on half-cell
-            # midpoints (handled by online RoPE, which accepts fractional coords).
-            grid[0, :, sl] = p['positions'].to(dev).transpose(0, 1) / 2.0   # (2, n_i)
-            tsize[0, sl] = p['sizes'].to(dev)
-            mask[0, sl] = 1
-            doc[0, sl] = img_idx
-            label[0, img_idx] = p['label'].to(dev)
-            tvec[0, img_idx] = p['t'].to(dev)
-            size[0, img_idx] = grid_side
-            offset += n_i
-
         return dict(
-            feature=feat, target=tgt, grid=grid, tsize=tsize, mask=mask, doc_ids=doc,
-            label=label, t=tvec, size=size,
-            n_pack=torch.tensor([n_pack], dtype=torch.int32, device=dev),
+            x_t=torch.stack([p['x_t'] for p in picked]),
+            x0=torch.stack([p['x0'] for p in picked]),
+            t=torch.stack([p['t'] for p in picked]),
+            label=torch.stack([p['label'] for p in picked]).to(self.device),
+            plans=[p['plan'] for p in picked],
+            n_tok=n_tok,
         )
 
 
@@ -401,17 +349,20 @@ class INQuadtreeLatentLoader:
         )
 
     def train_iter(self, model, epoch, rank=0, world_size=1, device='cuda'):
+        """Plan pool for one epoch's shard.
+
+        `model` is the FROZEN VariancePredictor. The returned iterator yields
+        image batches sized to the token budget; the caller runs the trained
+        compressor on each batch (see PredictiveVarianceCompressor).
+        """
         raw_loader = self._raw_loader(epoch, rank, world_size)
-        it = QuadtreePackedIterator(
+        return QuadtreePlanPool(
             raw_loader, model,
             max_seq_len=self.max_seq_len,
-            pad_to_multiple=self.pad_to_multiple,
             device=device,
-            latent_channels=self.latent_channels,
             crop=self.crop,
+            threshold=self.threshold,
         )
-        it.threshold = self.threshold
-        return it
 
 
 # --------------------------------------------------------------------------- #
@@ -423,9 +374,13 @@ def _smoke_test():
     C, H = 4, 32
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    model = VariancePredictor(latent_channels=C, region_sizes=(2, 4, 8)).to(device).eval()
+    from fit.quadtree_compression.predictive_compressor import (
+        PredictiveVarianceCompressor)
 
-    # Fake raw dataset: a list of (x_t, t, label) dicts, bypassing safetensors.
+    vp = VariancePredictor(latent_channels=C, region_sizes=(2, 4, 8)).to(device).eval()
+    comp = PredictiveVarianceCompressor(latent_channels=C, c=64, d=128, crop=H,
+                                        pad_to_multiple=128).to(device)
+
     class _FakeRaw(torch.utils.data.Dataset):
         def __len__(self):
             return 40
@@ -438,32 +393,29 @@ def _smoke_test():
                         label=torch.tensor(i % 10, dtype=torch.long))
 
     raw_loader = DataLoader(_FakeRaw(), batch_size=8, collate_fn=_raw_collate)
-    it = QuadtreePackedIterator(raw_loader, model, max_seq_len=512,
-                                pad_to_multiple=128, device=device,
-                                latent_channels=C, crop=H)
-    it.threshold = 0.5
+    pool = QuadtreePlanPool(raw_loader, vp, max_seq_len=512, device=device,
+                            crop=H, threshold=0.5)
 
-    seen_docs = 0
-    for step, batch in enumerate(it):
-        N = batch['feature'].shape[1]
-        n_pack = int(batch['n_pack'])
-        valid = int(batch['mask'].sum())
-        assert batch['feature'].shape == (1, N, 4 * C)
-        assert batch['target'].shape == (1, N, 4 * C)
-        assert batch['grid'].shape == (1, 2, N)
-        assert batch['tsize'].shape == (1, N)
-        assert batch['size'].shape == (1, n_pack, 2)
-        assert (batch['size'] == H // 2).all()       # finest patch grid = crop/2
+    seen = 0
+    for step, sel in enumerate(pool):
+        B = sel['x_t'].shape[0]
+        assert sel['n_tok'] <= 512
+        packed = comp(sel['x_t'], sel['plans'], sel['label'], sel['t'], x0=sel['x0'])
+        N = packed['feature'].shape[1]
+        assert packed['feature'].shape == (1, N, comp.d)
+        assert packed['grid'].shape == (1, 2, N)
+        assert packed['tsize'].shape == (1, N)
+        assert packed['size'].shape == (1, B, 2)
         assert N % 128 == 0
-        assert valid <= 512
-        # doc_ids consistent with n_pack and mask
-        max_doc = int(batch['doc_ids'].max())
-        assert max_doc == n_pack - 1, (max_doc, n_pack)
-        assert int((batch['doc_ids'] >= 0).sum()) == valid
-        seen_docs += n_pack
-        print(f"step {step:2d}  N={N:4d}  valid={valid:4d}  n_pack={n_pack:2d}")
+        valid = int(packed['mask'].sum())
+        assert valid == sel['n_tok'] <= 512
+        assert int(packed['doc_ids'].max()) == B - 1
+        assert int((packed['doc_ids'] >= 0).sum()) == valid
+        assert packed['feature'].requires_grad, "encoder gradient must flow"
+        seen += B
+        print(f"step {step:2d}  N={N:4d}  valid={valid:4d}  n_pack={B:2d}")
 
-    print(f"packed {seen_docs} images total; smoke test passed")
+    print(f"packed {seen} images total; smoke test passed")
 
 
 if __name__ == '__main__':

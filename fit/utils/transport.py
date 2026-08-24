@@ -236,3 +236,37 @@ class Transport:
         sq_err = weight * (x1_hat - target) ** 2          # (1, N, 4C)
         loss = self._mean_per_image(sq_err, doc_ids, model_kwargs, feature)
         return {'loss': loss, 'pred': x1_hat}
+
+    def loss_quadtree_dense(self, model, compressor, selection, packed):
+        """Clean-target loss taken at FULL latent resolution (pyramid-decoder path).
+
+        Same 1/(1-t)^2 velocity re-weighting as `_loss_quadtree`, but the model's
+        token output is handed to the compressor's PyramidDecoder and compared
+        against the dense clean latent x0 instead of mean-pooled leaf tokens.
+        Every latent pixel is supervised, so coarse leaves are no longer trained
+        only on their own average.
+
+        selection : the dict from QuadtreePlanPool (x_t, x0, t, plans, ...).
+        packed    : the dict from PredictiveVarianceCompressor.forward.
+        """
+        t_ds = packed['t']                                # (1, n_pack) dataset t
+        t = 1.0 - t_ds                                    # transport convention
+
+        fwd = dict(y=packed['label'].to(torch.int).clamp(min=0),
+                   grid=packed['grid'], mask=packed['mask'].float(),
+                   size=packed['size'], tsize=packed['tsize'],
+                   doc_ids=packed['doc_ids'].long(),
+                   block_mask=packed['block_mask'])
+        tokens = model(packed['feature'], t, **fwd)       # (1, N, D)
+
+        x_hat = compressor.decode_packed(
+            tokens, selection['plans'], packed['counts'], selection['x_t'])
+
+        # Per-IMAGE velocity weight 1/(1-t)^2 == 1/t_ds^2, floored at the clean end.
+        noise_w = t_ds[0].clamp(min=QUADTREE_WEIGHT_EPS)  # (n_pack,)
+        weight = (1.0 / (noise_w ** 2)).view(-1, 1, 1, 1)
+
+        sq_err = weight * (x_hat - selection['x0']) ** 2  # (B, C, H, W)
+        # Mean over each image, then over images: equal weight per image.
+        loss = sq_err.flatten(1).mean(dim=1).mean()
+        return {'loss': loss.reshape(1), 'pred': x_hat}

@@ -88,7 +88,9 @@ def compress(model, x_t, t, threshold):
     hands the per-scale variance grids to `compress_from_variance`. When compressing
     a whole batch, run the variance predictor once on the batch and call
     `compress_from_variance` per image instead — see
-    `in1k_quadtree_latent_dataset.QuadtreePackedIterator`.
+    `in1k_quadtree_latent_dataset.QuadtreePlanPool`. For the LEARNED
+    compression path use `plan_from_variance` instead — it decides the same tree
+    without pooling any values, leaving the detail for the PyramidEncoder.
     """
     device = x_t.device
     t = torch.as_tensor(t, dtype=torch.float32, device=device).reshape(1)
@@ -235,3 +237,117 @@ def smoke_test():
 
 if __name__ == "__main__":
     smoke_test()
+
+
+# --------------------------------------------------------------------------- #
+# Plan-only walk (for the learned PredictiveVarianceCompressor)               #
+# --------------------------------------------------------------------------- #
+def plan_from_variance(var, threshold, latent_size):
+    """Decide the quadtree *structure* only — no latent values are read.
+
+    This is `compress_from_variance` with the value-pooling stripped out. The
+    learned `PyramidEncoder` produces the token contents from the FULL-RESOLUTION
+    latent, so the tree decision no longer needs (and must not do) the mean-pool
+    that would destroy the very detail the encoder is meant to see.
+
+    var        : list of per-scale channel-max variance grids, var[s] of shape
+                 (H/N_s, W/N_s) for N_s in REGION_SIZES (2, 4, 8).
+    threshold  : regions with predicted variance < threshold are compressible.
+    latent_size: H (== W) of the latent in latent pixels.
+
+    Returns (levels, positions, sizes):
+        levels    (n,) long   encoder level l, where leaf side N == 2**l
+        positions (n, 2)      (y, x) patch center in latent-pixel coords
+        sizes     (n,) long   leaf side N in latent px (1 / 2 / 4 / 8)
+
+    Token ORDER is the recursion order, matching `compress_from_variance`.
+    """
+    H = int(latent_size)
+    device = var[0].device
+    flat_by_size = {n: (var[s] < threshold) for s, n in enumerate(REGION_SIZES)}
+
+    levels, positions, sizes = [], [], []
+
+    def patch_is_flat(n, ly, lx):
+        f = flat_by_size[n]
+        return bool(f[ly:ly + 2, lx:lx + 2].all())
+
+    def emit(n, ly, lx):
+        levels.append(int(n).bit_length() - 1)       # N=1,2,4,8 -> l=0,1,2,3
+        positions.append((float(ly * n + n), float(lx * n + n)))
+        sizes.append(n)
+
+    def recurse(n, ly, lx):
+        if n > 1 and not patch_is_flat(n, ly, lx):
+            m = n // 2
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    recurse(m, 2 * (ly + dy), 2 * (lx + dx))
+            return
+        emit(n, ly, lx)
+
+    coarse_n = LEAF_SIZES[-1]
+    coarse_leaves = H // coarse_n
+    for ly in range(0, coarse_leaves, 2):
+        for lx in range(0, coarse_leaves, 2):
+            recurse(coarse_n, ly, lx)
+
+    return (
+        torch.tensor(levels, dtype=torch.long, device=device),
+        torch.tensor(positions, dtype=torch.float32, device=device),
+        torch.tensor(sizes, dtype=torch.long, device=device),
+    )
+
+
+def plan_to_masks(levels, positions, sizes, latent_size, n_levels=4):
+    """Turn a per-token plan into the per-level boolean masks PyramidEncoder wants.
+
+    PyramidEncoder.features returns level-l features on a (H/2^(l+1)) grid; a
+    token at level l with leaf side N == 2**l covers a 2N x 2N latent-pixel patch
+    whose top-left is at (cy - N, cx - N). That patch is exactly ONE cell of the
+    level-l grid, at index ((cy - N) / (2N), (cx - N) / (2N)).
+
+    Returns (masks, order) where masks is a list of n_levels (1, H_l, W_l) bool
+    tensors and `order` is a long tensor that permutes level-major token order
+    (level 0 tokens, then level 1, ... — the order PyramidEncoder emits) back into
+    the plan's original recursion order.
+    """
+    H = int(latent_size)
+    device = levels.device
+    masks = []
+    for l in range(n_levels):
+        g = H // (2 ** (l + 1))
+        masks.append(torch.zeros(1, g, g, dtype=torch.bool, device=device))
+
+    for l in range(n_levels):
+        sel = (levels == l)
+        if not bool(sel.any()):
+            continue
+        n = 2 ** l
+        pos = positions[sel]                                   # (k, 2) centers
+        iy = ((pos[:, 0] - n) / (2 * n)).round().long()
+        ix = ((pos[:, 1] - n) / (2 * n)).round().long()
+        masks[l][0, iy, ix] = True
+
+    # PyramidEncoder gathers with a boolean mask (row-major within each level) and
+    # concatenates levels in order 0..n_levels-1. Recover the mapping back to the
+    # plan's recursion order so tokens stay aligned with positions/sizes.
+    idx = torch.arange(levels.shape[0], device=device)
+    gather_order = []
+    for l in range(n_levels):
+        sel = (levels == l)
+        if not bool(sel.any()):
+            continue
+        n = 2 ** l
+        pos = positions[sel]
+        iy = ((pos[:, 0] - n) / (2 * n)).round().long()
+        ix = ((pos[:, 1] - n) / (2 * n)).round().long()
+        g = H // (2 ** (l + 1))
+        # row-major rank within this level's mask == the order gather_tokens yields
+        rank = iy * g + ix
+        gather_order.append(idx[sel][rank.argsort()])
+    order_levelmajor = torch.cat(gather_order) if gather_order else idx
+    inverse = torch.empty_like(order_levelmajor)
+    inverse[order_levelmajor] = torch.arange(
+        order_levelmajor.shape[0], device=device)
+    return masks, inverse

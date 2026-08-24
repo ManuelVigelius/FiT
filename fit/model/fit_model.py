@@ -31,7 +31,6 @@ class FiT(nn.Module):
         mlp_ratio: float = 4.0,
         class_dropout_prob: float = 0.1,
         num_classes: int = 1000,
-        learn_sigma: bool = True,
         use_checkpoint: bool=False,
         use_swiglu: bool = False,
         use_swiglu_large: bool = False,
@@ -63,14 +62,13 @@ class FiT(nn.Module):
         super().__init__()
         self.context_size = context_size
         self.hidden_size = hidden_size
-        self.learn_sigma = learn_sigma
         self.use_checkpoint = use_checkpoint
         self.depth = depth
         self.mlp_ratio = mlp_ratio
         self.class_dropout_prob = class_dropout_prob
         self.num_classes = num_classes
         self.in_channels = in_channels
-        self.out_channels = self.in_channels * 2 if learn_sigma else in_channels
+        self.out_channels = in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.adaln_type = adaln_type

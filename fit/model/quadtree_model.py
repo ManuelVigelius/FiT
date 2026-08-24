@@ -23,21 +23,23 @@ Two things differ substantively from the base model:
       drives adaLN in every block. It is zero-initialised so size conditioning
       starts as a no-op.
 
-  2.  **Optional learned resampling.** With ``use_learned_resampling=False`` the
-      token in/out projections are plain linears (:class:`PatchEmbedder` /
-      :class:`FinalLayer`), i.e. the leaf values (mean-pooled latents already
-      produced by the compressor) are embedded directly. With
-      ``use_learned_resampling=True`` we instead down/up-sample each leaf with the
-      shared learned :class:`Merge` / :class:`Split` blocks from
-      :mod:`fit.quadtree_compression.adaptive_patch_pyramid`: a size-``N`` leaf is
-      ``merge`` composed ``log2(N)`` times on the way in and ``split`` composed the
-      same number of times on the way out. This is the "with / without learned
-      up- and down-sampling" ablation.
+  2.  **Tokens come from a learned compressor.** Tokens are produced by the
+      trained :class:`~fit.quadtree_compression.predictive_compressor.PredictiveVarianceCompressor`,
+      whose :class:`PyramidEncoder` runs on the FULL-RESOLUTION latent. So the
+      input projection is usually the identity (``token_input_dim == hidden_size``)
+      rather than a patch embed of mean-pooled leaf values. The earlier
+      ``LeafResampler`` is gone: it composed Merge/Split on top of values the
+      compressor had *already* mean-pooled, so there was no sub-leaf detail left
+      for it to resample.
+
+      ``use_pyramid_decoder`` selects the output side. False keeps the per-token
+      linear readout supervised on pooled x0 tokens; True emits hidden_size
+      tokens for the compressor's :class:`PyramidDecoder`, supervised at full
+      resolution. This is the ablation.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional
 
 from fit.model.modules import (
@@ -48,79 +50,6 @@ from fit.model.utils import get_parameter_dtype
 from fit.utils.utils import init_from_ckpt
 from fit.model.rope import VisionRotaryEmbedding
 from fit.quadtree_compression.quadtree_compression import LEAF_SIZES
-from fit.quadtree_compression.adaptive_patch_pyramid import Merge, Split
-
-
-#################################################################################
-#                        Learned per-leaf-size resampling                       #
-#################################################################################
-
-class LeafResampler(nn.Module):
-    """Down/up-sample quadtree leaf tokens with the shared pyramid Merge/Split.
-
-    Each token from the compressor is a 2x2 block of size-``N`` leaf values with
-    ``4 * latent_channels`` channels (row-major over the 2x2 leaves). We treat
-    that token as a tiny ``(2, 2)`` spatial grid of per-leaf channel vectors and
-    fold it down to a single ``hidden_size`` vector.
-
-    A size-``N`` leaf (N in ``LEAF_SIZES``) is the average of an ``N x N`` latent
-    region. To keep the token space scale-consistent — exactly the design goal of
-    the shared-weight pyramid — a size-``N`` leaf is embedded by composing the
-    same :class:`Merge` block ``log2(N)`` extra times on top of the base stem, and
-    reconstructed by composing :class:`Split` the same number of times. The
-    weights are shared across all leaf sizes, so every compression level trains
-    the same resampling function.
-
-    encode: (n, 4*latent_ch) leaf tokens of side ``N`` -> (n, hidden_size)
-    decode: (n, hidden_size) -> (n, 4*out_ch_per_leaf) for side-``N`` leaves
-    """
-
-    def __init__(self, latent_channels, hidden_size, out_channels):
-        super().__init__()
-        self.latent_channels = latent_channels
-        self.hidden_size = hidden_size
-        self.out_channels = out_channels
-        # Base grid of a token is 2x2 leaves. `stem` lifts a raw leaf channel
-        # vector into the hidden width; `merge`/`split` fold/unfold one octave of
-        # leaf size and are shared across levels (level-l leaf == merge^l(stem)).
-        self.stem = nn.Conv2d(latent_channels, hidden_size, 1)
-        self.merge = Merge(hidden_size)
-        self.split = Split(hidden_size, hidden_size)
-        # 2x2 leaf block -> one token vector (folds the base 2x2 patch grid).
-        self.merge_patch = Merge(hidden_size)
-        self.split_patch = Split(hidden_size, hidden_size)
-        # Per-leaf output head after unfolding back to the 2x2 patch grid.
-        self.out = nn.Conv2d(hidden_size, out_channels, 1)
-
-    @staticmethod
-    def _n_octaves(size):
-        # size in {1, 2, 4, 8} -> {0, 1, 2, 3}
-        return int(size).bit_length() - 1
-
-    def encode(self, tokens, size):
-        """(n, 4*latent_ch) size-``size`` leaf tokens -> (n, hidden_size)."""
-        n = tokens.shape[0]
-        # (n, 4*C) row-major over 2x2 leaves -> (n, C, 2, 2)
-        x = tokens.reshape(n, 2, 2, self.latent_channels).permute(0, 3, 1, 2)
-        x = self.stem(x)                                    # (n, D, 2, 2)
-        # Fold `log2(size)` extra octaves so all leaf sizes land in one space.
-        for _ in range(self._n_octaves(size)):
-            # Merge halves the grid; a 2x2 grid would vanish, so tile before each
-            # fold to keep a >=2 grid and let the shared Merge see a 2x2 context.
-            x = self.merge(x.repeat_interleave(2, 2).repeat_interleave(2, 3))
-        x = self.merge_patch(x)                             # (n, D, 1, 1)
-        return x.reshape(n, self.hidden_size)
-
-    def decode(self, feats, size):
-        """(n, hidden_size) -> (n, 4*out_ch) size-``size`` leaf tokens."""
-        n = feats.shape[0]
-        x = feats.reshape(n, self.hidden_size, 1, 1)
-        x = self.split_patch(x)                             # (n, D, 2, 2)
-        for _ in range(self._n_octaves(size)):
-            # Mirror of encode: unfold an octave, then pool back to a 2x2 grid.
-            x = F.avg_pool2d(self.split(x), 2)
-        x = self.out(x)                                     # (n, out_ch, 2, 2)
-        return x.permute(0, 2, 3, 1).reshape(n, 4 * self.out_channels)
 
 
 #################################################################################
@@ -141,7 +70,6 @@ class QuadtreeFiT(nn.Module):
         mlp_ratio: float = 4.0,
         class_dropout_prob: float = 0.1,
         num_classes: int = 1000,
-        learn_sigma: bool = True,
         use_checkpoint: bool = False,
         use_swiglu: bool = False,
         use_swiglu_large: bool = False,
@@ -167,38 +95,38 @@ class QuadtreeFiT(nn.Module):
         ignore_keys: list = None,
         finetune: str = None,
         use_size_cond: bool = True,
-        use_learned_resampling: bool = False,
+        token_input_dim: Optional[int] = None,
+        use_pyramid_decoder: bool = False,
         **kwargs,
     ):
         super().__init__()
         self.context_size = context_size
         self.hidden_size = hidden_size
-        self.learn_sigma = learn_sigma
         self.use_checkpoint = use_checkpoint
         self.depth = depth
         self.mlp_ratio = mlp_ratio
         self.class_dropout_prob = class_dropout_prob
         self.num_classes = num_classes
         self.in_channels = in_channels
-        self.out_channels = self.in_channels * 2 if learn_sigma else in_channels
+        self.out_channels = in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.adaln_type = adaln_type
         self.online_rope = online_rope
-        self.use_learned_resampling = use_learned_resampling
+        self.use_pyramid_decoder = use_pyramid_decoder
 
-        # ---- token in/out projections ----------------------------------------
-        # Without learned resampling: the compressor's leaf values (already a
-        # 2x2 block => 4*in_channels per token) are embedded / read out with a
-        # plain linear. With learned resampling: the shared Merge/Split pyramid
-        # down/up-samples each leaf by its size (see LeafResampler).
-        if use_learned_resampling:
-            self.resampler = LeafResampler(in_channels, hidden_size, self.out_channels)
-            self.x_embedder = None
-            self.final_layer = None
+        # ---- token in-projection ---------------------------------------------
+        # Tokens now arrive from the trained PyramidEncoder, which already emits
+        # `d`-dim vectors built from the FULL-RESOLUTION latent. When that `d`
+        # equals hidden_size the input projection is the identity; otherwise a
+        # plain linear adapts it. `token_input_dim=None` keeps the legacy path
+        # where the compressor hands over raw 4*C mean-pooled leaf values.
+        self.token_input_dim = token_input_dim
+        in_dim = token_input_dim if token_input_dim is not None else in_channels * patch_size**2
+        if in_dim == hidden_size:
+            self.x_embedder = nn.Identity()
         else:
-            self.x_embedder = PatchEmbedder(in_channels * patch_size**2, hidden_size, bias=True)
-            self.resampler = None
+            self.x_embedder = PatchEmbedder(in_dim, hidden_size, bias=True)
 
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
@@ -235,14 +163,16 @@ class QuadtreeFiT(nn.Module):
             q_norm=q_norm, k_norm=k_norm, qk_norm_weight=qk_norm_weight, qkv_bias=qkv_bias, ffn_bias=ffn_bias,
             adaln_bias=adaln_bias, adaln_type=adaln_type, adaln_lora_dim=adaln_lora_dim
         ) for _ in range(depth)])
-        if not use_learned_resampling:
-            self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, norm_layer=norm_type, adaln_bias=adaln_bias, adaln_type=adaln_type)
-            # adaLN-conditioned final norm reused by the learned-resampling head.
-            self.final_norm = None
+        # ---- token out-projection --------------------------------------------
+        # use_pyramid_decoder=False: per-token linear readout to 4*C_out; the loss
+        #   is taken against the mean-pooled x0 tokens (cheap, stays in token space).
+        # use_pyramid_decoder=True: emit hidden_size tokens for the external
+        #   PyramidDecoder, which reconstructs a dense latent and is supervised at
+        #   FULL resolution. The decoder itself lives on the compressor, not here.
+        if use_pyramid_decoder:
+            self.final_layer = FinalLayer(hidden_size, 1, hidden_size, norm_layer=norm_type, adaln_bias=adaln_bias, adaln_type=adaln_type)
         else:
-            # The learned resampler produces the per-leaf output; it still needs an
-            # adaLN-modulated final norm before the resampler's decode.
-            self.final_norm = FinalLayer(hidden_size, 1, hidden_size, norm_layer=norm_type, adaln_bias=adaln_bias, adaln_type=adaln_type)
+            self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, norm_layer=norm_type, adaln_bias=adaln_bias, adaln_type=adaln_type)
 
         self.initialize_weights(pretrain_ckpt=pretrain_ckpt, ignore=ignore_keys)
         if finetune != None:
@@ -266,7 +196,7 @@ class QuadtreeFiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        if self.x_embedder is not None:
+        if hasattr(self.x_embedder, 'proj'):
             w = self.x_embedder.proj.weight.data
             nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
             nn.init.constant_(self.x_embedder.proj.bias, 0)
@@ -291,21 +221,19 @@ class QuadtreeFiT(nn.Module):
             nn.init.constant_(self.global_adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layer adaLN + linear so the model starts near identity.
-        head = self.final_layer if self.final_layer is not None else self.final_norm
+        head = self.final_layer
         if self.adaln_type == 'swiglu':
             nn.init.constant_(head.adaLN_modulation.fc2.weight, 0)
             nn.init.constant_(head.adaLN_modulation.fc2.bias, 0)
         else:   # adaln_type in ['normal', 'lora']
             nn.init.constant_(head.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(head.adaLN_modulation[-1].bias, 0)
-        if self.final_layer is not None:
+        # With the pyramid decoder the zero-init lives on PyramidDecoder.out (it
+        # is already zeroed there), so zeroing this linear too would kill the
+        # decoder's input entirely. Only zero it on the direct-readout path.
+        if not self.use_pyramid_decoder:
             nn.init.constant_(self.final_layer.linear.weight, 0)
             nn.init.constant_(self.final_layer.linear.bias, 0)
-        else:
-            # Learned-resampling head: zero the resampler's output conv so the
-            # prediction starts at zero, matching the zeroed FinalLayer above.
-            nn.init.constant_(self.resampler.out.weight, 0)
-            nn.init.constant_(self.resampler.out.bias, 0)
 
         keys = list(self.state_dict().keys())
         ignore_keys = []
@@ -352,41 +280,6 @@ class QuadtreeFiT(nn.Module):
                     self.ckpt_wrapper(block), x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask
                 )
         return x
-
-    def _embed_tokens(self, x, tsize):
-        """Token in-projection. x: (1, N, 4*C_in), tsize: (1, N) leaf side.
-
-        Raw path: plain linear. Learned path: run each leaf-size group through
-        the shared Merge stack (LeafResampler.encode) and scatter back.
-        """
-        if not self.use_learned_resampling:
-            return self.x_embedder(x)
-        B, N, _ = x.shape
-        out = x.new_zeros(B, N, self.hidden_size)
-        for n in LEAF_SIZES:
-            sel = (tsize == n)                              # (1, N)
-            if not bool(sel.any()):
-                continue
-            out[sel] = self.resampler.encode(x[sel], n).to(out.dtype)
-        return out
-
-    def _readout_tokens(self, x, c, tsize):
-        """Token out-projection. x: (1, N, D) -> (1, N, 4*C_out).
-
-        Raw path: adaLN FinalLayer linear. Learned path: adaLN final norm then
-        per-leaf-size Split stack (LeafResampler.decode) scattered back.
-        """
-        if not self.use_learned_resampling:
-            return self.final_layer(x, c)
-        x = self.final_norm(x, c)                           # (1, N, D)
-        B, N, _ = x.shape
-        out = x.new_zeros(B, N, 4 * self.out_channels)
-        for n in LEAF_SIZES:
-            sel = (tsize == n)
-            if not bool(sel.any()):
-                continue
-            out[sel] = self.resampler.decode(x[sel], n).to(out.dtype)
-        return out
 
     def _build_conditioning(self, t, y, tsize, doc_ids, dtype):
         """Build the per-token conditioning signal `c` that drives adaLN.
@@ -447,7 +340,7 @@ class QuadtreeFiT(nn.Module):
         """
         assert doc_ids is not None, "QuadtreeFiT only supports the packed path"
 
-        x = self._embed_tokens(x, tsize)                    # (1, N, D)
+        x = self.x_embedder(x)                                       # (1, N, D)
 
         c = self._build_conditioning(t, y, tsize, doc_ids, x.dtype)  # (B, N, D)
 
@@ -460,7 +353,7 @@ class QuadtreeFiT(nn.Module):
         freqs_cos, freqs_sin = self._rope_freqs(grid, size)
 
         x = self._run_blocks(self.blocks, x, c, mask, freqs_cos, freqs_sin, global_adaln, block_mask)
-        x = self._readout_tokens(x, c, tsize)               # (1, N, 4*C_out)
+        x = self.final_layer(x, c)                          # (1, N, 4*C_out)
         x = x * mask[..., None]                             # zero out padding tokens
         return x
 
