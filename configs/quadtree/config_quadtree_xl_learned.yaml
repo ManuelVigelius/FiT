@@ -1,3 +1,25 @@
+# ============================================================================
+# LEARNED: residual PyramidEncoder + residual PyramidDecoder, new head.
+#
+# Both learned paths are on, and both are RESIDUAL — each starts as a no-op and
+# only earns its way in:
+#
+#   in    token = base_proj(mean-pooled patch) + gamma * pyramid     (gamma = 0)
+#   out   x_hat = NN-upsampled per-token readout + gamma * pyramid   (gamma = 0)
+#
+# So at step 0 this is the baseline config, exactly, and the pyramids add detail
+# from there. base_proj is seeded from the checkpoint's x_embedder.proj, which
+# is where that pretrained patch embed goes now that the model's own x_embedder
+# is an Identity.
+#
+# The head is NEW: use_pyramid_decoder makes final_layer 1152-dim, so the
+# checkpoint's 16-dim head cannot load and is excluded via ignore_keys. The
+# readout lives on the decoder (base_head) and trains from scratch — which also
+# sidesteps the velocity-vs-x0 target mismatch the baseline config has to
+# finetune away.
+#
+# Compare against config_quadtree_xl_baseline.yaml.
+# ============================================================================
 diffusion:
   pretrained_first_stage_model_path: stabilityai/sd-vae-ft-ema
   network_config:
@@ -26,13 +48,26 @@ diffusion:
       adaln_type: lora
       adaln_lora_dim: 288
       use_size_cond: true          # learned per-leaf-size embedding (1/2/4/8)
-      # Tokens arrive from the trained PyramidEncoder at width d; when this equals
-      # hidden_size the input projection is the identity.
+      # Tokens arrive from the trained PyramidEncoder at width d; equal to
+      # hidden_size, so the model's own x_embedder is an Identity and the
+      # input projection lives on the compressor (base_proj) instead.
       token_input_dim: 1152
-      # ABLATION: false = per-token linear readout, loss on mean-pooled x0 tokens.
-      #           true  = tokens -> PyramidDecoder -> dense latent, full-res loss.
-      use_pyramid_decoder: false
-      # pretrain_ckpt: checkpoints/fitv2_xl.safetensors
+      # Tokens -> PyramidDecoder -> dense latent, supervised at FULL resolution.
+      # This rebuilds final_layer as a 1152-dim readout.
+      use_pyramid_decoder: true
+      # Pretrained TRUNK. final_layer is excluded on purpose: with
+      # use_pyramid_decoder it is 1152-dim, whereas the checkpoint's head is
+      # 16-dim, so it cannot be loaded — and should not be, since the decoder now
+      # owns the readout. x_embedder is likewise skipped (it is an Identity here);
+      # its pretrained weights are routed to the compressor's base_proj below.
+      pretrain_ckpt: checkpoints/fitv2_xl.safetensors
+      # NOTE: x_embedder in ignore_keys only stops the model from *claiming* those
+      # weights; loading still prints "2 unexpected keys
+      # (x_embedder.proj.weight/bias)". That is expected — x_embedder is an
+      # Identity here and those weights are consumed by base_proj on the
+      # compressor instead. Unexpected keys other than those two are a real
+      # mismatch and worth investigating.
+      ignore_keys: [final_layer, x_embedder]
 
   # Learned compression: frozen variance predictor decides the tree (see data),
   # this module fills the tokens from the FULL-RESOLUTION latent and is trained
@@ -45,7 +80,7 @@ diffusion:
       d: 1152                      # token width; must match token_input_dim
       crop: 32
       pad_to_multiple: 128
-      with_decoder: false          # must match use_pyramid_decoder above
+      with_decoder: true           # must match use_pyramid_decoder above
       share_weights: true          # one Merge/Split shared across all levels
       # RESIDUAL MODE: token = base_proj(mean-pooled patch) + gamma * pyramid,
       # with gamma zero-init. At step 0 the transformer therefore sees exactly the

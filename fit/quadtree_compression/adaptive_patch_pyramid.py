@@ -13,6 +13,11 @@ Design commitments:
   - Decoder is the synthesis side of a Laplacian pyramid, not a U-Net. Coarse
     tokens are placed on a sparse grid; each upsampling step fills the holes with
     finer tokens. The quadtree guarantees the levels are disjoint and complete.
+  - Both encoder and decoder support a RESIDUAL mode in which the learned pyramid
+    only ever adds a zero-gated correction on top of an ordinary patch embed /
+    per-token readout. See PyramidEncoder.tokens_at_level and
+    PyramidDecoder.base_predict. In that mode, at zero compression the pair
+    reduces exactly to plain FiT's patchify -> linear -> unpatchify.
   - Decoder blend blocks are ConvNeXt-style (depthwise + inverted bottleneck) and
     DO cross patch boundaries. That is what removes seams.
   - Everything is dense. The level-2 grid is stored full-size even when mostly
@@ -40,6 +45,30 @@ class ChannelsLastLN(nn.Module):
 
     def forward(self, x):
         return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
+def _patchify_2x2(z):
+    """(B, C, H, W) -> (B, 4*C, H/2, W/2), channels ordered (c, p1, p2).
+
+    This is `fit.utils.utils.patchify(z, 2)` kept in spatial layout, and the
+    ordering matters: three different 4*C layouts are in play in this repo.
+
+      * `patchify`                -> (c p1 p2)   <- what the PRETRAINED
+                                                    `x_embedder` was trained on
+      * `F.pixel_unshuffle`       -> (c p1 p2) but with p1/p2 as the fast axes
+                                     of a different reshape — NOT the same
+      * `compress_from_variance`  -> (p1 p2 c)   <- the quadtree's own legacy
+                                                    layout, embed trained from
+                                                    scratch so it never mattered
+
+    Residual mode exists to reuse pretrained weights, so this follows `patchify`.
+    A permuted layout here would still train, just from a scrambled starting
+    point — which is exactly the failure this mode is meant to avoid.
+    """
+    b, c, h, w = z.shape
+    return (z.reshape(b, c, h // 2, 2, w // 2, 2)
+             .permute(0, 1, 3, 5, 2, 4)
+             .reshape(b, 4 * c, h // 2, w // 2))
 
 
 def gather_tokens(feat, mask):
@@ -96,10 +125,13 @@ class PyramidEncoder(nn.Module):
     levels you mostly discard is cheaper than any ragged alternative.
     """
 
-    def __init__(self, latent_ch, c, d, n_levels=3, share_weights=False):
+    def __init__(self, latent_ch, c, d, n_levels=3, share_weights=False,
+                 residual=False):
         super().__init__()
         self.n_levels = n_levels
         self.c = c
+        self.latent_ch = latent_ch
+        self.residual = residual
         self.stem = nn.Conv2d(4 * latent_ch, c, 1)
         if share_weights:
             merge = Merge(c)
@@ -109,6 +141,50 @@ class PyramidEncoder(nn.Module):
         self.proj = nn.Linear(c, d)
         self.scale_emb = nn.Parameter(torch.zeros(n_levels, d))
 
+        # ---- residual mode ---------------------------------------------------
+        # The learned pyramid is a CORRECTION on top of the ordinary patch embed,
+        # not a replacement for it. `base_proj` is the same 4*C -> d linear the
+        # plain model calls `x_embedder.proj`, so a pretrained FiT checkpoint can
+        # be copied straight into it (see `load_base_proj`). `res_gamma` is
+        # zero-init, which makes the encoder output vanish at step 0: the model
+        # then sees EXACTLY the mean-pooled baseline tokens it was pretrained on,
+        # and the pyramid only ever earns its way in from there.
+        if residual:
+            self.base_proj = nn.Linear(4 * latent_ch, d)
+            self.res_gamma = nn.Parameter(torch.zeros(n_levels, d))
+        else:
+            self.base_proj = None
+            self.res_gamma = None
+
+    @torch.no_grad()
+    def load_base_proj(self, weight, bias=None):
+        """Copy a pretrained `x_embedder.proj` into the base projection.
+
+        weight: (d, 4*latent_ch) — the pretrained patch embed matrix.
+        """
+        assert self.base_proj is not None, "encoder built with residual=False"
+        self.base_proj.weight.copy_(weight)
+        if bias is not None:
+            self.base_proj.bias.copy_(bias)
+
+    def base_features(self, z):
+        """z: (B, C, H, W) -> list of (B, 4*C, H_l, W_l) mean-pooled patch values.
+
+        Level l holds the value a plain patchify would give if the whole image
+        used patch size 2^(l+1): the 2x2 block of size-2^l leaves, flattened
+        row-major to 4*C. That is byte-for-byte the layout
+        `compress_from_variance` used to emit, hence what the pretrained
+        `x_embedder` expects.
+        """
+        feats = [_patchify_2x2(z)]
+        for _ in range(self.n_levels - 1):
+            # avg-pool the LEAF values, then re-block into 2x2 patches. Pooling in
+            # (C, H, W) space and re-blocking keeps the (p1, p2, C) row-major
+            # ordering intact at every level.
+            z = F.avg_pool2d(z, 2)
+            feats.append(_patchify_2x2(z))
+        return feats
+
     def features(self, z):
         """z: (B, C, H, W) -> list of (B, c, H/2^(l+1), W/2^(l+1)), fine to coarse."""
         x = self.stem(F.pixel_unshuffle(z, 2))
@@ -117,6 +193,19 @@ class PyramidEncoder(nn.Module):
             x = merge(x)
             feats.append(x)
         return feats
+
+    def tokens_at_level(self, feat, base_feat, mask, l):
+        """Gather level-l tokens: base patch embed + gated pyramid residual.
+
+        feat      : (B, c, H_l, W_l)    pyramid features for level l
+        base_feat : (B, 4*C, H_l, W_l)  mean-pooled patch values, or None
+        mask      : (B, H_l, W_l) bool
+        """
+        t = self.proj(gather_tokens(feat, mask)) + self.scale_emb[l]
+        if self.residual:
+            base = self.base_proj(gather_tokens(base_feat, mask))
+            t = base + self.res_gamma[l] * t
+        return t
 
     def forward(self, z, masks):
         """
@@ -128,9 +217,10 @@ class PyramidEncoder(nn.Module):
         ordering -- the decoder's scatter assumes it.
         """
         feats = self.features(z)
+        base = self.base_features(z) if self.residual else [None] * self.n_levels
         tokens, levels = [], []
         for l, (f, m) in enumerate(zip(feats, masks)):
-            t = self.proj(gather_tokens(f, m)) + self.scale_emb[l]
+            t = self.tokens_at_level(f, base[l], m, l)
             tokens.append(t)
             levels.append(torch.full((t.shape[0],), l, dtype=torch.long, device=t.device))
         return torch.cat(tokens, 0), torch.cat(levels, 0)
@@ -197,12 +287,38 @@ class PyramidDecoder(nn.Module):
     """
 
     def __init__(self, latent_ch, c, d, n_levels=3, c_head=None, t_dim=None,
-                 share_weights=False, zero_init_out=True):
+                 share_weights=False, zero_init_out=True, residual=False,
+                 patch_size=2):
         super().__init__()
         self.n_levels = n_levels
         self.c = c
+        self.latent_ch = latent_ch
+        self.residual = residual
+        self.patch_size = patch_size
         c_head = c_head or c // 4
         self.c_head = c_head
+
+        # ---- residual mode ---------------------------------------------------
+        # Mirror of PyramidEncoder's residual path, on the way out. The BASE
+        # prediction is the ordinary per-token readout — d -> patch_size^2 *
+        # latent_ch, exactly plain FiT's `final_layer.linear` — reshaped to a
+        # patch and repeated across the leaf's footprint. The conv stack below
+        # then only supplies a zero-gated correction.
+        #
+        # Why an explicit repeat rather than leaning on Split's ICNR init: ICNR
+        # makes Split start as nearest-neighbour upsampling SPATIALLY, but the
+        # vector it replicates has already been through the random `in_proj`
+        # (d -> c) and is later mapped by the random `out` (c_head ->
+        # latent_ch). Measured at init, the replicated block correlates ~0.06
+        # with the token it came from. ICNR replicates the wrong thing; only an
+        # explicit base path makes the output start AT the token's own
+        # prediction.
+        if residual:
+            self.base_head = nn.Linear(d, patch_size * patch_size * latent_ch)
+            self.res_gamma = nn.Parameter(torch.zeros(n_levels, 1, 1, 1))
+        else:
+            self.base_head = None
+            self.res_gamma = None
 
         self.in_proj = nn.Linear(d, c)
         # tells the blend convs where the patch-size boundaries are
@@ -229,12 +345,72 @@ class PyramidDecoder(nn.Module):
         # PredictiveVarianceCompressor): a zero here blocks ALL gradient to the
         # transformer and the encoder upstream, not just to this layer. Pass
         # zero_init_out=False in that setting.
-        if zero_init_out:
+        # Residual mode must NOT zero `out`: the gate `res_gamma` is already
+        # zero, and a product of two zero-init factors is a dead end — both
+        # factors then receive exactly zero gradient and the pyramid never
+        # trains at all. Exactly one of the two may be zero. Keeping `out`
+        # random (and the gate zero) is the encoder's arrangement and the one
+        # that bootstraps: gamma moves on step 1, which opens the path to `out`.
+        if zero_init_out and not residual:
             nn.init.zeros_(self.out.weight)
             nn.init.zeros_(self.out.bias)
         else:
             nn.init.normal_(self.out.weight, std=0.02)
             nn.init.zeros_(self.out.bias)
+
+    def base_predict(self, tokens, masks):
+        """Per-token readout, NN-upsampled onto the dense latent grid.
+
+        This is the decoder's identity-like starting point. Each token is mapped
+        to one `patch_size x patch_size` patch by `base_head` (the same shape
+        plain FiT's `final_layer.linear` produces) and that patch is then
+        repeated across the token's whole footprint: a level-l token owns a
+        2N x 2N latent region with N == 2^l, i.e. an N x N tiling of the patch.
+
+        At level 0 (N == 1) there is no repetition at all, so with zero
+        compression this reduces EXACTLY to plain FiT's readout. For a coarse
+        leaf it is a blocky upsample of a single predicted patch — deliberately
+        the honest baseline, since a coarse token genuinely carries only one
+        patch worth of information. The pyramid's job is to add back the detail
+        that blockiness is missing.
+
+        tokens: (N_total, d) in level-major order
+        masks:  list of n_levels (B, H_l, W_l) bool
+        returns (B, latent_ch, H, W)
+        """
+        p, C = self.patch_size, self.latent_ch
+        counts = [int(m.sum()) for m in masks]
+        # `tokens` may already BE patches: when an external head (e.g. a
+        # pretrained final_layer) has done the d -> p*p*C readout, applying
+        # base_head again would project a second time. Detect that by width and
+        # pass through, so the same method serves both wirings.
+        flat = tokens if tokens.shape[-1] == p * p * C else self.base_head(tokens)
+        per_level = list(torch.split(flat, counts, dim=0))
+
+        B = masks[0].shape[0]
+        H = masks[0].shape[1] * p                    # level-0 grid is H/p cells
+        out = None
+        for l, m in enumerate(masks):
+            if counts[l] == 0:
+                continue
+            n = 2 ** l                               # patch tiling factor
+            # scatter the flat patch vectors onto the level-l grid
+            g = scatter_tokens(per_level[l], m, p * p * C)   # (B, p*p*C, H_l, W_l)
+            b, _, hl, wl = g.shape
+            # (p*p*C) -> (C, p, p), then tile n x n and fold into pixels
+            g = g.reshape(b, C, p, p, hl, wl)
+            g = g.permute(0, 1, 4, 2, 5, 3)          # (B, C, H_l, p, W_l, p)
+            g = g.reshape(b, C, hl * p, wl * p)      # patch grid -> pixels
+            if n > 1:
+                g = g.repeat_interleave(n, dim=2).repeat_interleave(n, dim=3)
+            # same for the mask, so levels stay disjoint
+            mm = m[:, None].to(g.dtype)
+            mm = mm.repeat_interleave(p * n, dim=2).repeat_interleave(p * n, dim=3)
+            g = g * mm
+            out = g if out is None else out + g
+        if out is None:
+            out = tokens.new_zeros(B, C, H, H)
+        return out
 
     def forward(self, tokens, masks, z, t_emb=None):
         """
@@ -243,6 +419,7 @@ class PyramidDecoder(nn.Module):
         z:      (B, C, H, W) noisy latent, for the long skip
         returns x_hat: (B, C, H, W)
         """
+        base = self.base_predict(tokens, masks) if self.residual else None
         h = self.in_proj(tokens)
         counts = [int(m.sum()) for m in masks]
         per_level = list(torch.split(h, counts, dim=0))
@@ -266,4 +443,22 @@ class PyramidDecoder(nn.Module):
         f = self.head_split(f)                       # -> full latent resolution
         f = self.skip_proj(torch.cat([f, z], dim=1))  # long skip from z_t
         f = self.head_blend(f, t_emb)
-        return self.out(f)
+        res = self.out(f)
+        if not self.residual:
+            return res
+        # Per-level gate, broadcast back onto the dense grid so each region is
+        # gated by the level that owns it. Coarse leaves need the pyramid most,
+        # so letting their gate open at its own rate is worth the bookkeeping.
+        gate = self._gate_map(masks, res)
+        return base + gate * res
+
+    def _gate_map(self, masks, ref):
+        """(B, 1, H, W) map of res_gamma[l] over each level's footprint."""
+        p = self.patch_size
+        gate = torch.zeros_like(ref[:, :1])
+        for l, m in enumerate(masks):
+            n = 2 ** l
+            mm = m[:, None].to(ref.dtype)
+            mm = mm.repeat_interleave(p * n, dim=2).repeat_interleave(p * n, dim=3)
+            gate = gate + self.res_gamma[l].view(1, 1, 1, 1) * mm
+        return gate

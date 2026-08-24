@@ -30,24 +30,33 @@ the checkpoint should not care. If it does, this script shows it.
 
 This also verifies the claim in the module docstring of
 `adaptive_patch_pyramid` that the pyramid only ever supplies a *residual*: at
-level 0 the tokens must already carry the full signal, since `MODE = "patchify"`
+level 0 the tokens must already carry the full signal, since `MODE = "baseline"`
 reconstructs images from raw patches alone.
 
 The two modes
 -------------
-``MODE = "patchify"``  (the reference)
-    Build the model with ``token_input_dim=16`` so ``x_embedder`` is the
-    checkpoint's own ``PatchEmbedder``, and feed raw 2x2-patchified latents in
-    quadtree order. Expect REAL IMAGES.
+``MODE = "baseline"``  (the reference)
+    No learned compression at all. Build the model with ``token_input_dim=16`` so
+    ``x_embedder`` is the checkpoint's own ``PatchEmbedder``, feed raw
+    2x2-patchified latents in quadtree order, and read out with the checkpoint's
+    own ``final_layer``. Expect REAL IMAGES.
 
-``MODE = "encoder"``   (the contrast)
-    Keep ``token_input_dim=1152`` (``x_embedder`` is Identity) and take tokens
-    from the level-0 output of `PyramidEncoder`. Those weights are randomly
-    initialised and have never been aligned with the pretrained token space, so
-    expect NOISE. This is not a failure of the trunk — it measures how far the
-    untrained encoder sits from the embedding the checkpoint expects.
+``MODE = "learned"``   (encoder + decoder)
+    Tokens come from `PyramidEncoder` (``token_input_dim=1152``, so
+    ``x_embedder`` is an Identity) and the head output is routed back to a dense
+    latent through `PyramidDecoder.base_predict`. What this shows depends on
+    ``RESIDUAL``:
 
-``MODE = "both"`` writes them side by side, reference on the left.
+      True  — both pyramids run in residual mode with zero-init gates, and
+              ``base_proj`` is seeded from the checkpoint's ``x_embedder.proj``.
+              At zero compression the pooled patch IS the raw patch and the
+              decoder's upsample is a no-op, so this reduces EXACTLY to baseline
+              and the two panels must show the SAME images. Checked numerically.
+      False — the pyramids are untrained and unseeded, so expect NOISE. Not a
+              trunk failure; it measures how far an untrained pyramid sits from
+              the pretrained token space.
+
+``MODE = "both"`` runs both and writes them side by side, baseline on the left.
 
 Prediction head
 ---------------
@@ -127,11 +136,20 @@ CKPT_FILE = "model_1.safetensors"      # used only when CKPT_PATH is a directory
 #   OUTPUT_DIR = "/visinf/projects_students/mb_mvigel/quadtree_ckpt_test"
 OUTPUT_DIR = str(_REPO_ROOT / "quadtree_ckpt_test")
 
-# "patchify" | "encoder" | "both"  — see the module docstring.
+# Which token/readout paths to exercise. Each entry is (use_encoder, use_decoder):
+#   "baseline" — raw patches in, model's own head out          (both off)
+#   "learned"  — PyramidEncoder in, PyramidDecoder out         (both on)
+# "both" runs baseline then learned and compares them pixel-for-pixel.
 MODE = "both"
 
-# Load the checkpoint's final_layer (velocity head). False leaves it zero-init,
-# which makes the model output exactly zero — no images by construction.
+# The pretrained final_layer (velocity head) is ALWAYS loaded — that is the whole
+# mechanism of this test: real images can only come out if the pretrained weights
+# are applied correctly. Both modes therefore keep use_pyramid_decoder=False so
+# final_layer stays 16-dim and the checkpoint's head fits; the "learned" mode
+# routes that head's output through the decoder's residual path instead of
+# replacing it. (Training uses a 1152-dim head — see
+# config_quadtree_xl_learned.yaml — but that head has no pretrained weights to
+# verify, so it is out of scope here.)
 LOAD_HEAD = True
 
 # Quadtree threshold. 0.0 = NO COMPRESSION (all size-1 leaves). This is what
@@ -142,6 +160,20 @@ QUADTREE_THRESHOLD = 0.0
 # Keep the learned per-leaf-size embedding active. It is zero-init, so at zero
 # compression it contributes nothing — leaving it on proves that.
 USE_SIZE_COND = True
+
+# Run the learned paths in RESIDUAL mode, seeded from the checkpoint.
+#
+#   True  — encoder: token  = base_proj(pooled patch) + gamma * pyramid
+#           decoder: x_hat  = NN-upsampled head(token) + gamma * pyramid
+#           both gammas zero-init, base_proj from x_embedder.proj and base_head
+#           from final_layer.linear. At zero compression the pooled patch IS the
+#           raw patch and the upsample is a no-op, so "learned" reduces EXACTLY
+#           to "baseline" and both must produce the SAME images. That turns the
+#           side-by-side from a vague "looks plausible" into an equality check.
+#   False — legacy contrast: the pyramids run untrained and unseeded, so the
+#           learned panel is noise. It only shows how far an untrained pyramid
+#           sits from the pretrained token space.
+RESIDUAL = True
 
 N_IMAGES = 8
 BATCH_SIZE = 8
@@ -369,16 +401,72 @@ def tokens_from_patchify(x_sp, order, N, dtype):
 
 
 def tokens_from_encoder(compressor, x_sp, plan, N, dtype):
-    """Level-0 tokens straight out of the (untrained) PyramidEncoder.
+    """Tokens from the PyramidEncoder, via the compressor's own batched path.
 
-    Uses the compressor's own batched path so this reflects the real training
-    pipeline, not a reimplementation of it.
+    In residual mode with a seeded base_proj these are bit-identical to
+    `tokens_from_patchify` put through the checkpoint's PatchEmbedder.
     """
     plans = [plan] * x_sp.shape[0]
     tokens, counts = compressor.encode_batch(x_sp, plans)
     out = tokens.new_zeros(1, N, tokens.shape[-1])
     out[0, :sum(counts)] = tokens
     return out.to(dtype)
+
+
+def _to_level_major(tok, masks, lm_order, n_pack):
+    """(n_pack, n_tok, D) in recursion order -> the decoder's level-major order.
+
+    Boolean-mask indexing over a BATCHED mask is image-major within each level
+    (all of image 0's level-l tokens, then image 1's, ...), so the flat tensor
+    the decoder wants is: for each level, every image's tokens for that level.
+    """
+    n_tok = tok.shape[1]
+    to_lm = torch.empty_like(lm_order)
+    to_lm[lm_order] = torch.arange(lm_order.shape[0], device=lm_order.device)
+    per_img = [tok[i][to_lm] for i in range(n_pack)]        # each (n_tok, D)
+
+    counts = [int(m[0].sum()) for m in masks]
+    blocks, off = [], 0
+    for c in counts:
+        blocks.append(torch.cat([p[off:off + c] for p in per_img], 0))
+        off += c
+    return torch.cat(blocks, 0)
+
+
+def latent_from_tokens(out, compressor, plan, order, n_pack, use_decoder):
+    """Model output tokens -> dense latent prediction.
+
+    baseline: the tokens ARE 2x2 patches (the pretrained 16-dim head), so this is
+    reorder + unpatchify — the standard FiT readout.
+
+    learned: the same 16-dim head output goes through the decoder's residual
+    path, base_predict + gamma * pyramid. `base_predict` expects exactly this
+    patch_size**2 * C shape, which is why the pretrained head can stay in place.
+    With gamma = 0 and size-1 leaves the two paths agree exactly.
+    """
+    n_tok = int(plan['sizes'].shape[0])
+    tok = out[0, :n_pack * n_tok].reshape(n_pack, n_tok, -1)
+
+    inv = torch.empty_like(order)
+    inv[order] = torch.arange(order.shape[0], device=order.device)
+
+    if not use_decoder:
+        return unpatchify(tok[:, inv].float(), (LATENT_SIZE, LATENT_SIZE),
+                          PATCH_SIZE)
+
+    dec = compressor.decoder
+    masks, lm_order = plan_to_masks(
+        plan['levels'], plan['positions'], plan['sizes'], LATENT_SIZE,
+        n_levels=dec.n_levels)
+    masks = [m.expand(n_pack, -1, -1) for m in masks]
+    lm = _to_level_major(tok.float(), masks, lm_order, n_pack)
+
+    # base_predict is the residual path's base term and consumes the head output
+    # directly. The pyramid branch is skipped: it needs d-wide tokens (in_proj is
+    # d -> c), which the pretrained 16-dim head does not produce. With gamma = 0
+    # it would contribute nothing anyway, and this test exists to check the
+    # pretrained weights, not the untrained pyramid.
+    return dec.base_predict(lm, masks)
 
 
 @torch.no_grad()
@@ -403,7 +491,7 @@ def sample_batch(model, compressor, plan, order, g, labels, mode, device, dtype)
         t, dt = ts[i], ts[i + 1] - ts[i]
         x2 = torch.cat([x, x], 0)                       # cond + uncond
 
-        if mode == "patchify":
+        if mode == "baseline":
             feat = tokens_from_patchify(x2, order, N, dtype)
         else:
             feat = tokens_from_encoder(compressor, x2, plan, N, dtype)
@@ -411,13 +499,8 @@ def sample_batch(model, compressor, plan, order, g, labels, mode, device, dtype)
         t_pack = t.repeat(1, 2 * n_pack)
         out = model(feat, t_pack, y, **kwargs)          # (1, N, ...)
 
-        n_tok = int(plan['sizes'].shape[0])
-        v_tok = out[0, :2 * n_pack * n_tok].reshape(2 * n_pack, n_tok, -1)
-        # back to row-major before unpatchify
-        inv = torch.empty_like(order)
-        inv[order] = torch.arange(order.shape[0], device=order.device)
-        v_tok = v_tok[:, inv]
-        v = unpatchify(v_tok.float(), (LATENT_SIZE, LATENT_SIZE), PATCH_SIZE)
+        v = latent_from_tokens(out, compressor, plan, order, 2 * n_pack,
+                               use_decoder=(mode == "learned"))
 
         v_c, v_u = v.chunk(2, dim=0)
         x = x + (v_u + CFG_SCALE * (v_c - v_u)).to(dtype) * dt
@@ -435,7 +518,7 @@ def decode_and_save(vae, x, paths):
 
 
 def save_side_by_side(a_dir, b_dir, out_dir, n):
-    """Reference (patchify) left, encoder right, one file per image."""
+    """Reference (baseline) left, learned right, one file per image."""
     os.makedirs(out_dir, exist_ok=True)
     for i in range(n):
         a = Image.open(os.path.join(a_dir, f"{i:03d}.png"))
@@ -483,19 +566,41 @@ def run_mode(mode, ckpt_path, plan, order, g, vae, labels):
     out_dir = os.path.join(OUTPUT_DIR, mode)
     os.makedirs(out_dir, exist_ok=True)
 
-    # patchify -> pretrained PatchEmbedder (16 -> 1152).
-    # encoder  -> Identity, tokens already at hidden_size.
-    token_input_dim = C_IN * PATCH_SIZE ** 2 if mode == "patchify" else HIDDEN_SIZE
+    # baseline -> pretrained PatchEmbedder (16 -> 1152).
+    # learned  -> Identity, tokens already at hidden_size from the encoder.
+    # Both keep use_pyramid_decoder=False so final_layer stays 16-dim and the
+    # pretrained head loads in either case.
+    token_input_dim = C_IN * PATCH_SIZE ** 2 if mode == "baseline" else HIDDEN_SIZE
     model = load_model(ckpt_path, token_input_dim, DEVICE)
     dtype = next(model.parameters()).dtype
 
     compressor = None
-    if mode == "encoder":
+    if mode == "learned":
         compressor = PredictiveVarianceCompressor(
             latent_channels=C_IN, c=256, d=HIDDEN_SIZE, crop=LATENT_SIZE,
-            pad_to_multiple=PAD_TO_MULTIPLE, with_decoder=False,
-            share_weights=True).to(DEVICE).eval()
-        print("  [note] PyramidEncoder is randomly initialised — expect noise.")
+            pad_to_multiple=PAD_TO_MULTIPLE, with_decoder=True,
+            share_weights=True, residual_encoder=RESIDUAL,
+            residual_decoder=RESIDUAL, patch_size=PATCH_SIZE,
+            # load_base_head stays False: this script keeps the model's own
+            # pretrained final_layer, which has already done the 1152 -> 16
+            # readout by the time the decoder sees the tokens. base_predict
+            # detects that width and passes them through, so base_head is unused
+            # here. (In training it is the readout — see
+            # config_quadtree_xl_learned.yaml.)
+            load_base_head=False,
+        ).to(DEVICE).eval()
+        if RESIDUAL:
+            compressor.load_base_proj_from_ckpt(ckpt_path)
+            # base_head is deliberately NOT seeded. The model's own pretrained
+            # final_layer has already mapped 1152 -> 16, so the tokens reaching
+            # the decoder are patches; base_predict detects that width and passes
+            # them through rather than projecting a second time. In training the
+            # decoder owns the readout instead (see config_quadtree_xl_learned).
+            print("  [note] residual encoder+decoder, base_proj from the "
+                  "checkpoint, head stays pretrained; gamma=0 means this must "
+                  "MATCH baseline mode.")
+        else:
+            print("  [note] pyramids are untrained and unseeded — expect noise.")
 
     if not LOAD_HEAD:
         print("  [note] LOAD_HEAD=False: zero-init head outputs 0; "
@@ -541,18 +646,46 @@ def main():
     print(f"\nLoading VAE from {VAE_PATH} …")
     vae = AutoencoderKL.from_pretrained(VAE_PATH).to(DEVICE).eval()
 
-    modes = ["patchify", "encoder"] if MODE == "both" else [MODE]
+    modes = ["baseline", "learned"] if MODE == "both" else [MODE]
     dirs = {m: run_mode(m, ckpt_path, plan, order, g, vae, labels) for m in modes}
 
     if MODE == "both":
         sbs = os.path.join(OUTPUT_DIR, "side_by_side")
-        save_side_by_side(dirs["patchify"], dirs["encoder"], sbs, N_IMAGES)
-        print(f"\nSide-by-side (patchify | encoder) -> {sbs}")
+        save_side_by_side(dirs["baseline"], dirs["learned"], sbs, N_IMAGES)
+        print(f"\nSide-by-side (baseline | learned) -> {sbs}")
+
+        if RESIDUAL:
+            # In residual mode with a seeded base_proj the two token sources are
+            # the same function, so the saved PNGs must agree exactly. Comparing
+            # decoded pixels (not tokens) makes this an end-to-end check: it
+            # covers the sampler, the head and the VAE too, and it is the one
+            # assertion that would catch a layout or ordering regression in
+            # base_features that still "looks fine" by eye.
+            import numpy as np
+            worst = 0
+            for i in range(N_IMAGES):
+                a = np.asarray(Image.open(
+                    os.path.join(dirs["baseline"], f"{i:03d}.png")), dtype=np.int16)
+                b = np.asarray(Image.open(
+                    os.path.join(dirs["learned"], f"{i:03d}.png")), dtype=np.int16)
+                worst = max(worst, int(np.abs(a - b).max()))
+            # Allow a tiny slack: the two paths differ by one extra matmul, so
+            # float non-associativity can move a pixel by a level or two.
+            status = "MATCH" if worst <= 2 else "MISMATCH"
+            print(f"Residual check: max |baseline - learned| = {worst}/255  "
+                  f"[{status}]")
+            if worst > 2:
+                print("  -> learned mode does NOT reduce to the pretrained "
+                      "path. Check base_proj seeding, the base_features channel "
+                      "layout, and the decoder's level-major ordering.")
 
     print(f"\nDone. Inspect {OUTPUT_DIR}.")
-    print("PASS  = 'patchify' images are recognisable objects.")
-    print("FAIL  = 'patchify' images are noise -> QuadtreeFiT diverges from the "
+    print("PASS  = 'baseline' images are recognisable objects.")
+    print("FAIL  = 'baseline' images are noise -> QuadtreeFiT diverges from the "
           "checkpoint (trunk, RoPE grid, conditioning, packing or token order).")
+    if MODE == "both" and RESIDUAL:
+        print("        With RESIDUAL=True the two panels must ALSO be identical "
+              "(checked above).")
 
 
 if __name__ == "__main__":

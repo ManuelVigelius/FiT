@@ -38,6 +38,27 @@ step. That is fine: it is a plain batched conv forward.
                                               |
                                               v
                                    packed sequence -> QuadtreeFiT
+
+Residual encoding (`residual_encoder=True`)
+-------------------------------------------
+Letting the PyramidEncoder produce tokens on its own means training starts from a
+randomly-initialised conv stack: the transformer's first sight of an image is
+noise, and any pretrained FiT weights downstream are being asked to interpret a
+tokenisation they have never seen. Worse, once `token_input_dim == hidden_size`
+the model's own `x_embedder` collapses to `nn.Identity`, so a pretrained
+`x_embedder.proj` has nowhere to load and is silently discarded.
+
+In residual mode the encoder instead computes
+
+    token = base_proj(mean-pooled patch) + gamma_l * pyramid(full-res latent)
+
+where `base_proj` is the ordinary 4*C -> d patch embed (seedable straight from a
+pretrained `x_embedder.proj` via `base_proj_ckpt`) and `gamma_l` is a per-level,
+per-channel gate initialised to ZERO. At step 0 the tokens are therefore bit-exact
+with the mean-pooled tokens a plain FiT was pretrained on; the pyramid contributes
+nothing until the gate opens, and what it learns is strictly the sub-leaf detail
+that pooling threw away. That is the "adaptive patch pyramid provides only a
+residual signal" property, enforced by construction rather than by hoping.
 """
 
 import math
@@ -46,7 +67,7 @@ import torch
 import torch.nn as nn
 
 from fit.quadtree_compression.adaptive_patch_pyramid import (
-    PyramidEncoder, PyramidDecoder, gather_tokens)
+    PyramidEncoder, PyramidDecoder)
 from fit.quadtree_compression.quadtree_compression import (
     LEAF_SIZES, plan_to_masks)
 from fit.utils.utils import positions_to_grid
@@ -69,24 +90,115 @@ class PredictiveVarianceCompressor(nn.Module):
 
     def __init__(self, latent_channels=4, c=256, d=1152, crop=32,
                  pad_to_multiple=128, with_decoder=False, c_head=None,
-                 t_dim=None, share_weights=False):
+                 t_dim=None, share_weights=False, residual_encoder=False,
+                 base_proj_ckpt=None, residual_decoder=False,
+                 load_base_head=False, base_head_ckpt=None, patch_size=2):
         super().__init__()
         self.latent_channels = latent_channels
         self.crop = crop
         self.pad_to_multiple = pad_to_multiple
         self.d = d
+        self.residual_encoder = residual_encoder
 
         self.encoder = PyramidEncoder(latent_channels, c, d, n_levels=N_LEVELS,
-                                      share_weights=share_weights)
+                                      share_weights=share_weights,
+                                      residual=residual_encoder)
+        self.residual_decoder = residual_decoder
+        if residual_encoder and base_proj_ckpt is not None:
+            self.load_base_proj_from_ckpt(base_proj_ckpt)
         self.decoder = None
         if with_decoder:
             # zero_init_out=False is REQUIRED here: this decoder sits mid-graph,
             # between the transformer and the loss, so a zero output layer would
             # starve the transformer AND the encoder of gradient entirely.
+            # In residual mode the zero-init hazard the comment above describes
+            # no longer applies: `base_head` carries gradient to the transformer
+            # regardless of the gate, so PyramidDecoder zero-inits `out` itself.
             self.decoder = PyramidDecoder(latent_channels, c, d,
                                           n_levels=N_LEVELS, c_head=c_head,
                                           t_dim=t_dim, share_weights=share_weights,
-                                          zero_init_out=False)
+                                          zero_init_out=False,
+                                          residual=residual_decoder,
+                                          patch_size=patch_size)
+            # `load_base_head` is the switch; `base_head_ckpt` only says WHERE
+            # from (defaulting to the same checkpoint the trunk came from). They
+            # are separate so that "seed the readout" is an explicit decision
+            # rather than a side effect of naming a path — the two prediction
+            # targets involved (velocity vs clean x0) are easy to mix up.
+            if residual_decoder and load_base_head:
+                src = base_head_ckpt or base_proj_ckpt
+                if src is None:
+                    raise ValueError(
+                        'load_base_head=True but no checkpoint given; set '
+                        'base_head_ckpt (or base_proj_ckpt) to the source.')
+                self.load_base_head_from_ckpt(src)
+
+    def load_base_proj_from_ckpt(self, path, key='x_embedder.proj'):
+        """Seed the residual encoder's base projection from a pretrained FiT.
+
+        The pretrained `x_embedder.proj` maps 4*C mean-pooled latent values to
+        the token width. In residual mode that is exactly the role of
+        `encoder.base_proj`, so copying it across starts training from the
+        pretrained tokenisation instead of from noise.
+        """
+        if path.endswith('.safetensors'):
+            from safetensors.torch import load_file
+            sd = load_file(path)
+        else:
+            sd = torch.load(path, map_location='cpu')
+            sd = sd.get('model', sd.get('state_dict', sd))
+        w, b = sd.get(f'{key}.weight'), sd.get(f'{key}.bias')
+        if w is None:
+            print(f'[compressor] no {key}.weight in {path}; base_proj left at init')
+            return
+        self.encoder.load_base_proj(w.to(torch.float32), 
+                                    None if b is None else b.to(torch.float32))
+        print(f'[compressor] base_proj seeded from {key} in {path}')
+
+    def load_base_head_from_ckpt(self, path, key='final_layer.linear'):
+        """Seed the residual decoder's base readout from a pretrained FiT.
+
+        Mirror of `load_base_proj_from_ckpt` on the output side.
+
+        TWO CAVEATS, both easy to get wrong:
+
+        * TARGET. The pretrained `final_layer.linear` predicts VELOCITY, whereas
+          `Transport.loss_quadtree_dense` supervises CLEAN X0. Seeding from a
+          velocity checkpoint therefore gives a well-scaled readout of the right
+          shape, not a semantically correct one — it has to be finetuned onto the
+          new target. Only enable this when the source checkpoint's prediction
+          target matches your loss.
+        * SHAPE. This only works when the checkpoint's head is the token->patch
+          readout, i.e. it was trained WITHOUT use_pyramid_decoder. A checkpoint
+          saved with use_pyramid_decoder=True has a d->d passthrough head
+          instead, and its weights belong to a different wiring entirely; the
+          shape check below rejects that rather than loading nonsense.
+        """
+        assert self.decoder is not None and self.decoder.residual
+        if path.endswith('.safetensors'):
+            from safetensors.torch import load_file
+            sd = load_file(path)
+        else:
+            sd = torch.load(path, map_location='cpu')
+            sd = sd.get('model', sd.get('state_dict', sd))
+        w, b = sd.get(f'{key}.weight'), sd.get(f'{key}.bias')
+        if w is None:
+            raise KeyError(
+                f'load_base_head requested but {key}.weight is absent from '
+                f'{path}. Loading was asked for explicitly, so this is an error '
+                f'rather than something to warn about and skip.')
+        want = tuple(self.decoder.base_head.weight.shape)
+        if tuple(w.shape) != want:
+            raise ValueError(
+                f'{key}.weight is {tuple(w.shape)} but base_head needs {want}. '
+                f'A d->d shape means the checkpoint was trained WITH '
+                f'use_pyramid_decoder, where the readout lives on base_head and '
+                f'not on final_layer — those weights are not interchangeable.')
+        with torch.no_grad():
+            self.decoder.base_head.weight.copy_(w.to(torch.float32))
+            if b is not None:
+                self.decoder.base_head.bias.copy_(b.to(torch.float32))
+        print(f'[compressor] base_head seeded from {key} in {path}')
 
     # ------------------------------------------------------------------ #
     # encode                                                              #
@@ -162,13 +274,18 @@ class PredictiveVarianceCompressor(nn.Module):
         so nothing here loops over images on the GPU.
         """
         feats = self.encoder.features(x_t)          # list of (B, c, H_l, W_l)
+        # In residual mode the mean-pooled patch values ride alongside: the token
+        # is base_proj(pooled) + gamma * pyramid, gamma zero-init. See
+        # PyramidEncoder.tokens_at_level.
+        base = (self.encoder.base_features(x_t) if self.encoder.residual
+                else [None] * N_LEVELS)
         masks, counts, perm = self._batch_masks(plans, x_t.device)
 
         # No skipping of empty levels here: `perm` is indexed against the full
         # level-0..L-1 concatenation, and an empty level contributes a length-0
         # block that cat handles fine.
-        toks = [self.encoder.proj(gather_tokens(feats[l], masks[l]))
-                + self.encoder.scale_emb[l] for l in range(N_LEVELS)]
+        toks = [self.encoder.tokens_at_level(feats[l], base[l], masks[l], l)
+                for l in range(N_LEVELS)]
         tokens = torch.cat(toks, 0)[perm]           # -> packed order
         return tokens, counts
 

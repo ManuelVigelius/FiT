@@ -1,3 +1,20 @@
+# ============================================================================
+# BASELINE: no learned compression, pretrained head.
+#
+# Tokens are mean-pooled quadtree leaves fed straight to the checkpoint's own
+# PatchEmbedder; the readout is the checkpoint's own final_layer. The
+# PyramidEncoder/PyramidDecoder are not built at all.
+#
+# This is the reference point for the ablation: whatever
+# config_quadtree_xl_learned.yaml gains has to be measured against this.
+#
+# NOTE ON THE HEAD. The pretrained final_layer predicts VELOCITY, but
+# train_quadtree.py supervises CLEAN X0 (see Transport._loss_quadtree, with its
+# 1/(1-t)^2 weight). Loading the pretrained head therefore gives a well-scaled
+# starting point, not a correct one — it has to be finetuned onto the new
+# target. If you would rather start the head fresh, drop `pretrain_ckpt` and add
+# `ignore_keys: [final_layer]` to keep the trunk but re-init the readout.
+# ============================================================================
 diffusion:
   pretrained_first_stage_model_path: stabilityai/sd-vae-ft-ema
   network_config:
@@ -26,13 +43,16 @@ diffusion:
       adaln_type: lora
       adaln_lora_dim: 288
       use_size_cond: true          # learned per-leaf-size embedding (1/2/4/8)
-      # Tokens arrive from the trained PyramidEncoder at width d; when this equals
-      # hidden_size the input projection is the identity.
-      token_input_dim: 1152
-      # ABLATION: false = per-token linear readout, loss on mean-pooled x0 tokens.
-      #           true  = tokens -> PyramidDecoder -> dense latent, full-res loss.
+      # 16 == in_channels * patch_size^2, so x_embedder is the checkpoint's own
+      # PatchEmbedder and tokens are raw mean-pooled 2x2 patches. This is the
+      # value that lets a pretrained FiT load with NO unexpected keys.
+      token_input_dim: 16
+      # No PyramidDecoder: final_layer keeps its 16-dim readout, which is the
+      # shape the pretrained head has. (use_pyramid_decoder: true would rebuild
+      # it as 1152-dim and the pretrained head could no longer be loaded.)
       use_pyramid_decoder: false
-      # pretrain_ckpt: checkpoints/fitv2_xl.safetensors
+      # PRETRAINED HEAD: loads the whole checkpoint, final_layer included.
+      pretrain_ckpt: checkpoints/fitv2_xl.safetensors
 
   # Learned compression: frozen variance predictor decides the tree (see data),
   # this module fills the tokens from the FULL-RESOLUTION latent and is trained
@@ -47,28 +67,12 @@ diffusion:
       pad_to_multiple: 128
       with_decoder: false          # must match use_pyramid_decoder above
       share_weights: true          # one Merge/Split shared across all levels
-      # RESIDUAL MODE: token = base_proj(mean-pooled patch) + gamma * pyramid,
-      # with gamma zero-init. At step 0 the transformer therefore sees exactly the
-      # mean-pooled tokens a plain FiT was pretrained on, and the pyramid only
-      # adds detail as it earns it. Set base_proj_ckpt to a pretrained FiT to seed
-      # base_proj from its x_embedder.proj — otherwise that pretrained patch embed
-      # is thrown away (it has nowhere to go once token_input_dim == hidden_size).
-      residual_encoder: true
-      base_proj_ckpt: checkpoints/fitv2_xl.safetensors
-      # Same idea on the way out (needs with_decoder / use_pyramid_decoder true):
-      # x_hat = NN-upsampled per-token readout + gamma * pyramid, gamma zero-init.
-      residual_decoder: true
-      patch_size: 2
-      # Seed the decoder's readout (base_head) from the checkpoint's
-      # final_layer.linear. OFF here on purpose: the pretrained head predicts
-      # VELOCITY while this trainer supervises CLEAN X0, so seeding it would
-      # import the wrong target. Turn it on only when the source checkpoint's
-      # prediction target matches the loss — and note it requires a checkpoint
-      # trained WITHOUT use_pyramid_decoder, since that is the wiring where
-      # final_layer holds the token->patch readout. A mismatch is rejected
-      # rather than silently loaded.
-      load_base_head: false
-      # base_head_ckpt: <path>     # defaults to base_proj_ckpt when unset
+      # Both learned paths OFF. The compressor still runs — it is what walks the
+      # quadtree and packs the sequence — but tokens are plain mean-pooled leaf
+      # values and the model reads them out with its own final_layer. Nothing
+      # here is trained except through the diffusion loss.
+      residual_encoder: false
+      residual_decoder: false
 
 data:
   target: fit.data.in1k_quadtree_latent_dataset.INQuadtreeLatentLoader
