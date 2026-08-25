@@ -157,6 +157,22 @@ LOAD_HEAD = True
 # collapsing leaves and the pretrained weights no longer apply.
 QUADTREE_THRESHOLD = 0.0
 
+# Optional hand-painted tree, used INSTEAD of the uncompressed one.
+#   None            — the uncompressed 256-token tree (the real test).
+#   "centre"        — full res in the centre half, as coarse as the tree likes
+#                     outside (76 tokens: 64 size-1 + 12 size-4).
+#   "centre_half"   — full res in the centre, size-2 outside, i.e. the literal
+#                     "periphery at half resolution" (112 tokens).
+#
+# THIS IS A PROBE, NOT A PASS/FAIL TEST. The pretrained FiT has never seen a
+# mixed-size token sequence: every token it was trained on was one 2x2 patch, and
+# here a size-4 token claims a 8x8 latent region while its RoPE coordinate says
+# it sits at a single point. Degraded or broken output is the EXPECTED result and
+# says nothing about whether the implementation is correct. What it does show is
+# that the machinery runs end to end on a non-trivial tree — packing, RoPE grid,
+# per-level masks, decoder scatter — which is worth knowing before training.
+CUSTOM_PLAN = None
+
 # Keep the learned per-leaf-size embedding active. It is zero-init, so at zero
 # compression it contributes nothing — leaving it on proves that.
 USE_SIZE_COND = True
@@ -250,6 +266,55 @@ def resolve_ckpt(path: str) -> str:
     if not files:
         raise FileNotFoundError(f"no .safetensors under {path}")
     return os.path.join(path, files[0])
+
+
+def build_custom_plan(device, box=None, coarse_cap=None):
+    """A hand-painted quadtree: fine inside `box`, coarser outside.
+
+    The planner decides structure purely from the variance grids, so any tree can
+    be requested by painting variance directly — HIGH (>= threshold, i.e. "not
+    flat") where full resolution is wanted, LOW elsewhere. No separate
+    plan-building path is needed, which means this still exercises exactly the
+    recursion training uses.
+
+    box        : (y0, y1, x0, x1) in LATENT pixels, the region kept at size 1.
+                 None means the centre half, i.e. (8, 24, 8, 24) at 32x32.
+    coarse_cap : largest leaf side allowed outside the box. None lets the tree
+                 coarsen as far as it likes (typically size 4 for a centre box);
+                 2 gives the literal "periphery at half resolution".
+
+    Returns the same (plan, order, g) triple as `build_uncompressed_plan`, except
+    `order` is None — a mixed-size tree has no row-major equivalent to permute
+    to, so the patchify path does not apply to it.
+    """
+    q = LATENT_SIZE // 4
+    y0, y1, x0, x1 = box if box is not None else (q, 3 * q, q, 3 * q)
+
+    var = []
+    for N in REGION_SIZES:
+        gN = LATENT_SIZE // N
+        v = torch.zeros(gN, gN, device=device)          # low == compressible
+        if coarse_cap is not None and N > coarse_cap:
+            v[:] = 1.0                                  # forbid leaves this coarse
+        else:
+            for iy in range(gN):
+                for ix in range(gN):
+                    py0, py1 = iy * N, (iy + 1) * N
+                    px0, px1 = ix * N, (ix + 1) * N
+                    if py1 > y0 and py0 < y1 and px1 > x0 and px0 < x1:
+                        v[iy, ix] = 1.0                 # overlaps box -> split
+        var.append(v)
+
+    levels, positions, sizes = plan_from_variance(var, 0.5, LATENT_SIZE)
+
+    # The leaves must tile the latent exactly once; a gap or overlap here would
+    # silently corrupt both the RoPE grid and the decoder's scatter.
+    area = int((sizes.float() ** 2 * 4).sum())
+    assert area == LATENT_SIZE ** 2, (
+        f"leaves cover {area} latent px, expected {LATENT_SIZE ** 2}")
+
+    plan = dict(levels=levels, positions=positions, sizes=sizes)
+    return plan, None, LATENT_SIZE // PATCH_SIZE
 
 
 def build_uncompressed_plan(device):
@@ -392,6 +457,9 @@ def tokens_from_patchify(x_sp, order, N, dtype):
     sequence (and hence `grid`/`doc_ids`) expects. Getting this wrong is exactly
     the kind of bug the test is built to catch — the images would scramble.
     """
+    assert order is not None, (
+        "raw-patchify tokens require the uniform size-1 tree; a custom plan must "
+        "go through the encoder")
     tok = patchify(x_sp, PATCH_SIZE)                    # (n_pack, n_tok, 16)
     tok = tok[:, order]                                 # -> recursion order
     n_pack, n_tok, D = tok.shape
@@ -447,10 +515,14 @@ def latent_from_tokens(out, compressor, plan, order, n_pack, use_decoder):
     n_tok = int(plan['sizes'].shape[0])
     tok = out[0, :n_pack * n_tok].reshape(n_pack, n_tok, -1)
 
-    inv = torch.empty_like(order)
-    inv[order] = torch.arange(order.shape[0], device=order.device)
-
     if not use_decoder:
+        # Row-major readout only exists for the uniform size-1 tree; a mixed-size
+        # tree has no row-major grid to permute back to, hence order is None.
+        assert order is not None, (
+            "a custom (mixed-size) plan has no row-major order, so the "
+            "unpatchify readout does not apply — use the decoder path")
+        inv = torch.empty_like(order)
+        inv[order] = torch.arange(order.shape[0], device=order.device)
         return unpatchify(tok[:, inv].float(), (LATENT_SIZE, LATENT_SIZE),
                           PATCH_SIZE)
 
@@ -633,11 +705,23 @@ def main():
     print(f"Checkpoint : {ckpt_path}")
     print(f"Head       : {'pretrained (velocity)' if LOAD_HEAD else 'zero-init'}")
 
-    plan, order, g = build_uncompressed_plan(DEVICE)
-    print(f"Quadtree   : threshold={QUADTREE_THRESHOLD} -> "
-          f"{int(plan['sizes'].shape[0])} tokens, all size-1 "
-          f"(= uncompressed {g}x{g} grid)")
-    check_premises(plan, order, g, DEVICE)
+    if CUSTOM_PLAN is None:
+        plan, order, g = build_uncompressed_plan(DEVICE)
+        print(f"Quadtree   : threshold={QUADTREE_THRESHOLD} -> "
+              f"{int(plan['sizes'].shape[0])} tokens, all size-1 "
+              f"(= uncompressed {g}x{g} grid)")
+        check_premises(plan, order, g, DEVICE)
+    else:
+        cap = 2 if CUSTOM_PLAN == "centre_half" else None
+        plan, order, g = build_custom_plan(DEVICE, coarse_cap=cap)
+        sizes = plan['sizes']
+        hist = {int(n): int((sizes == n).sum()) for n in sorted(set(sizes.tolist()))}
+        print(f"Quadtree   : CUSTOM_PLAN={CUSTOM_PLAN!r} -> "
+              f"{int(sizes.shape[0])} tokens, sizes {hist}")
+        print("             [probe] mixed-size trees are OUT OF DISTRIBUTION for "
+              "the pretrained checkpoint;")
+        print("             degraded output is expected and is not a failure of "
+              "the implementation.")
 
     labels = torch.tensor(
         (CLASS_LABELS * (N_IMAGES // len(CLASS_LABELS) + 1))[:N_IMAGES],
@@ -647,9 +731,15 @@ def main():
     vae = AutoencoderKL.from_pretrained(VAE_PATH).to(DEVICE).eval()
 
     modes = ["baseline", "learned"] if MODE == "both" else [MODE]
+    if CUSTOM_PLAN is not None and "baseline" in modes:
+        # baseline feeds raw patches and reads out with unpatchify; both need the
+        # uniform tree. Only the encoder/decoder path handles mixed sizes.
+        print("\n[note] CUSTOM_PLAN set -> skipping 'baseline' mode "
+              "(raw patchify has no mixed-size equivalent).")
+        modes = [m for m in modes if m != "baseline"]
     dirs = {m: run_mode(m, ckpt_path, plan, order, g, vae, labels) for m in modes}
 
-    if MODE == "both":
+    if MODE == "both" and CUSTOM_PLAN is None:
         sbs = os.path.join(OUTPUT_DIR, "side_by_side")
         save_side_by_side(dirs["baseline"], dirs["learned"], sbs, N_IMAGES)
         print(f"\nSide-by-side (baseline | learned) -> {sbs}")
