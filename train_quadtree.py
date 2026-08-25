@@ -225,7 +225,15 @@ def main():
     transport = Transport()
 
     # ---- Frozen variance predictor + quadtree packer ------------------------
-    vp = _build_variance_predictor(data_cfg.params.train.variance_predictor, device)
+    # Optional: the ground-truth-variance loader
+    # (fit.data.in1k_gt_quadtree_latent_dataset) decides the quadtree from the
+    # clean latent CPU-side and has no predictor block. Its `train_iter` accepts
+    # and ignores `vp`, so passing None is the whole difference.
+    vp_cfg = getattr(data_cfg.params.train, 'variance_predictor', None)
+    vp = _build_variance_predictor(vp_cfg, device) if vp_cfg is not None else None
+    if vp is None:
+        logger.info("No variance_predictor block — quadtree structure comes from "
+                    "the dataset (ground-truth variance).")
 
     # ---- Learned compressor (PyramidEncoder [+ PyramidDecoder]) -------------
     # Trained jointly with the diffusion model. It runs on exactly the images the

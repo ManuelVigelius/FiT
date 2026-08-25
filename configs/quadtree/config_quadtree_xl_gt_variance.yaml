@@ -1,0 +1,154 @@
+# ============================================================================
+# GT-VARIANCE ABLATION: same model/compressor as config_quadtree_xl_learned.yaml,
+# but the quadtree is decided from the TRUE variance of the clean latent instead
+# of a VariancePredictor forward on x_t.
+#
+# The predictor is small, so its error is a confound: a badly-placed tree looks
+# the same as a compressor or transformer failure. This config removes it. It is
+# an ORACLE — it reads x0, which is unavailable at sampling time — so it is a
+# diagnostic baseline, not a deployable setup. The gap to the learned config is
+# the predictor's contribution to the error.
+#
+# Only the `data` block differs from config_quadtree_xl_learned.yaml:
+#   * a different loader (INGTQuadtreeLatentLoader)
+#   * no variance_predictor block (nothing to load, nothing to run)
+#   * a max_res_schedule, which is what now controls the token budget — the GT
+#     variance alone would emit 256 lossless tokens for any busy image.
+# ============================================================================
+diffusion:
+  pretrained_first_stage_model_path: stabilityai/sd-vae-ft-ema
+  network_config:
+    target: fit.model.quadtree_model.QuadtreeFiT
+    params:
+      context_size: 256
+      patch_size: 2
+      in_channels: 4
+      hidden_size: 1152
+      depth: 36
+      num_heads: 16
+      mlp_ratio: 4.0
+      class_dropout_prob: 0.1
+      num_classes: 1000
+      use_swiglu: true
+      use_swiglu_large: false
+      q_norm: layernorm
+      k_norm: layernorm
+      qk_norm_weight: false
+      rel_pos_embed: rope
+      online_rope: true            # required: quadtree grid has fractional coords
+      max_pe_len_h: 16
+      max_pe_len_w: 16
+      decouple: true
+      ori_max_pe_len: 16
+      adaln_type: lora
+      adaln_lora_dim: 288
+      use_size_cond: true          # learned per-leaf-size embedding (1/2/4/8)
+      # Tokens arrive from the trained PyramidEncoder at width d; equal to
+      # hidden_size, so the model's own x_embedder is an Identity and the
+      # input projection lives on the compressor (base_proj) instead.
+      token_input_dim: 1152
+      # Tokens -> PyramidDecoder -> dense latent, supervised at FULL resolution.
+      # This rebuilds final_layer as a 1152-dim readout.
+      use_pyramid_decoder: true
+      # Pretrained TRUNK. final_layer is excluded on purpose: with
+      # use_pyramid_decoder it is 1152-dim, whereas the checkpoint's head is
+      # 16-dim, so it cannot be loaded — and should not be, since the decoder now
+      # owns the readout. x_embedder is likewise skipped (it is an Identity here);
+      # its pretrained weights are routed to the compressor's base_proj below.
+      pretrain_ckpt: checkpoints/fitv2_xl.safetensors
+      # NOTE: x_embedder in ignore_keys only stops the model from *claiming* those
+      # weights; loading still prints "2 unexpected keys
+      # (x_embedder.proj.weight/bias)". That is expected — x_embedder is an
+      # Identity here and those weights are consumed by base_proj on the
+      # compressor instead. Unexpected keys other than those two are a real
+      # mismatch and worth investigating.
+      ignore_keys: [final_layer, x_embedder]
+
+  # Learned compression: frozen variance predictor decides the tree (see data),
+  # this module fills the tokens from the FULL-RESOLUTION latent and is trained
+  # jointly with the diffusion model.
+  compressor_config:
+    target: fit.quadtree_compression.predictive_compressor.PredictiveVarianceCompressor
+    params:
+      latent_channels: 4
+      c: 256                       # pyramid conv width
+      d: 1152                      # token width; must match token_input_dim
+      crop: 32
+      pad_to_multiple: 128
+      with_decoder: true           # must match use_pyramid_decoder above
+      share_weights: true          # one Merge/Split shared across all levels
+      # RESIDUAL MODE: token = base_proj(mean-pooled patch) + gamma * pyramid,
+      # with gamma zero-init. At step 0 the transformer therefore sees exactly the
+      # mean-pooled tokens a plain FiT was pretrained on, and the pyramid only
+      # adds detail as it earns it. Set base_proj_ckpt to a pretrained FiT to seed
+      # base_proj from its x_embedder.proj — otherwise that pretrained patch embed
+      # is thrown away (it has nowhere to go once token_input_dim == hidden_size).
+      residual_encoder: true
+      base_proj_ckpt: checkpoints/fitv2_xl.safetensors
+      # Same idea on the way out (needs with_decoder / use_pyramid_decoder true):
+      # x_hat = NN-upsampled per-token readout + gamma * pyramid, gamma zero-init.
+      residual_decoder: true
+      patch_size: 2
+      # Seed the decoder's readout (base_head) from the checkpoint's
+      # final_layer.linear. OFF here on purpose: the pretrained head predicts
+      # VELOCITY while this trainer supervises CLEAN X0, so seeding it would
+      # import the wrong target. Turn it on only when the source checkpoint's
+      # prediction target matches the loss — and note it requires a checkpoint
+      # trained WITHOUT use_pyramid_decoder, since that is the wiring where
+      # final_layer holds the token->patch readout. A mismatch is rejected
+      # rather than silently loaded.
+      load_base_head: false
+      # base_head_ckpt: <path>     # defaults to base_proj_ckpt when unset
+
+data:
+  target: fit.data.in1k_gt_quadtree_latent_dataset.INGTQuadtreeLatentLoader
+  params:
+    train:
+      data_path: datasets/imagenet1k_latents_256_sd_vae_ft_ema
+      crop: 32
+      max_tokens: 1024
+      pad_to_multiple: 128
+      quadtree_threshold: 0.5      # variance cut for compressibility
+      # Time-dependent resolution cap: [t_start, min_leaf_size] pairs, meaning
+      # "from t_start onward the tree may not split finer than min_leaf_size".
+      # Bigger leaf side == coarser == fewer tokens, so this caps resolution.
+      # Early t (little noise) gets full detail; late t is nearly pure noise,
+      # where fine structure is unrecoverable and not worth the tokens — at
+      # t >= 0.95 every patch is pinned to size 8, i.e. 4 tokens per image.
+      # Must cover t = 0. This is the main knob for the token budget here.
+      max_res_schedule:
+        - [0.0, 1]
+        - [0.7, 2]
+        - [0.85, 4]
+        - [0.95, 8]
+      snr_type: lognorm
+      latent_channels: 4
+      seed: 42
+      loader:
+        num_workers: 4
+        raw_batch_size: 64
+      # No variance_predictor block: the tree comes from x0 directly, and the
+      # plan is computed CPU-side in the DataLoader workers.
+
+accelerate:
+  gradient_accumulation_steps: 1
+  mixed_precision: 'bf16'
+  num_train_epochs:
+  max_train_steps: 100000
+  learning_rate: 1.0e-4
+  learning_rate_base_batch_size: 1024   # token-budget base (matches max_tokens)
+  max_grad_norm: 1.0
+  optimizer:
+    target: torch.optim.AdamW
+    params:
+      betas: ${tuple:0.9, 0.999}
+      weight_decay: 0
+      eps: 1.0e-8
+  lr_scheduler: constant_with_warmup
+  lr_warmup_steps: 200
+  logger: wandb
+  checkpointing_epochs: False
+  checkpointing_steps: 4000
+  checkpointing_steps_list: [100000]
+  checkpoints_total_limit: 2
+  logging_steps: 100
