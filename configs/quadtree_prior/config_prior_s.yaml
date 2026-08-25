@@ -1,0 +1,63 @@
+# ============================================================================
+# Class-conditional autoregressive prior over QUADTREE STRUCTURES.
+#
+# At sampling time there is no x0, so the ground-truth-variance tree of
+# config_quadtree_xl_gt_variance.yaml is unavailable. This model is run ONCE
+# before image generation and produces a plausible tree from the class label
+# (and the timestep it is for), which then drives the quadtree compressor in
+# place of the oracle plan.
+#
+# The prior runs ONCE before the diffusion process starts, so it is conditioned
+# on the class label alone — no timestep — and its targets are the UNCAPPED
+# GT-variance tree of the clean latent. `quadtree_threshold` MUST match the value
+# used in the compressor's config, otherwise the prior learns a distribution of
+# trees the compressor never saw.
+# ============================================================================
+model:
+  target: quadtree_prior.model.QuadtreePrior
+  params:
+    hidden_size: 384
+    depth: 6
+    num_heads: 6
+    mlp_ratio: 4.0
+    num_classes: 1000
+    class_dropout_prob: 0.1     # enables classifier-free guidance at sampling
+    norm_layer: layernorm
+
+data:
+  target: quadtree_prior.dataset.QuadtreeStructureLoader
+  params:
+    train:
+      data_path: datasets/imagenet1k_latents_256_sd_vae_ft_ema
+      crop: 32
+      # Variance cut for compressibility; must match the compressor config.
+      # This is the ONLY knob on the target trees — the prior runs before the
+      # diffusion process, so there is no timestep and no max_res_schedule.
+      quadtree_threshold: 0.5
+      seed: 42
+      loader:
+        batch_size: 256
+        num_workers: 8
+
+accelerate:
+  gradient_accumulation_steps: 1
+  mixed_precision: 'bf16'
+  num_train_epochs:
+  max_train_steps: 50000
+  learning_rate: 3.0e-4
+  learning_rate_base_batch_size: 256
+  max_grad_norm: 1.0
+  optimizer:
+    target: torch.optim.AdamW
+    params:
+      betas: ${tuple:0.9, 0.95}
+      weight_decay: 0.01
+      eps: 1.0e-8
+  lr_scheduler: constant_with_warmup
+  lr_warmup_steps: 500
+  logger: wandb
+  checkpointing_epochs: False
+  checkpointing_steps: 5000
+  checkpointing_steps_list: [50000]
+  checkpoints_total_limit: 2
+  logging_steps: 100
