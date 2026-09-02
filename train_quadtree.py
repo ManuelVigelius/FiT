@@ -359,9 +359,35 @@ def main():
 
     torch._inductor.config.joint_graph_constant_folding = False
     torch._dynamo.config.optimize_ddp = False
-    model = torch.compile(model, dynamic=True, mode="default")
-    if args.use_ema:
-        ema_model = torch.compile(ema_model, dynamic=True, mode="default")
+
+    # Persistent reductions keep the whole reduction axis in shared memory. With
+    # this model's sequence lengths that can exceed what the GPU has, and Inductor
+    # has no smaller fallback config to fall back TO — every candidate is rejected
+    # and compilation dies at the BACKWARD pass with:
+    #
+    #   RuntimeError: No valid triton configs. OutOfResources: out of resource:
+    #   shared memory, Required: 102144, Hardware limit: 101376
+    #
+    # (Seen on the 99KB-shared-memory lab nodes; it overshot by 768 bytes.)
+    # Turning them off makes Inductor emit looped reductions instead, whose
+    # shared-memory use does not scale with the reduction length. Slightly slower
+    # kernels, but they compile. Set FIT_PERSISTENT_REDUCTIONS=1 to restore the
+    # default on hardware with more shared memory.
+    if os.environ.get("FIT_PERSISTENT_REDUCTIONS", "0") != "1":
+        torch._inductor.config.triton.persistent_reductions = False
+        logger.info("Inductor persistent_reductions disabled (shared-memory cap). "
+                    "Set FIT_PERSISTENT_REDUCTIONS=1 to re-enable.")
+
+    # torch.compile can be disabled entirely as an escape hatch: FIT_COMPILE=0.
+    # Training is correct either way — this only affects speed — so it is the
+    # first thing to try when a run dies inside inductor/triton rather than in
+    # model code.
+    if os.environ.get("FIT_COMPILE", "1") != "0":
+        model = torch.compile(model, dynamic=True, mode="default")
+        if args.use_ema:
+            ema_model = torch.compile(ema_model, dynamic=True, mode="default")
+    else:
+        logger.info("torch.compile disabled via FIT_COMPILE=0 (eager mode).")
 
     transport = Transport()
 

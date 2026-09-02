@@ -241,6 +241,18 @@ cd "$REPO_DIR"
 
 export WANDB_MODE=offline
 
+# torch.compile is OFF by default on these nodes. The quadtree path feeds the
+# model a different token count nearly every step, so dynamo keeps recompiling
+# for new shapes, and on this hardware some of those backward kernels want more
+# shared memory than the GPU has (99KB), which is a hard compile failure:
+#
+#   RuntimeError: No valid triton configs. OutOfResources: out of resource:
+#   shared memory, Required: 102144, Hardware limit: 101376
+#
+# Eager is slower but it runs. Set FIT_COMPILE=1 to try compiling again (e.g. on
+# A100/H100 nodes, which have 164KB+ and do not hit this).
+export FIT_COMPILE="${FIT_COMPILE:-0}"
+
 # Restrict to specific physical GPUs (override with CUDA_VISIBLE_DEVICES=... in
 # the environment). torch sees the selected devices as cuda:0..N-1, so
 # nproc_per_node must match the count listed here.
