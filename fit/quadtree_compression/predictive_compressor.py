@@ -92,7 +92,8 @@ class PredictiveVarianceCompressor(nn.Module):
                  pad_to_multiple=128, with_decoder=False, c_head=None,
                  t_dim=None, share_weights=False, residual_encoder=False,
                  base_proj_ckpt=None, residual_decoder=False,
-                 load_base_head=False, base_head_ckpt=None, patch_size=2):
+                 load_base_head=False, base_head_ckpt=None, patch_size=2,
+                 pyramid_free=False):
         super().__init__()
         self.latent_channels = latent_channels
         self.crop = crop
@@ -102,7 +103,8 @@ class PredictiveVarianceCompressor(nn.Module):
 
         self.encoder = PyramidEncoder(latent_channels, c, d, n_levels=N_LEVELS,
                                       share_weights=share_weights,
-                                      residual=residual_encoder)
+                                      residual=residual_encoder,
+                                      pyramid_free=pyramid_free)
         self.residual_decoder = residual_decoder
         if residual_encoder and base_proj_ckpt is not None:
             self.load_base_proj_from_ckpt(base_proj_ckpt)
@@ -277,7 +279,8 @@ class PredictiveVarianceCompressor(nn.Module):
         # In residual mode the mean-pooled patch values ride alongside: the token
         # is base_proj(pooled) + gamma * pyramid, gamma zero-init. See
         # PyramidEncoder.tokens_at_level.
-        base = (self.encoder.base_features(x_t) if self.encoder.residual
+        base = (self.encoder.base_features(x_t)
+                if (self.encoder.residual or self.encoder.pyramid_free)
                 else [None] * N_LEVELS)
         masks, counts, perm = self._batch_masks(plans, x_t.device)
 
@@ -292,7 +295,26 @@ class PredictiveVarianceCompressor(nn.Module):
     # ------------------------------------------------------------------ #
     # pack                                                                #
     # ------------------------------------------------------------------ #
-    def forward(self, x_t, plans, labels, t, x0=None):
+    def forward(self, *args, mode='encode', **kwargs):
+        """Dispatch to encode (default) or decode.
+
+        Both directions MUST be reachable through `forward`, because under DDP
+        this module is wrapped and only `forward` runs the autograd hooks that
+        synchronise gradients. Calling `decode_packed` on the wrapper raises
+        AttributeError (DDP does not forward custom methods), and reaching past
+        it via `.module` is worse: the decoder's parameters are then used outside
+        DDP's forward, which trips "Expected to mark a variable ready only once"
+        on the backward, or silently desynchronises the decoder's gradients.
+
+        So the decode path is routed here as `compressor(..., mode='decode')`.
+        """
+        if mode == 'decode':
+            return self.decode_packed(*args, **kwargs)
+        if mode != 'encode':
+            raise ValueError(f"mode must be 'encode' or 'decode', got {mode!r}")
+        return self._encode_forward(*args, **kwargs)
+
+    def _encode_forward(self, x_t, plans, labels, t, x0=None):
         """Compress + pack one training step's images into a single sequence.
 
         x_t    : (B, C, H, W) noisy latents for exactly the images that belong in

@@ -259,8 +259,13 @@ class Transport:
                    block_mask=packed['block_mask'])
         tokens = model(packed['feature'], t, **fwd)       # (1, N, D)
 
-        x_hat = compressor.decode_packed(
-            tokens, selection['plans'], packed['counts'], selection['x_t'])
+        # Routed through __call__ (not .decode_packed) so the decoder's forward
+        # runs inside DDP's wrapper: under DDP the bare method is not exposed,
+        # and bypassing the wrapper breaks gradient synchronisation. See
+        # PredictiveVarianceCompressor.forward.
+        x_hat = compressor(
+            tokens, selection['plans'], packed['counts'], selection['x_t'],
+            mode='decode')
 
         # Per-IMAGE velocity weight 1/(1-t)^2 == 1/t_ds^2, floored at the clean end.
         noise_w = t_ds[0].clamp(min=QUADTREE_WEIGHT_EPS)  # (n_pack,)

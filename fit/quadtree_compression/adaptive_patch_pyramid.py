@@ -126,12 +126,36 @@ class PyramidEncoder(nn.Module):
     """
 
     def __init__(self, latent_ch, c, d, n_levels=3, share_weights=False,
-                 residual=False):
+                 residual=False, pyramid_free=False):
         super().__init__()
         self.n_levels = n_levels
         self.c = c
         self.latent_ch = latent_ch
         self.residual = residual
+
+        # ---- pyramid-free mode ----------------------------------------------
+        # The no-learned-compression baseline: tokens are the raw mean-pooled
+        # patches, handed straight to the model's own (pretrained) x_embedder.
+        # NOTHING here is built or trained -- no stem, no merges, no proj, no
+        # gate. Requires d == 4*latent_ch, since there is no projection left to
+        # change the width.
+        self.pyramid_free = pyramid_free
+        if pyramid_free:
+            if d != 4 * latent_ch:
+                raise ValueError(
+                    f'pyramid_free needs d == 4*latent_ch (the mean-pooled patch '
+                    f'width), got d={d} and 4*latent_ch={4 * latent_ch}. There is '
+                    f'no projection in this mode to reconcile the two.')
+            if residual:
+                raise ValueError(
+                    'pyramid_free and residual are mutually exclusive: residual '
+                    'adds a GATED PYRAMID on top of the base path, which is '
+                    'exactly what pyramid_free removes.')
+            self.stem = self.proj = self.base_proj = None
+            self.merges = nn.ModuleList()
+            self.scale_emb = self.res_gamma = None
+            return
+
         self.stem = nn.Conv2d(4 * latent_ch, c, 1)
         if share_weights:
             merge = Merge(c)
@@ -186,7 +210,13 @@ class PyramidEncoder(nn.Module):
         return feats
 
     def features(self, z):
-        """z: (B, C, H, W) -> list of (B, c, H/2^(l+1), W/2^(l+1)), fine to coarse."""
+        """z: (B, C, H, W) -> list of (B, c, H/2^(l+1), W/2^(l+1)), fine to coarse.
+
+        Returns a list of None in pyramid_free mode: there is no pyramid, and
+        `tokens_at_level` ignores the entry.
+        """
+        if self.pyramid_free:
+            return [None] * self.n_levels
         x = self.stem(F.pixel_unshuffle(z, 2))
         feats = [x]
         for merge in self.merges:
@@ -197,10 +227,18 @@ class PyramidEncoder(nn.Module):
     def tokens_at_level(self, feat, base_feat, mask, l):
         """Gather level-l tokens: base patch embed + gated pyramid residual.
 
-        feat      : (B, c, H_l, W_l)    pyramid features for level l
+        feat      : (B, c, H_l, W_l)    pyramid features for level l, or None
+                                        when the pyramid is disabled entirely
         base_feat : (B, 4*C, H_l, W_l)  mean-pooled patch values, or None
         mask      : (B, H_l, W_l) bool
         """
+        # `pyramid_free`: emit the mean-pooled patch and nothing else. This is
+        # not the same as residual with a zero gate — that still BUILDS and
+        # TRAINS the pyramid, and its gate receives gradient immediately, so the
+        # pyramid stops being inert after the first optimizer step. For a
+        # no-learned-compression baseline the pyramid must not exist at all.
+        if self.pyramid_free:
+            return gather_tokens(base_feat, mask)
         t = self.proj(gather_tokens(feat, mask)) + self.scale_emb[l]
         if self.residual:
             base = self.base_proj(gather_tokens(base_feat, mask))

@@ -62,15 +62,27 @@ diffusion:
     params:
       latent_channels: 4
       c: 256                       # pyramid conv width
-      d: 1152                      # token width; must match token_input_dim
+      # Token width. MUST equal token_input_dim above (16 = in_channels * 2^2),
+      # because the encoder always emits d-wide tokens and hands them straight to
+      # the model's x_embedder. Setting this to hidden_size here was a bug: the
+      # compressor emitted 1152-wide tokens into a Linear(16 -> 1152) patch embed
+      # and every rank died with "a and b must have same reduction dim".
+      d: 16
       crop: 32
       pad_to_multiple: 128
       with_decoder: false          # must match use_pyramid_decoder above
       share_weights: true          # one Merge/Split shared across all levels
-      # Both learned paths OFF. The compressor still runs — it is what walks the
-      # quadtree and packs the sequence — but tokens are plain mean-pooled leaf
-      # values and the model reads them out with its own final_layer. Nothing
-      # here is trained except through the diffusion loss.
+      # NO learned compression at all. The compressor still walks the quadtree
+      # and packs the sequence, but the token is the raw mean-pooled patch and the
+      # encoder builds no stem / merges / proj / gate — there is nothing here for
+      # the optimizer to train. The model's own pretrained x_embedder does the
+      # 16 -> 1152 patch embed, exactly as in plain FiT.
+      #
+      # This is NOT the same as `residual_encoder: true` with a zero gate. That
+      # wiring still BUILDS the pyramid and gives res_gamma an immediate gradient,
+      # so the gate opens on the first optimizer step and the "baseline" quietly
+      # becomes a learned-compression run — which would destroy the ablation.
+      pyramid_free: true
       residual_encoder: false
       residual_decoder: false
 
