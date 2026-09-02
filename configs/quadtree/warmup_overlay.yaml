@@ -18,20 +18,29 @@
 #
 # NOTE ON DURATION. The residual gates (`res_gamma`) are zero-init, so at step 0
 # the pyramid *weights* get gradient scaled by zero — only the gates themselves
-# move at first. The pyramid starts learning once the gates open, which is why
-# this is not a 1-2k-step affair like the fitv2 size_embedder warmup. 8000 is a
-# starting point; watch the loss, and watch that res_gamma is actually moving
-# off zero before deciding it is long enough.
+# move at first, and the pyramid starts learning once they open (the mechanism is
+# tested in test_res_gamma_gradient.py). 4000 steps is therefore a compute-bound
+# choice, not a sufficiency argument: this budget buys the gates time to open and
+# the new layers a head start, not a converged pyramid.
+#
+# So watch `res_gamma` — if it is still near zero at the end of the warmup, the
+# pyramid has barely begun to train and the full stage is effectively starting
+# from the baseline. Both stages checkpoint, so extending is always possible:
+# rerun the full variant WITHOUT --reset-optimizer to continue from the latest
+# checkpoint with optimizer state intact.
 # ============================================================================
 accelerate:
   # Short phase; the full run continues from here with a reset optimizer.
-  max_train_steps: 8000
+  max_train_steps: 4000
 
   # Only the new layers are training and they start from scratch, so they can
   # take a larger LR than the 1e-4 the full (trunk-included) stage uses.
   learning_rate: 3.0e-4
 
-  # Checkpoint more often than the full run: this stage is short, and the final
-  # checkpoint here is the input to the full stage.
-  checkpointing_steps: 2000
-  checkpointing_steps_list: [8000]
+  # Checkpoint more often than the full run: this stage is short, and its LAST
+  # checkpoint is the input to the full stage — losing it costs the whole warmup.
+  # checkpoints_total_limit (2, inherited) prunes oldest-first, so with saves at
+  # 1000/2000/3000/4000 the step-4000 one always survives; checkpointing_steps_list
+  # additionally writes it as save-checkpoint-4000, which pruning never touches.
+  checkpointing_steps: 1000
+  checkpointing_steps_list: [4000]
