@@ -87,6 +87,119 @@ def resolve_tuple(*args):
 OmegaConf.register_new_resolver("tuple", resolve_tuple)
 
 
+# Which parameters the pretrained checkpoint actually supplies. Everything else
+# is new (random or zero init) and is what a warmup phase should train.
+#
+#   model       the checkpoint is a plain FiT, so the trunk (blocks, t_embedder,
+#               y_embedder, global_adaLN_modulation) loads. `size_embedder` has no
+#               counterpart there, and `final_layer` is either excluded via
+#               ignore_keys (use_pyramid_decoder rebuilds it at hidden_size) or
+#               loaded with the WRONG target — the pretrained head predicts
+#               velocity, this trainer supervises clean x0 — so it is treated as
+#               new in both wirings.
+#
+#   compressor  only `encoder.base_proj` is seeded (from x_embedder.proj) and,
+#               when load_base_head is on, `decoder.base_head`. The pyramid
+#               itself is entirely new. res_gamma is zero-init, so at step 0 the
+#               pyramids are no-ops and the warmup starts from exactly the
+#               baseline tokenisation.
+DEFAULT_WARMUP_TRAINABLE = ['size_embedder', 'final_layer']
+
+
+def _freeze_pretrained(model, compressor, accelerator, spec, seeded_base_head):
+    """Freeze pretrained weights, leaving only the new layers trainable.
+
+    Returns the list of (module_label, param_name) pairs left trainable.
+
+    `spec` is the raw --freeze_pretrained value. 'default'/'' selects
+    DEFAULT_WARMUP_TRAINABLE on the model plus every compressor parameter that
+    was not seeded from the checkpoint; anything else is a comma-separated list
+    of substrings matched against both modules.
+    """
+    raw = (spec or '').strip()
+    custom = None if (not raw or raw == 'default') else [
+        s.strip() for s in raw.split(',') if s.strip()]
+
+    unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_comp = accelerator.unwrap_model(compressor)
+
+    # ---- model -----------------------------------------------------------
+    model_names = custom if custom is not None else DEFAULT_WARMUP_TRAINABLE
+    unwrapped_model.finetune(type='partial', unfreeze=model_names)
+
+    # ---- compressor ------------------------------------------------------
+    # No finetune() here, and the default rule is a complement rather than a
+    # match: train everything EXCEPT the seeded projections.
+    seeded = ['encoder.base_proj']
+    if seeded_base_head:
+        seeded.append('decoder.base_head')
+    for name, p in unwrapped_comp.named_parameters():
+        if custom is not None:
+            p.requires_grad = any(s in name for s in custom)
+        else:
+            p.requires_grad = not any(name.startswith(s) for s in seeded)
+
+    trainable = ([('model', n) for n, p in unwrapped_model.named_parameters() if p.requires_grad]
+                 + [('compressor', n) for n, p in unwrapped_comp.named_parameters() if p.requires_grad])
+    return trainable
+
+
+def _raw(module, accelerator):
+    """Strip both wrappers: DDP (unwrap_model) and torch.compile (_orig_mod).
+
+    accelerate's unwrap_model only removes the DDP shell; torch.compile leaves an
+    OptimizedModule whose state_dict keys carry a "_orig_mod." prefix the saved
+    checkpoint does not have.
+    """
+    m = accelerator.unwrap_model(module)
+    return getattr(m, '_orig_mod', m)
+
+
+def _load_weights_only(ckpt_dir, model, compressor, ema_model, accelerator, use_ema):
+    """Restore model / compressor / EMA weights from a checkpoint, nothing else.
+
+    accelerate's save_state writes one file per prepared model, numbered by the
+    order prepare_model was called in: here model, then ema_model (only when EMA
+    is on), then compressor. So the compressor's index shifts with --use_ema, and
+    is derived rather than hardcoded.
+    """
+    from pathlib import Path
+    from accelerate.checkpointing import load_model as _load_model
+
+    ckpt = Path(ckpt_dir)
+
+    def _file(idx):
+        stem = "model" if idx == 0 else f"model_{idx}"
+        safe, binf = ckpt / f"{stem}.safetensors", ckpt / f"pytorch_{stem}.bin"
+        if safe.exists():
+            return safe
+        if binf.exists():
+            return binf
+        raise FileNotFoundError(
+            f"reset_optimizer: no weights for prepared model #{idx} in {ckpt}. "
+            f"Expected {safe.name} or {binf.name}. If the warmup ran with a "
+            f"different --use_ema setting the file numbering shifts; re-run the "
+            f"warmup and the full stage with the same EMA flag.")
+
+    comp_idx = 2 if use_ema else 1
+
+    raw_model = _raw(model, accelerator)
+    _load_model(raw_model, str(_file(0)), device=str(accelerator.device))
+    logger.info(f"  model      <- {_file(0).name}")
+
+    raw_comp = _raw(compressor, accelerator)
+    _load_model(raw_comp, str(_file(comp_idx)), device=str(accelerator.device))
+    logger.info(f"  compressor <- {_file(comp_idx).name}")
+
+    # Re-seed EMA from the warmup weights. The deepcopy that built ema_model ran
+    # before this load and still holds the pretrained weights, so copying the
+    # freshly-loaded model over it is what makes EMA start from the warmup point
+    # rather than from the pretrained checkpoint.
+    if use_ema and ema_model is not None:
+        _raw(ema_model, accelerator).load_state_dict(raw_model.state_dict())
+        logger.info("  ema        <- model weights (re-seeded from warmup)")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Quadtree FiT training.")
     parser.add_argument("--project_name", type=str, const=True, default="", nargs="?")
@@ -101,6 +214,34 @@ def parse_args():
     parser.add_argument("--use_ema", action="store_true", default=True)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--local_rank", type=int, default=-1)
+    parser.add_argument(
+        "--freeze_pretrained",
+        type=str,
+        default=None,
+        metavar="LAYERS",
+        help=(
+            "Warmup phase: freeze the pretrained weights and train only the newly "
+            "added ones. Pass 'default' (or an empty string) to use the built-in "
+            "list, which is derived from what the checkpoint actually supplies: "
+            "on the model, everything except size_embedder and final_layer is "
+            "pretrained; on the compressor, everything except encoder.base_proj "
+            "(and decoder.base_head when seeded) is new. Or pass a comma-separated "
+            "list of name substrings to keep trainable instead. Names are matched "
+            "against BOTH the model and the compressor, since the two share one "
+            "optimizer here."
+        ),
+    )
+    parser.add_argument(
+        "--reset_optimizer",
+        action="store_true",
+        default=False,
+        help=(
+            "Load only model / compressor / EMA weights from the latest checkpoint, "
+            "discarding optimizer and scheduler state and resetting the step counter. "
+            "Use this when transitioning from a --freeze_pretrained warmup run to "
+            "full training, so the optimizer is freshly initialised over all params."
+        ),
+    )
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -252,6 +393,22 @@ def main():
     train_len = loader.train_len()
     logger.info(f"Dataset built ({train_len} feature files).")
 
+    # ---- Warmup: freeze the pretrained weights ------------------------------
+    # Must run BEFORE the optimizer is built so only trainable params get slots
+    # (and so AdamW never allocates state for frozen tensors).
+    if args.freeze_pretrained is not None:
+        seeded_base_head = bool(getattr(
+            diffusion_cfg.compressor_config.params, 'load_base_head', False))
+        trainable_names = _freeze_pretrained(
+            model, compressor, accelerator, args.freeze_pretrained, seeded_base_head)
+        if accelerator.is_main_process:
+            n_model = sum(1 for m, _ in trainable_names if m == 'model')
+            n_comp = len(trainable_names) - n_model
+            logger.info(f"freeze_pretrained: {n_model} model + {n_comp} compressor "
+                        f"tensors trainable")
+            for mod, n in trainable_names:
+                logger.info(f"  [{mod}] {n}")
+
     # ---- Optimizer / scheduler ----------------------------------------------
     # The compressor trains jointly with the diffusion model, so it shares the
     # optimizer and the grad-norm clip.
@@ -288,6 +445,16 @@ def main():
             resume_from_path = dirs[-1] if dirs else None
         if resume_from_path is None:
             logger.info("No checkpoint to resume; starting fresh.")
+        elif args.reset_optimizer:
+            # Weights-only resume, for warmup -> full training. Restores model,
+            # compressor and EMA but drops optimizer / scheduler state, and leaves
+            # the step counter at 0 so the LR warmup runs again over all params.
+            ckpt_full_path = os.path.join(ckptdir, resume_from_path)
+            logger.info(f"reset_optimizer: loading weights only from {resume_from_path}, "
+                        f"resetting step counter.")
+            _load_weights_only(ckpt_full_path, model, compressor,
+                               ema_model if args.use_ema else None,
+                               accelerator, args.use_ema)
         else:
             global_steps = int(resume_from_path.split("-")[1])
             logger.info(f"Resuming from step {global_steps}: {resume_from_path}")
