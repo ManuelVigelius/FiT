@@ -56,7 +56,11 @@ WORKDIR_FAST="$FASTDATA/workdir"
 PERSISTENT_OUT="/visinf/projects_students/mb_mvigel"
 
 GPUS_PER_NODE=4
-MASTER_PORT=29501     # differs from cluster_train.sh so both can run at once
+# Rendezvous port. Base differs from cluster_train.sh (29500) so a quadtree run
+# and a base-model run can share a node; the per-variant offset below then lets
+# TWO quadtree variants run at once — e.g. the pyramid-decoder ablation pair on
+# GPUs 0-3 and 4-7. Override with MASTER_PORT=... for anything else.
+MASTER_PORT_BASE="${MASTER_PORT:-29501}"
 
 CFG_DIR="$REPO_DIR/configs/quadtree"
 WARMUP_OVERLAY="$CFG_DIR/warmup_overlay.yaml"
@@ -75,6 +79,18 @@ case "${VARIANT^^}" in
   *) echo "Unknown variant '${VARIANT}'. Must be LEARNED, BASELINE, GT, WLEARNED, WGT, or PRIOR."; exit 1 ;;
 esac
 
+# Port offset per VARIANT FAMILY, so two different variants can train side by
+# side on one node. Keyed on BASE_VARIANT rather than the raw argument so a
+# warmup and the full run it exec's into share a port — they never overlap in
+# time, and reusing it avoids stranding a second port per experiment.
+case "$BASE_VARIANT" in
+  learned)  PORT_OFFSET=0 ;;
+  baseline) PORT_OFFSET=1 ;;
+  gt)       PORT_OFFSET=2 ;;
+  prior)    PORT_OFFSET=3 ;;
+esac
+MASTER_PORT=$((MASTER_PORT_BASE + PORT_OFFSET))
+
 # The warmup writes into the SAME project dir as the full run that follows it, so
 # the full stage can pick the warmup's checkpoint up with --resume_from_checkpoint
 # latest + --reset_optimizer. That is the whole handoff.
@@ -91,7 +107,8 @@ echo "Variant      : ${VARIANT^^}"
 echo "Config       : $CONFIG"
 echo "Project      : $PROJECT"
 echo "Workdir      : $WORKDIR"
-echo "GPUs         : $GPUS_PER_NODE"
+echo "GPUs         : $GPUS_PER_NODE (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,2,3,4})"
+echo "Rendezvous   : localhost:$MASTER_PORT"
 echo ""
 
 # Fail fast: if the persistent destination already exists, the post-training mv
@@ -125,10 +142,37 @@ fi
 echo "[3/3] Checking checkpoint symlinks..."
 mkdir -p "$REPO_DIR/checkpoints"
 
+# `ln -sfn` via a temp name + mv is atomic and idempotent, which matters when two
+# variants are launched simultaneously on one node (the ablation pair on GPUs 0-3
+# and 4-7). A plain [ ! -e ] guard is a race: both see it missing, the loser's
+# `ln` fails, and `set -e` kills that run before it starts.
+# -f replaces an existing link rather than failing, and -n stops it descending
+# into one that points at a directory. Both matter because two variants may be
+# launched at once (the ablation pair on GPUs 0-3 and 4-7): a bare `[ ! -e ] &&
+# ln -s` guard is a race where the loser's `ln` fails and `set -e` kills that run
+# before it starts. Every caller writes the SAME target here, so last-writer-wins
+# is the correct outcome and no temp-file dance is needed.
+# Not fatal on failure: `ln -f` is unlink-then-symlink (two syscalls) on BSD, so
+# simultaneous callers can collide with "File exists" even though every one of
+# them is writing the SAME target. Verify the end state instead of the exit code
+# — if the link resolves to the intended file, the job is done, whoever won.
+link_atomic() {  # link_atomic <target> <linkname>
+  local i
+  for i in 1 2 3; do
+    ln -sfn "$1" "$2" 2>/dev/null || true
+    # -e follows the link, so this is true only once it resolves to a real file.
+    # A rival's unlink-then-symlink can leave a brief window where it does not;
+    # retrying rides that out.
+    [ -e "$2" ] && return 0
+  done
+  echo "ERROR: failed to create symlink $2 -> $1" >&2
+  return 1
+}
+
 CHECKPOINT_LINK="$REPO_DIR/checkpoints/fitv2_xl.safetensors"
-if [ "$IS_PRIOR" = false ] && [ ! -e "$CHECKPOINT_LINK" ]; then
-  ln -s "$CHECKPOINT_SRC" "$CHECKPOINT_LINK"
-  echo "        base checkpoint symlink created."
+if [ "$IS_PRIOR" = false ]; then
+  link_atomic "$CHECKPOINT_SRC" "$CHECKPOINT_LINK"
+  echo "        base checkpoint symlink ready."
 fi
 
 # The LEARNED and BASELINE configs name checkpoints/variance_predictor.pt. It is
@@ -136,10 +180,12 @@ fi
 # front rather than failing several minutes in, after the dataset copy.
 VP_LINK="$REPO_DIR/checkpoints/variance_predictor.pt"
 if [ "$NEEDS_VP" = true ]; then
+  # -e follows symlinks, so an existing-but-dangling link counts as missing here
+  # and gets repointed rather than silently used.
   if [ ! -e "$VP_LINK" ]; then
     if [ -e "$VP_CKPT_SRC" ]; then
-      ln -s "$VP_CKPT_SRC" "$VP_LINK"
-      echo "        variance predictor symlink created."
+      link_atomic "$VP_CKPT_SRC" "$VP_LINK"
+      echo "        variance predictor symlink ready."
     else
       echo "ERROR: ${VARIANT^^} needs a trained VariancePredictor, but neither" >&2
       echo "         $VP_LINK" >&2
@@ -158,7 +204,10 @@ echo "[3/3] Checkpoints ready."
 # --- Write a one-line config override to point data_path at fastdata ---
 # Same key path as the base model, so this file is interchangeable with the one
 # cluster_train.sh writes.
-OVERRIDE_CFG="$FASTDATA/data_path_override.yaml"
+# Per-variant filename: two runs starting together would otherwise truncate and
+# rewrite one shared file while the other is reading it. The contents are
+# identical, so this costs nothing.
+OVERRIDE_CFG="$FASTDATA/data_path_override_${BASE_VARIANT}.yaml"
 mkdir -p "$FASTDATA"
 cat > "$OVERRIDE_CFG" <<YAML
 data:
