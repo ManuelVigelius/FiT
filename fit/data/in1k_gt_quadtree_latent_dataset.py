@@ -68,6 +68,14 @@ Plan layout (per image), identical to the predictor path:
     levels    (n_i,)     encoder level l, leaf side N == 2**l
     positions (n_i, 2)   (y, x) patch center in latent-pixel coords
     sizes     (n_i,)     leaf side (1 / 2 / 4 / 8)
+
+Structure vector
+----------------
+Each sample also carries `struct`, the split bits of the FULL tree
+(`quadtree_prior.structure.structure_vector`, STRUCT_DIM == 84), for models
+that condition on global structure. It is built from the same variance grids
+with min_leaf_size=1, i.e. it ignores `max_res_schedule`: the plan says which
+tokens exist at this t, the vector says what the image's tree is, at every t.
 """
 
 import glob
@@ -84,6 +92,7 @@ from fit.quadtree_compression.quadtree_compression import (LEAF_SIZES,
                                                            REGION_SIZES)
 from fit.quadtree_compression.variance_prediction import (
     load_latent, region_variance_targets)
+from quadtree_prior import structure as S
 
 # Default: no cap anywhere. Overridden from config in practice — an uncapped GT
 # tree spends far more tokens than the predictor path does.
@@ -281,10 +290,17 @@ class GTQuadtreeLatentDataset(Dataset):
             var, self.threshold, self.crop,
             min_leaf_size=min_leaf_size_at(t, self.max_res_schedule))
 
+        # Structure conditioning: same grids, but the UNCAPPED tree, so the
+        # vector is identical at every t for this image.
+        full = plan_from_gt_variance(var, self.threshold, self.crop,
+                                     min_leaf_size=1)
+        struct = S.structure_vector(S.sizes_grid_from_plan(
+            dict(positions=full[1], sizes=full[2])))
+
         return dict(
             x_t=x_t, x0=x0, t=t.float(), label=self._load_label(idx),
             plan=dict(levels=levels, positions=positions, sizes=sizes),
-            n_tok=int(sizes.shape[0]),
+            n_tok=int(sizes.shape[0]), struct=struct,
         )
 
     def _load_label(self, idx):
@@ -330,6 +346,7 @@ class GTQuadtreePacker:
         x0     (B, C, H, W)  clean latents, for the full-resolution loss
         t      (B,)          timesteps
         label  (B,)          class labels
+        struct (B, 84)       full-tree split bits (structure conditioning)
         plans  list of B dicts: levels (n,), positions (n,2), sizes (n,)
         n_tok  int           total valid tokens across the batch
 
@@ -392,6 +409,7 @@ class GTQuadtreePacker:
             x0=torch.stack([p['x0'] for p in picked]).to(dev, non_blocking=True),
             t=torch.stack([p['t'] for p in picked]).to(dev, non_blocking=True),
             label=torch.stack([p['label'] for p in picked]).to(dev, non_blocking=True),
+            struct=torch.stack([p['struct'] for p in picked]).to(dev, non_blocking=True),
             plans=[p['plan'] for p in picked],
             n_tok=n_tok,
         )

@@ -96,14 +96,16 @@ OmegaConf.register_new_resolver("tuple", resolve_tuple)
 #               ignore_keys (use_pyramid_decoder rebuilds it at hidden_size) or
 #               loaded with the WRONG target — the pretrained head predicts
 #               velocity, this trainer supervises clean x0 — so it is treated as
-#               new in both wirings.
+#               new in both wirings. `struct_embedder` (structure conditioning,
+#               struct_cond_dim > 0) is new as well; listing it is harmless for
+#               models that do not have it, since matching is by substring.
 #
 #   compressor  only `encoder.base_proj` is seeded (from x_embedder.proj) and,
 #               when load_base_head is on, `decoder.base_head`. The pyramid
 #               itself is entirely new. res_gamma is zero-init, so at step 0 the
 #               pyramids are no-ops and the warmup starts from exactly the
 #               baseline tokenisation.
-DEFAULT_WARMUP_TRAINABLE = ['size_embedder', 'final_layer']
+DEFAULT_WARMUP_TRAINABLE = ['size_embedder', 'final_layer', 'struct_embedder']
 
 
 def _freeze_pretrained(model, compressor, accelerator, spec, seeded_base_head):
@@ -526,6 +528,10 @@ def main():
                 packed = compressor(selection['x_t'], selection['plans'],
                                     selection['label'], selection['t'],
                                     x0=selection['x0'])
+                if 'struct' in selection:
+                    # Full-tree split bits, one row per packed image, in the
+                    # same order as packed['label'].
+                    packed['struct'] = selection['struct'].unsqueeze(0)
 
                 di = packed['doc_ids'].long()
 
@@ -553,6 +559,7 @@ def main():
                             block_mask=block_mask,
                             target=_pooled_targets(selection, packed),
                             t=packed['t'], n_pack=packed['n_pack'],
+                            struct=packed.get('struct'),
                         )
                         loss_dict = transport.training_losses(
                             model, packed['feature'], model_kwargs)

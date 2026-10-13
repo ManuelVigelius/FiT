@@ -2,7 +2,7 @@
 # Cluster training runner for the QUADTREE FiT variant on visinf lab nodes.
 # Sibling of cluster_train.sh, which covers the base fitv2 model.
 #
-# Usage: bash tools/cluster_train_quadtree.sh [LEARNED|BASELINE|GT|WLEARNED|WGT|PRIOR] [--reset-optimizer]
+# Usage: bash tools/cluster_train_quadtree.sh [LEARNED|BASELINE|GT|GT_STRUCT|WLEARNED|WGT|WGT_STRUCT|PRIOR] [--reset-optimizer]
 #
 #   LEARNED   — full training, residual pyramid encoder + decoder, new head
 #   BASELINE  — full training, no learned compression (mean-pooled leaves,
@@ -14,6 +14,9 @@
 #               base_proj; train size_embedder, final_layer and the pyramid),
 #               then automatically continues into full LEARNED training
 #   WGT       — same warmup, for the GT config
+#   GT_STRUCT — GT plus global structure conditioning: the full (unpruned)
+#               tree's 84 split bits through an MLP into the t + y conditioning
+#   WGT_STRUCT — same warmup, for the GT_STRUCT config
 #   PRIOR     — the small autoregressive prior over quadtree STRUCTURES
 #               (quadtree_prior.train). Separate model, single GPU, no warmup.
 #   --reset-optimizer — reset optimizer/scheduler state and the step counter on
@@ -32,7 +35,7 @@
 
 set -e
 
-VARIANT="${1:?Usage: cluster_train_quadtree.sh [LEARNED|BASELINE|GT|WLEARNED|WGT|PRIOR] [--reset-optimizer]}"
+VARIANT="${1:?Usage: cluster_train_quadtree.sh [LEARNED|BASELINE|GT|GT_STRUCT|WLEARNED|WGT|WGT_STRUCT|PRIOR] [--reset-optimizer]}"
 RESET_OPTIMIZER=false
 if [ "${2}" = "--reset-optimizer" ]; then
   RESET_OPTIMIZER=true
@@ -74,9 +77,11 @@ case "${VARIANT^^}" in
   GT)       CONFIG="$CFG_DIR/config_quadtree_xl_gt_variance.yaml";  BASE_VARIANT="gt"; NEEDS_VP=false ;;
   WLEARNED) CONFIG="$CFG_DIR/config_quadtree_xl_learned.yaml";      BASE_VARIANT="learned"; IS_WARMUP=true ;;
   WGT)      CONFIG="$CFG_DIR/config_quadtree_xl_gt_variance.yaml";  BASE_VARIANT="gt"; IS_WARMUP=true; NEEDS_VP=false ;;
+  GT_STRUCT)  CONFIG="$CFG_DIR/config_quadtree_xl_gt_struct.yaml";  BASE_VARIANT="gt_struct"; NEEDS_VP=false ;;
+  WGT_STRUCT) CONFIG="$CFG_DIR/config_quadtree_xl_gt_struct.yaml";  BASE_VARIANT="gt_struct"; IS_WARMUP=true; NEEDS_VP=false ;;
   PRIOR)    CONFIG="$REPO_DIR/configs/quadtree_prior/config_prior_s.yaml"
             BASE_VARIANT="prior"; IS_PRIOR=true; NEEDS_VP=false ;;
-  *) echo "Unknown variant '${VARIANT}'. Must be LEARNED, BASELINE, GT, WLEARNED, WGT, or PRIOR."; exit 1 ;;
+  *) echo "Unknown variant '${VARIANT}'. Must be LEARNED, BASELINE, GT, GT_STRUCT, WLEARNED, WGT, WGT_STRUCT, or PRIOR."; exit 1 ;;
 esac
 
 # Port offset per VARIANT FAMILY, so two different variants can train side by
@@ -88,6 +93,7 @@ case "$BASE_VARIANT" in
   baseline) PORT_OFFSET=1 ;;
   gt)       PORT_OFFSET=2 ;;
   prior)    PORT_OFFSET=3 ;;
+  gt_struct) PORT_OFFSET=4 ;;
 esac
 MASTER_PORT=$((MASTER_PORT_BASE + PORT_OFFSET))
 

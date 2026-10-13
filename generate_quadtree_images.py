@@ -10,6 +10,13 @@ Sampling for the quadtree FiT variants, across the four ablation conditions.
                variance of a real training latent (oracle structure).
     prior      GT-variance model, tree sampled ONCE per image from the trained
                class-conditional QuadtreePrior, then coarsened per step.
+    gt_struct  GT-STRUCT model (also conditioned on the full tree's 84 split
+               bits), trees as in `gt`.
+    prior_struct  GT-STRUCT model, trees as in `prior`.
+
+The *_struct models take the structure vector of the FULL tree: computed once
+per image before the loop, from the uncapped GT tree or the uncoarsened prior
+sample, and never from the per-step (schedule-pruned) plans.
 
 Why the sampler is written here rather than reusing noise_field_sampler
 ----------------------------------------------------------------------
@@ -121,6 +128,10 @@ CONDITIONS = {
                      pyramid=True,  tree="gt"),
     "prior":    dict(project="quadtree_xl_cluster_gt",
                      pyramid=True,  tree="prior"),
+    "gt_struct":    dict(project="quadtree_xl_cluster_gt_struct",
+                         pyramid=True, tree="gt", struct=True),
+    "prior_struct": dict(project="quadtree_xl_cluster_gt_struct",
+                         pyramid=True, tree="prior", struct=True),
 }
 
 
@@ -148,6 +159,7 @@ def load_arm(cond, step, ema, device):
     cfg = dict(_TRUNK)
     cfg["token_input_dim"] = HIDDEN_SIZE if spec["pyramid"] else 4 * C_IN
     cfg["use_pyramid_decoder"] = spec["pyramid"]
+    cfg["struct_cond_dim"] = S.STRUCT_DIM if spec.get("struct") else 0
 
     model = QuadtreeFiT(**cfg).to(device).eval()
     sd = load_file(os.path.join(
@@ -417,6 +429,22 @@ def sample_batch(cond, model, comp, labels, *, vp=None, gt_latents=None,
     B = labels.shape[0]
     schedule = normalize_max_res_schedule(MAX_RES_SCHEDULE)
 
+    # Structure conditioning: from the FULL tree, fixed for the whole
+    # trajectory. The per-step `plans` below are schedule-pruned and must never
+    # feed it. Both CFG branches get it (the null class sees the tree too).
+    struct_cfg = None
+    if spec.get("struct"):
+        if spec["tree"] == "gt":
+            full = plans_from_gt(gt_latents, 1)
+        elif spec["tree"] == "prior":
+            full = prior_plans                    # sampled uncoarsened
+        else:
+            raise ValueError(f"{cond}: structure conditioning needs a full "
+                             f"tree, which tree={spec['tree']!r} lacks")
+        struct = torch.stack([
+            S.structure_vector(S.sizes_grid_from_plan(p)) for p in full])
+        struct_cfg = torch.cat([struct, struct], 0)[None].to(device, dtype)
+
     if noise is not None:
         x = noise.to(device=device, dtype=dtype)
     else:
@@ -480,7 +508,7 @@ def sample_batch(cond, model, comp, labels, *, vp=None, gt_latents=None,
                    grid=packed["grid"], mask=packed["mask"].float(),
                    size=packed["size"], tsize=packed["tsize"],
                    doc_ids=packed["doc_ids"].long(),
-                   block_mask=packed["block_mask"])
+                   block_mask=packed["block_mask"], struct=struct_cfg)
         # The model takes transport convention (0 = noise, 1 = clean).
         tokens = model(packed["feature"], 1.0 - packed["t"], **fwd)
 

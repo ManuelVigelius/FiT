@@ -256,7 +256,8 @@ class Transport:
                    grid=packed['grid'], mask=packed['mask'].float(),
                    size=packed['size'], tsize=packed['tsize'],
                    doc_ids=packed['doc_ids'].long(),
-                   block_mask=packed['block_mask'])
+                   block_mask=packed['block_mask'],
+                   struct=packed.get('struct'))
         tokens = model(packed['feature'], t, **fwd)       # (1, N, D)
 
         # Routed through __call__ (not .decode_packed) so the decoder's forward

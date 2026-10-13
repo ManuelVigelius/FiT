@@ -283,6 +283,40 @@ def n_tokens_from_sizes_grid(grid):
 
 
 # --------------------------------------------------------------------------- #
+# sizes grid  ->  structure vector (diffusion-model conditioning)             #
+# --------------------------------------------------------------------------- #
+# The tree's three split levels as bit masks, coarsest first, each row-major
+# over its own grid of blocks:
+#
+#     m8  (2, 2)  quadrant of 8x8 cells splits below size 8     4 bits
+#     m4  (4, 4)  region of 4x4 cells splits below size 4      16 bits
+#     m2  (8, 8)  block of 2x2 cells splits to lossless size 1 64 bits
+#
+# m8 is exactly the root token's mask, in the same bit order. A bit under an
+# unsplit parent is always 0, so the vector is a lossless, unique code for the
+# tree: one vector per possible structure.
+STRUCT_BLOCKS = (8, 4, 2)
+STRUCT_DIM = sum((PATCH_GRID // b) ** 2 for b in STRUCT_BLOCKS)   # 84
+
+
+def structure_vector(sizes_grid):
+    """(..., 16, 16) leaf-size grid -> (..., STRUCT_DIM) float split bits.
+
+    Feed it the FULL tree (min_leaf_size=1), never a schedule-capped one: the
+    vector describes the image's structure, and must not change with t.
+    """
+    g = sizes_grid.to(torch.long)
+    lead = g.shape[:-2]
+    bits = []
+    for b in STRUCT_BLOCKS:
+        k = PATCH_GRID // b
+        # A block splits below size b iff some cell in it has a smaller leaf.
+        blocks = g.reshape(*lead, k, b, k, b).amin(dim=(-3, -1))
+        bits.append((blocks < b).reshape(*lead, k * k))
+    return torch.cat(bits, dim=-1).float()
+
+
+# --------------------------------------------------------------------------- #
 # Smoke test                                                                   #
 # --------------------------------------------------------------------------- #
 def _smoke_test():
@@ -328,16 +362,33 @@ def _smoke_test():
         assert (targets[1:][mask[1:]] >= 0).all()
         assert inputs[0] == BOS
 
+        # structure vector agrees with the token sequence, bit for bit:
+        # m8 is the root mask, m4/m2 are the region tokens' decisions.
+        v = structure_vector(g)
+        assert v.shape == (STRUCT_DIM,)
+        m8, m4, m2 = v[:4], v[4:20], v[20:].reshape(8, 8)
+        assert sum(int(m8[q]) << q for q in range(4)) == int(targets[0])
+        for r in range(N_REGIONS):
+            cls = int(targets[1 + r])
+            split4 = cls not in (IGNORE_INDEX, STOP_4)
+            assert bool(m4[r]) == split4
+            by, bx = (r // 4) * 2, (r % 4) * 2          # region -> m2 coords
+            for q, (qy, qx) in enumerate(_quadrant_offsets(1)):
+                assert bool(m2[by + qy, bx + qx]) == (split4 and bool((cls >> q) & 1))
+        assert torch.equal(structure_vector(g[None])[0], v)    # batched path
+
     # extremes: maximal compression and none at all
     all_coarse = torch.full((PATCH_GRID, PATCH_GRID), 8, dtype=torch.long)
     targets, _, mask = encode_sizes(all_coarse)
     assert int(targets[0]) == 0 and int(mask.sum()) == 1
     assert n_tokens_from_sizes_grid(all_coarse) == 4
+    assert not structure_vector(all_coarse).any()
 
     lossless = torch.ones(PATCH_GRID, PATCH_GRID, dtype=torch.long)
     targets, _, mask = encode_sizes(lossless)
     assert int(targets[0]) == 15 and bool(mask.all()) and (targets[1:] == 15).all()
     assert n_tokens_from_sizes_grid(lossless) == PATCH_GRID ** 2
+    assert structure_vector(lossless).all()
 
     print("structure smoke test passed (200 random trees + extremes)")
 

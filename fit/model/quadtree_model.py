@@ -36,6 +36,14 @@ Two things differ substantively from the base model:
       linear readout supervised on pooled x0 tokens; True emits hidden_size
       tokens for the compressor's :class:`PyramidDecoder`, supervised at full
       resolution. This is the ablation.
+
+Optionally (``struct_cond_dim > 0``) the model is also conditioned on the image's
+GLOBAL quadtree structure: the full tree's split bits
+(:func:`quadtree_prior.structure.structure_vector`) go through a small MLP whose
+output is added to the per-image t + y embedding. It always describes the
+UNPRUNED tree, so unlike ``tsize`` it does not change with t. It is never
+dropped for classifier-free guidance: the null-class branch sees it too, so CFG
+guides the class only. Zero-initialised, so it starts as a no-op.
 """
 
 import torch
@@ -97,6 +105,7 @@ class QuadtreeFiT(nn.Module):
         use_size_cond: bool = True,
         token_input_dim: Optional[int] = None,
         use_pyramid_decoder: bool = False,
+        struct_cond_dim: int = 0,
         **kwargs,
     ):
         super().__init__()
@@ -137,6 +146,13 @@ class QuadtreeFiT(nn.Module):
         self.use_size_cond = use_size_cond
         if use_size_cond:
             self.size_embedder = nn.Embedding(len(LEAF_SIZES), hidden_size)
+        # Global structure conditioning: full-tree split bits -> MLP, added to
+        # the per-image t + y embedding. Output layer zero-init (below).
+        self.struct_cond_dim = struct_cond_dim
+        if struct_cond_dim:
+            self.struct_embedder = nn.Sequential(
+                nn.Linear(struct_cond_dim, hidden_size), nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size))
         # Map raw leaf side (1/2/4/8) -> contiguous index (0..3) for the table.
         self.register_buffer(
             "_size_to_idx",
@@ -251,6 +267,11 @@ class QuadtreeFiT(nn.Module):
         # don't overwrite the zeros.
         if self.use_size_cond:
             nn.init.constant_(self.size_embedder.weight, 0)
+        # Same for structure conditioning: a zero output layer makes the MLP a
+        # no-op at step 0, so the pretrained trunk sees unchanged conditioning.
+        if self.struct_cond_dim:
+            nn.init.constant_(self.struct_embedder[-1].weight, 0)
+            nn.init.constant_(self.struct_embedder[-1].bias, 0)
 
     def _rope_freqs(self, grid, size):
         """Compute RoPE cos/sin frequencies for a token grid.
@@ -281,7 +302,7 @@ class QuadtreeFiT(nn.Module):
                 )
         return x
 
-    def _build_conditioning(self, t, y, tsize, doc_ids, dtype):
+    def _build_conditioning(self, t, y, tsize, doc_ids, dtype, struct=None):
         """Build the per-token conditioning signal `c` that drives adaLN.
 
         Combines the per-image (t + y) embedding — broadcast to every token of the
@@ -293,6 +314,8 @@ class QuadtreeFiT(nn.Module):
         tsize:    (B, N)            per-token leaf side (1/2/4/8)
         doc_ids:  (B, N)            image index per token, -1 for padding
         dtype:                      compute dtype (matches the token embeddings)
+        struct:   (B, max_n_pack, struct_cond_dim)  full-tree split bits per
+                                    packed image; required iff struct_cond_dim
 
         return:   (B, N, D)
         """
@@ -306,6 +329,12 @@ class QuadtreeFiT(nn.Module):
         t_emb = self.t_embedder(t_flat).reshape(B, max_n_pack, D)   # (B, P, D)
         y_emb = self.y_embedder(y_flat, self.training).reshape(B, max_n_pack, D)
         c_pack = t_emb + y_emb                                        # (B, P, D)
+        if self.struct_cond_dim:
+            if struct is None:
+                raise ValueError("model has struct_cond_dim > 0 but no `struct` "
+                                 "was passed")
+            c_pack = c_pack + self.struct_embedder(
+                struct.reshape(B, max_n_pack, self.struct_cond_dim).to(dtype))
 
         # Expand conditioning to per-token: each token inherits the embedding of
         # the image it belongs to. Padding tokens (doc_id=-1) are zeroed below.
@@ -323,7 +352,7 @@ class QuadtreeFiT(nn.Module):
         return c
 
     def forward(self, x, t, y, grid, mask, size=None, tsize=None,
-                doc_ids=None, block_mask=None, **kwargs):
+                doc_ids=None, block_mask=None, struct=None, **kwargs):
         """Packed forward pass.
 
         x:        (1, N_total, 4*C_in)  packed quadtree leaf tokens
@@ -335,6 +364,8 @@ class QuadtreeFiT(nn.Module):
         tsize:    (1, N_total)          per-token leaf side (1/2/4/8)
         doc_ids:  (1, N_total)          image index per token, -1 for padding
         block_mask:                     precomputed FlexAttention BlockMask
+        struct:   (1, max_n_pack, S)    full-tree split bits per image (only
+                                        with struct_cond_dim > 0)
 
         return:   (1, N_total, 4*C_out)
         """
@@ -342,7 +373,8 @@ class QuadtreeFiT(nn.Module):
 
         x = self.x_embedder(x)                                       # (1, N, D)
 
-        c = self._build_conditioning(t, y, tsize, doc_ids, x.dtype)  # (B, N, D)
+        c = self._build_conditioning(t, y, tsize, doc_ids, x.dtype,
+                                     struct)                          # (B, N, D)
 
         if self.global_adaLN_modulation is not None:
             global_adaln = self.global_adaLN_modulation(c)           # (B, N, 6*D)
