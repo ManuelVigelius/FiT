@@ -88,7 +88,12 @@ VAE_SCALE = 0.18215
 
 WORKDIR = "/visinf/projects_students/mb_mvigel/workdir"
 CKPT_ROOT = "/visinf/projects_students/mb_mvigel/checkpoints"
-DATASET_ROOT = "/visinf/projects_students/mb_mvigel/datasets/imagenet1k_latents_256_sd_vae_ft_ema"
+DATASET_ROOT = "/visinf/projects_students/mb_mvigel/datasets"
+
+# A fully dense tree is one size-1 leaf per 2x2 patch cell: (32/2)^2 = 256.
+DENSE_TOKENS = (LATENT_SIZE // 2) ** 2
+# Coarsest legal tree: one size-8 leaf per quadrant of the 32x32 latent.
+MIN_TOKENS = (LATENT_SIZE // 2 // 8) ** 2
 
 QUADTREE_THRESHOLD = 0.5
 MAX_RES_SCHEDULE = [[0.0, 1], [0.7, 2], [0.85, 4], [0.95, 8]]
@@ -166,7 +171,31 @@ def load_arm(cond, step, ema, device):
 
     comp_sd = load_file(os.path.join(ckpt_dir, "model_2.safetensors"))
     if spec["pyramid"]:
-        comp.load_state_dict(comp_sd, strict=True)
+        # share_weights=True makes merges[0..2] (and splits[0..2]) the SAME
+        # module object, so safetensors refuses to write the aliases and
+        # accelerate drops them: the checkpoint holds only merges.0/splits.0.
+        # Loading non-strictly restores the real weights into that one shared
+        # object, and every alias sees them because it IS that object. Guard
+        # anyway, so a genuinely truncated checkpoint still fails loudly.
+        missing_c, unexpected_c = comp.load_state_dict(comp_sd, strict=False)
+        aliased = [k for k in missing_c
+                   if k.startswith(("encoder.merges.", "decoder.splits."))
+                   and k.split(".")[2] != "0"]
+        real = [k for k in missing_c if k not in aliased]
+        if real or unexpected_c:
+            raise RuntimeError(
+                f"{cond}: compressor state_dict mismatch beyond the shared "
+                f"merge/split aliases\n  missing={real[:6]}\n"
+                f"  unexpected={unexpected_c[:6]}")
+        # The aliases must genuinely be the same object, or those levels would
+        # silently run on random init.
+        enc_m, dec_s = comp.encoder.merges, comp.decoder.splits
+        if any(m is not enc_m[0] for m in enc_m) or \
+           any(s is not dec_s[0] for s in dec_s):
+            raise RuntimeError(
+                f"{cond}: checkpoint omits merge/split levels but this "
+                f"compressor does not share them — weights would be random. "
+                f"Was it trained with share_weights: false?")
     elif comp_sd:
         raise RuntimeError(
             f"{cond}: expected an empty compressor (pyramid_free), got "
@@ -221,7 +250,7 @@ def coarsen_plan(plan, min_leaf):
         for x in range(0, n, min_leaf):
             blk = g[y:y + min_leaf, x:x + min_leaf]
             g[y:y + min_leaf, x:x + min_leaf] = int(blk.max())
-    return S.plan_from_sizes_grid(g)
+    return S.plan_from_sizes_grid(g, device=plan['sizes'].device)
 
 
 def plans_from_vp(vp, x_t, t_ds):
@@ -238,6 +267,23 @@ def plans_from_vp(vp, x_t, t_ds):
             [v[i] for v in var], QUADTREE_THRESHOLD, LATENT_SIZE)
         out.append(dict(levels=levels, positions=positions, sizes=sizes))
     return out
+
+
+def plans_dense(B, min_leaf, device):
+    """Uniform tree at the FINEST leaf the schedule allows.
+
+    The dense control: no adaptive compression at all, every leaf the same
+    size. `min_leaf` is 1 (fully dense, 256 tokens) except for the schedule-
+    capped arms, where the cap still applies -- a size-1 tree at t > 0.7 is a
+    resolution the GT/prior models were never trained on, so forcing it would
+    measure an out-of-distribution failure rather than the cost of compression.
+    """
+    g = torch.full((LATENT_SIZE // 2, LATENT_SIZE // 2), int(min_leaf),
+                   dtype=torch.long)
+    plan = S.plan_from_sizes_grid(g, device=device)
+    # Same structure for every image in the batch; the dicts are read-only here
+    # so sharing one is safe and avoids B identical rebuilds.
+    return [plan] * B
 
 
 def plans_from_gt(latents, min_leaf):
@@ -353,7 +399,7 @@ def quantize_to_plan(x, plans):
 def sample_batch(cond, model, comp, labels, *, vp=None, gt_latents=None,
                  prior_plans=None, num_steps=50, cfg_scale=4.0,
                  device="cuda", dtype=torch.float32, generator=None,
-                 log=None):
+                 log=None, return_last_plans=False, dense=False):
     """Euler flow-matching sampler over a per-step quadtree.
 
     The dense latent is the integration state. At each step the tree is chosen
@@ -370,6 +416,8 @@ def sample_batch(cond, model, comp, labels, *, vp=None, gt_latents=None,
     x = torch.randn(B, C_IN, LATENT_SIZE, LATENT_SIZE, device=device,
                     dtype=dtype, generator=generator)
 
+    last_plans = None          # num_steps=0 would otherwise leave this unbound
+
     # t_ds: 1 = pure noise, 0 = clean. Integrate downward.
     ts = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=dtype)
 
@@ -380,7 +428,13 @@ def sample_batch(cond, model, comp, labels, *, vp=None, gt_latents=None,
         t_batch_ds = torch.full((B,), float(t_ds), device=device, dtype=dtype)
 
         # --- 1. choose the tree for the current state -----------------------
-        if spec["tree"] == "vp":
+        if dense:
+            # Dense control. The VP arms trained uncapped, so they go fully
+            # dense (leaf 1); the schedule-capped arms keep their cap.
+            min_leaf = 1 if spec["tree"] == "vp" \
+                else min_leaf_size_at(float(t_ds), schedule)
+            plans = plans_dense(B, min_leaf, device)
+        elif spec["tree"] == "vp":
             plans = plans_from_vp(vp, x, t_batch_ds)
         else:
             min_leaf = min_leaf_size_at(float(t_ds), schedule)
@@ -403,6 +457,15 @@ def sample_batch(cond, model, comp, labels, *, vp=None, gt_latents=None,
         x_cfg = torch.cat([x_in, x_in], 0)
         y_cfg = torch.cat([labels, torch.full_like(labels, NUM_CLASSES)], 0)
         t_cfg = torch.cat([t_batch_ds, t_batch_ds], 0)
+        # Cheap invariant: plan_to_masks derives mask device from the plan
+        # tensors, so a stray CPU plan surfaces as a device mismatch deep inside
+        # the decoder. Catch it here, where the source is obvious.
+        for _p in plans:
+            if _p['sizes'].device.type != torch.device(device).type:
+                raise RuntimeError(
+                    f"plan on {_p['sizes'].device}, expected {device}. "
+                    "Plans must be built on the compute device.")
+
         plans_cfg = plans + plans
 
         packed = pack(comp, x_cfg, plans_cfg, y_cfg, t_cfg, device)
@@ -429,21 +492,130 @@ def sample_batch(cond, model, comp, labels, *, vp=None, gt_latents=None,
         # (1 - t) == t_ds; floor it to keep the last step finite.
         v = (x1 - x) / t_ds.clamp(min=1e-3)
         x = x + dt * v
+        last_plans = plans
 
-    return x
+    # The overlay must show the tree the FINAL prediction actually used, which
+    # is the one chosen at the last step -- not a fresh tree for the clean
+    # latent, which no model ever saw.
+    return (x, last_plans) if return_last_plans else x
+
+
+# ─────────────────────────────────── debug ──────────────────────────────────
+def draw_quadtree(img, plan, colour=(255, 64, 64), width=1):
+    """Overlay a plan's leaf boundaries on an HxWx3 uint8 image.
+
+    Plan geometry (see `scatter_baseline`): `sizes` is in PATCH CELLS, and a
+    size-N leaf centered at (cy, cx) covers 2N x 2N LATENT pixels starting at
+    (cy - N, cx - N). The VAE upsamples latent -> image by a fixed factor, so
+    one latent pixel is `scale` image pixels on a side.
+    """
+    out = img.copy()
+    H = out.shape[0]
+    scale = H // LATENT_SIZE            # 32 latent px -> 256 image px => 8
+    pos = plan["positions"].detach().cpu()
+    sizes = plan["sizes"].detach().cpu()
+
+    for k in range(int(sizes.shape[0])):
+        N = int(sizes[k])
+        y0 = int(round(float(pos[k, 0]) - N)) * scale
+        x0 = int(round(float(pos[k, 1]) - N)) * scale
+        side = 2 * N * scale
+        y1, x1 = min(y0 + side, H), min(x0 + side, out.shape[1])
+        y0, x0 = max(y0, 0), max(x0, 0)
+        if y1 <= y0 or x1 <= x0:
+            continue
+        # Draw inward so edge leaves keep their border inside the frame.
+        out[y0:min(y0 + width, y1), x0:x1] = colour      # top
+        out[max(y1 - width, y0):y1, x0:x1] = colour      # bottom
+        out[y0:y1, x0:min(x0 + width, x1)] = colour      # left
+        out[y0:y1, max(x1 - width, x0):x1] = colour      # right
+    return out
+
+
+def plot_token_counts(traj, step_ts, cond, path):
+    """One line per image: token count over the sampling trajectory.
+
+    x is the diffusion time in DATASET convention (t=1 noise -> t=0 clean), so
+    the axis is drawn decreasing left-to-right: the run starts at the left and
+    ends clean at the right. Returns False if matplotlib is unavailable.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("  (matplotlib missing, skipping plot)")
+        return False
+
+    if not traj:
+        return False
+    n = len(traj)
+    xs = step_ts if step_ts else list(range(len(traj[0])))
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    # Many overlapping lines: keep each faint so density reads as shade, and
+    # overlay the mean so the population trend stays legible.
+    alpha = max(0.06, min(0.5, 12.0 / n))
+    for t in traj:
+        ax.plot(xs, t, color="#4a7ebb", alpha=alpha, lw=0.8)
+    mean = [sum(c) / n for c in zip(*traj)]
+    ax.plot(xs, mean, color="#d94", lw=2.0, label="mean")
+
+    # Context: 256 = fully dense, 4 = coarsest legal tree. A trajectory pinned
+    # to either bound is degenerate, not a model result.
+    ax.axhline(DENSE_TOKENS, color="#888", ls=":", lw=1,
+               label=f"dense {DENSE_TOKENS}")
+    ax.axhline(MIN_TOKENS, color="#888", ls="--", lw=1,
+               label=f"coarsest {MIN_TOKENS}")
+
+    if step_ts:
+        ax.set_xlabel("t  (1 = noise  ->  0 = clean)")
+        ax.set_xlim(max(xs), min(xs))          # decreasing: noise on the left
+    else:
+        ax.set_xlabel("sampling step")
+    ax.set_ylabel("tokens")
+    ax.set_title(f"{cond}: tokens per image over sampling ({n} images)")
+    ax.set_ylim(0, DENSE_TOKENS * 1.08)
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return True
 
 
 # ──────────────────────────────────── main ──────────────────────────────────
 def _discover_latents(root):
+    """Locate the train-split crop folders under `root`.
+
+    Mirrors GTQuadtreeLatentDataset._discover_files, with one deliberate
+    difference: there is NO recursive fallback. `root` here may be the shared
+    datasets directory holding ~1.1M files, and a recursive sweep of that
+    either hangs or silently picks up latents from an unrelated dataset. A
+    wrong GT latent is not a crash — it is a quietly invalid oracle tree that
+    would corrupt the `gt` condition's FID. So: find the crop folders or fail.
+    """
     import glob
+    files, looked = [], []
     for sub in ("greater_than_256_crop", "greater_than_512_crop"):
         d = os.path.join(root, sub)
+        looked.append(d)
         if os.path.isdir(d):
-            f = sorted(glob.glob(os.path.join(d, "*.safetensors")))
-            if f:
-                return f
-    return sorted(glob.glob(os.path.join(root, "**", "*.safetensors"),
-                            recursive=True))
+            files.extend(sorted(glob.glob(os.path.join(d, "*.safetensors"))))
+    if not files:
+        raise RuntimeError(
+            "no latent crop folders found. Looked for:\n  "
+            + "\n  ".join(looked)
+            + "\nPass the directory that CONTAINS greater_than_256_crop "
+              "via --dataset."
+        )
+    return files
+
+
+def _to_images(vae, x):
+    """Latents -> HWC uint8 numpy, the standard VAE decode path."""
+    imgs = vae.decode(x / VAE_SCALE).sample
+    imgs = ((imgs.clamp(-1, 1) + 1) * 127.5).to(torch.uint8)
+    return imgs.permute(0, 2, 3, 1).cpu().numpy()
 
 
 def _center_crop(latent, c=LATENT_SIZE):
@@ -462,15 +634,18 @@ def main():
                     choices=list(CONDITIONS) + ["all"])
     ap.add_argument("--n-images", type=int, default=64)
     ap.add_argument("--batch-size", type=int, default=16)
-    ap.add_argument("--num-steps", type=int, default=50)
+    ap.add_argument("--num-steps", type=int, default=16)
     ap.add_argument("--cfg-scale", type=float, default=4.0)
     ap.add_argument("--step", type=int, default=8000,
                     help="diffusion checkpoint step")
     ap.add_argument("--prior-step", type=int, default=50000)
     ap.add_argument("--no-ema", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--out", default="/visinf/projects_students/mb_mvigel/samples")
+    ap.add_argument("--out", default="/visinf/home/mb_mvigel/samples")
     ap.add_argument("--dataset", default=DATASET_ROOT)
+    ap.add_argument("--debug", action="store_true",
+                    help="also write *_tree.png overlays of the final-step "
+                         "quadtree and a per-condition token-count plot")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -508,7 +683,11 @@ def main():
 
         out_dir = os.path.join(args.out, cond)
         os.makedirs(out_dir, exist_ok=True)
-        token_log = []
+        token_log = []         # per-step trace of the first batch (as before)
+        final_tokens = []      # tokens at the last step, per image
+        traj = []              # per-image token trajectory, one list per image
+        dense_tokens = []      # tokens in the dense control (debug only)
+        step_ts = []           # t value at each step (shared by all images)
 
         done = 0
         while done < args.n_images:
@@ -527,20 +706,59 @@ def main():
                 # Sampled ONCE per image, before the loop. The schedule only
                 # coarsens this fixed tree per step; it never re-samples.
                 from quadtree_prior.sample import sample_plans
-                prior_plans, _ = sample_plans(prior, labels, device=device)
+                # plan_device matters: plan_to_masks builds its masks on the
+                # device of the plan TENSORS (levels.device), ignoring the
+                # device arg threaded through _batch_masks. CPU plans would
+                # therefore hand the decoder CPU masks against CUDA tokens.
+                prior_plans, _ = sample_plans(prior, labels, device=device,
+                                              plan_device=device)
 
-            x = sample_batch(
+            batch_log = []
+            out = sample_batch(
                 cond, model, comp, labels, vp=vp, gt_latents=gt_latents,
                 prior_plans=prior_plans, num_steps=args.num_steps,
                 cfg_scale=args.cfg_scale, device=device, generator=gen,
-                log=token_log if done == 0 else None)
+                log=batch_log, return_last_plans=True)
+            x, last_plans = out
+            final_tokens.extend(int(p["sizes"].shape[0]) for p in last_plans)
 
-            imgs = vae.decode(x / VAE_SCALE).sample
-            imgs = ((imgs.clamp(-1, 1) + 1) * 127.5).to(torch.uint8)
-            imgs = imgs.permute(0, 2, 3, 1).cpu().numpy()
+            # Per-step trace for THIS batch -> one trajectory per image. The
+            # step grid is identical across batches, so transposing each
+            # batch's log and concatenating along the image axis is safe.
+            if done == 0:
+                token_log = batch_log                  # per-step, first batch
+                step_ts = [e["t"] for e in batch_log]
+            for i in range(bs):
+                traj.append([e["tokens"][i] for e in batch_log])
+
+            imgs = _to_images(vae, x)
             for k in range(bs):
                 Image.fromarray(imgs[k]).save(
                     os.path.join(out_dir, f"{done + k:06d}.png"))
+                if args.debug:
+                    Image.fromarray(
+                        draw_quadtree(imgs[k], last_plans[k])).save(
+                        os.path.join(out_dir, f"{done + k:06d}_tree.png"))
+
+            # --- dense control -------------------------------------------
+            # Same seed, same labels, same GT latents / prior trees: the ONLY
+            # difference is the tree. Pairs <id>.png and <id>_dense.png are
+            # therefore directly comparable, and isolate what the adaptive
+            # tree costs against no compression at all.
+            if args.debug:
+                gen_d = torch.Generator(device=device).manual_seed(
+                    args.seed + done)
+                x_d, dense_plans = sample_batch(
+                    cond, model, comp, labels, vp=vp, gt_latents=gt_latents,
+                    prior_plans=prior_plans, num_steps=args.num_steps,
+                    cfg_scale=args.cfg_scale, device=device, generator=gen_d,
+                    return_last_plans=True, dense=True)
+                imgs_d = _to_images(vae, x_d)
+                for k in range(bs):
+                    Image.fromarray(imgs_d[k]).save(
+                        os.path.join(out_dir, f"{done + k:06d}_dense.png"))
+                dense_tokens.extend(
+                    int(p["sizes"].shape[0]) for p in dense_plans)
 
             done += bs
             print(f"  {done}/{args.n_images}", flush=True)
@@ -554,6 +772,22 @@ def main():
             first = sum(token_log[0]["tokens"]) / len(token_log[0]["tokens"])
             last = sum(token_log[-1]["tokens"]) / len(token_log[-1]["tokens"])
             print(f"  mean tokens/image: {first:.1f} (t=1) -> {last:.1f} (t=0)")
+
+        if args.debug and final_tokens:
+            with open(os.path.join(out_dir, "token_traj.json"), "w") as f:
+                json.dump(dict(t=step_ts, traj=traj, final=final_tokens), f)
+            plot_path = os.path.join(out_dir, f"tokens_{cond}.png")
+            if plot_token_counts(traj, step_ts, cond, plot_path):
+                print(f"  wrote {plot_path}")
+            print(f"  final tokens: min {min(final_tokens)} "
+                  f"max {max(final_tokens)} "
+                  f"mean {sum(final_tokens) / len(final_tokens):.1f} "
+                  f"(dense {DENSE_TOKENS})")
+            if dense_tokens:
+                mt = sum(final_tokens) / len(final_tokens)
+                md = sum(dense_tokens) / len(dense_tokens)
+                print(f"  dense control: mean {md:.1f} tokens "
+                      f"({mt / md:.2f}x compression in the adaptive run)")
 
         del model, comp, vp, prior
         torch.cuda.empty_cache()
