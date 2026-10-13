@@ -399,7 +399,7 @@ def quantize_to_plan(x, plans):
 def sample_batch(cond, model, comp, labels, *, vp=None, gt_latents=None,
                  prior_plans=None, num_steps=50, cfg_scale=4.0,
                  device="cuda", dtype=torch.float32, generator=None,
-                 log=None, return_last_plans=False, dense=False):
+                 noise=None, log=None, return_last_plans=False, dense=False):
     """Euler flow-matching sampler over a per-step quadtree.
 
     The dense latent is the integration state. At each step the tree is chosen
@@ -408,13 +408,20 @@ def sample_batch(cond, model, comp, labels, *, vp=None, gt_latents=None,
 
     The models predict x1, so the velocity is recovered as
     v = (x1_hat - x_t) / (1 - t) with t in transport convention.
+
+    `noise` (B, C, H, W), if given, is the initial state; otherwise it is drawn
+    from `generator`. Passing it in keeps an image's starting point independent
+    of which batch or shard it lands in.
     """
     spec = CONDITIONS[cond]
     B = labels.shape[0]
     schedule = normalize_max_res_schedule(MAX_RES_SCHEDULE)
 
-    x = torch.randn(B, C_IN, LATENT_SIZE, LATENT_SIZE, device=device,
-                    dtype=dtype, generator=generator)
+    if noise is not None:
+        x = noise.to(device=device, dtype=dtype)
+    else:
+        x = torch.randn(B, C_IN, LATENT_SIZE, LATENT_SIZE, device=device,
+                        dtype=dtype, generator=generator)
 
     last_plans = None          # num_steps=0 would otherwise leave this unbound
 
@@ -628,12 +635,298 @@ def _center_crop(latent, c=LATENT_SIZE):
                   (Ws - c) // 2:(Ws - c) // 2 + c]
 
 
+# ───────────────────────────── reproducible runs ────────────────────────────
+# A run is split into a FIXED grid of batches: batch b always holds images
+# [b * batch_size, (b + 1) * batch_size), and shard i of N takes batches
+# i, i + N, i + 2N, ... Every image therefore sees the same inputs AND the same
+# batch-mates no matter how many GPUs produce the run. Batch-mates matter: they
+# change GPU reduction order, and through it the per-step VP trees, so images are
+# only bit-reproducible for a fixed batch grid. That is why batch_size is part of
+# the run record below.
+#
+# Each finished batch writes batches/<b>.json LAST. Its presence is what marks
+# the batch done, so a killed run resumes where it stopped, and --merge can
+# verify that a run is complete before anything is scored.
+
+
+def _manifest(cond, args):
+    """The arguments that determine this condition's images."""
+    keys = ["n_images", "batch_size", "num_steps", "cfg_scale", "step",
+            "no_ema", "seed", "debug"]
+    tree = CONDITIONS[cond]["tree"]
+    m = dict(condition=cond, **{k: getattr(args, k) for k in keys})
+    if tree == "gt":
+        m["dataset"] = os.path.abspath(args.dataset)
+    if tree == "prior":
+        m["prior_step"] = args.prior_step
+    return m
+
+
+def _check_manifest(out_dir, manifest):
+    """Record `manifest` as out_dir/run.json, or verify it matches the record.
+
+    Every shard and every resume goes through here, so one folder can never mix
+    images from two configurations. Shards start concurrently: os.link fails if
+    the target exists, which makes "first writer wins" atomic.
+    """
+    path = os.path.join(out_dir, "run.json")
+    if not os.path.exists(path) and any(
+            f.endswith(".png") for f in os.listdir(out_dir)):
+        raise RuntimeError(
+            f"{out_dir} already holds PNGs from a run without run.json "
+            "(older script version). Use a fresh --out or clear the folder.")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    try:
+        os.link(tmp, path)
+    except FileExistsError:
+        with open(path) as f:
+            recorded = json.load(f)
+        if recorded != manifest:
+            diff = {k: (recorded.get(k), manifest.get(k))
+                    for k in sorted(set(recorded) | set(manifest))
+                    if recorded.get(k) != manifest.get(k)}
+            raise RuntimeError(
+                f"{out_dir} holds a run with different settings "
+                f"(recorded, requested): {diff}. Use a fresh --out, or delete "
+                "the folder to start over.")
+    finally:
+        os.remove(tmp)
+
+
+def _fixed_inputs(seed, n_images, n_latents=None):
+    """Labels, initial noise and (gt only) training-latent indices for ALL images.
+
+    Drawn once on CPU, in this order, from one generator seeded with `seed`.
+    Labels and noise use the same draws as measure_fid.py, so for equal seed and
+    image count they match the FiT FID runs. Every shard draws the full set and
+    slices its own images out, so an image's inputs depend only on its index.
+    """
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    labels = torch.randint(0, NUM_CLASSES, (n_images,), generator=g)
+    noise = torch.randn(n_images, C_IN, LATENT_SIZE, LATENT_SIZE, generator=g)
+    gt_idx = (torch.randint(0, n_latents, (n_images,), generator=g)
+              if n_latents else None)
+    return labels, noise, gt_idx
+
+
+def _batch_path(out_dir, b):
+    return os.path.join(out_dir, "batches", f"{b:05d}.json")
+
+
+@torch.no_grad()
+def generate(cond, args, vae, device):
+    """Generate this shard's batches of one condition, skipping finished ones."""
+    spec = CONDITIONS[cond]
+    out_dir = os.path.join(args.out, cond)
+    os.makedirs(os.path.join(out_dir, "batches"), exist_ok=True)
+    _check_manifest(out_dir, _manifest(cond, args))
+
+    n_batches = math.ceil(args.n_images / args.batch_size)
+    mine = range(args.shard_id, n_batches, args.num_shards)
+    todo = [b for b in mine if not os.path.exists(_batch_path(out_dir, b))]
+    tag = f"[{cond} shard {args.shard_id}/{args.num_shards}]"
+    print(f"\n{'=' * 60}\n{tag} {spec['project']}, tree={spec['tree']}: "
+          f"{len(todo)} of {len(mine)} batches to generate", flush=True)
+    if not todo:
+        return
+
+    latent_files = None
+    if spec["tree"] == "gt":
+        latent_files = _discover_latents(args.dataset)
+        print(f"  GT trees from {len(latent_files)} train latents")
+    labels_all, noise_all, gt_idx_all = _fixed_inputs(
+        args.seed, args.n_images,
+        len(latent_files) if latent_files else None)
+
+    model, comp = load_arm(cond, args.step, not args.no_ema, device)
+    vp = load_variance_predictor(device) if spec["tree"] == "vp" else None
+    prior = load_prior(args.prior_step, not args.no_ema, device) \
+        if spec["tree"] == "prior" else None
+
+    for i, b in enumerate(todo):
+        s = b * args.batch_size
+        e = min(s + args.batch_size, args.n_images)
+        labels = labels_all[s:e].to(device)
+        noise = noise_all[s:e]
+
+        gt_latents = prior_plans = None
+        if spec["tree"] == "gt":
+            gt_latents = torch.stack([
+                _center_crop(load_latent(latent_files[j])).float()
+                for j in gt_idx_all[s:e].tolist()]).to(device)
+        elif spec["tree"] == "prior":
+            # Sampled ONCE per image, before the loop. The schedule only
+            # coarsens this fixed tree per step; it never re-samples.
+            from quadtree_prior.sample import sample_plans
+            # plan_device matters: plan_to_masks builds its masks on the
+            # device of the plan TENSORS (levels.device), ignoring the
+            # device arg threaded through _batch_masks. CPU plans would
+            # therefore hand the decoder CPU masks against CUDA tokens.
+            # The generator is keyed to the batch start, which the fixed
+            # batch grid makes shard-independent.
+            g_prior = torch.Generator(device=device).manual_seed(args.seed + s)
+            prior_plans, _ = sample_plans(prior, labels, device=device,
+                                          plan_device=device,
+                                          generator=g_prior)
+
+        batch_log = []
+        x, last_plans = sample_batch(
+            cond, model, comp, labels, vp=vp, gt_latents=gt_latents,
+            prior_plans=prior_plans, num_steps=args.num_steps,
+            cfg_scale=args.cfg_scale, device=device, noise=noise,
+            log=batch_log, return_last_plans=True)
+        record = dict(start=s, log=batch_log,
+                      final=[int(p["sizes"].shape[0]) for p in last_plans])
+
+        imgs = _to_images(vae, x)
+        for k in range(e - s):
+            Image.fromarray(imgs[k]).save(
+                os.path.join(out_dir, f"{s + k:06d}.png"))
+            if args.debug:
+                Image.fromarray(draw_quadtree(imgs[k], last_plans[k])).save(
+                    os.path.join(out_dir, f"{s + k:06d}_tree.png"))
+
+        # --- dense control -----------------------------------------------
+        # Same noise, same labels, same GT latents / prior trees: the ONLY
+        # difference is the tree. Pairs <id>.png and <id>_dense.png are
+        # therefore directly comparable, and isolate what the adaptive
+        # tree costs against no compression at all.
+        if args.debug:
+            x_d, dense_plans = sample_batch(
+                cond, model, comp, labels, vp=vp, gt_latents=gt_latents,
+                prior_plans=prior_plans, num_steps=args.num_steps,
+                cfg_scale=args.cfg_scale, device=device, noise=noise,
+                return_last_plans=True, dense=True)
+            imgs_d = _to_images(vae, x_d)
+            for k in range(e - s):
+                Image.fromarray(imgs_d[k]).save(
+                    os.path.join(out_dir, f"{s + k:06d}_dense.png"))
+            record["dense_final"] = [int(p["sizes"].shape[0])
+                                     for p in dense_plans]
+
+        # Written last, atomically: this file is the batch's completion mark.
+        path = _batch_path(out_dir, b)
+        with open(path + ".tmp", "w") as f:
+            json.dump(record, f)
+        os.replace(path + ".tmp", path)
+        print(f"{tag} batch {i + 1}/{len(todo)} (images {s}-{e - 1})",
+              flush=True)
+
+    del model, comp, vp, prior
+    torch.cuda.empty_cache()
+
+
+def _compute_fid(image_dir, n_images):
+    """clean-fid against the same cached custom reference as measure_fid.py."""
+    from cleanfid import fid as cleanfid
+    name = os.environ.get("FID_REF_NAME", "fit_imagenet256")
+    mode = os.environ.get("FID_MODE", "clean")
+    if not cleanfid.test_stats_exists(name, mode=mode):
+        raise RuntimeError(
+            f"clean-fid reference '{name}' (mode={mode}) is not built yet. "
+            "Build it once with tools/cluster_fid.sh (measure_fid.py).")
+    return float(cleanfid.compute_fid(
+        image_dir, dataset_name=name, dataset_split="custom", mode=mode,
+        num_gen=n_images))
+
+
+def merge(cond, args):
+    """Verify a finished run, combine its per-batch stats, optionally score FID.
+
+    Returns (fid or None, run record).
+    """
+    out_dir = os.path.join(args.out, cond)
+    path = os.path.join(out_dir, "run.json")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"{path} missing: nothing generated for "
+                                f"{cond} under {args.out}")
+    with open(path) as f:
+        run = json.load(f)
+    n_images, bs = run["n_images"], run["batch_size"]
+    n_batches = math.ceil(n_images / bs)
+    print(f"\n{'=' * 60}\n[{cond}] merging {n_batches} batches "
+          f"({n_images} images)")
+
+    # Refuse to summarise or score an incomplete run: clean-fid would happily
+    # score whatever PNGs exist and return a confident but wrong FID.
+    missing = [b for b in range(n_batches)
+               if not os.path.exists(_batch_path(out_dir, b))]
+    if missing:
+        raise RuntimeError(
+            f"[{cond}] {len(missing)}/{n_batches} batches unfinished (first: "
+            f"{missing[:5]}). Rerun generation with the same settings to "
+            "resume.")
+    no_png = [i for i in range(n_images)
+              if not os.path.isfile(os.path.join(out_dir, f"{i:06d}.png"))]
+    if no_png:
+        raise RuntimeError(f"[{cond}] {len(no_png)} PNGs missing "
+                           f"(first: {no_png[:5]})")
+
+    recs = []
+    for b in range(n_batches):
+        with open(_batch_path(out_dir, b)) as f:
+            recs.append(json.load(f))
+
+    # Token counts per step: the cheapest way to see the tree behaving —
+    # a baseline run that ratchets monotonically coarser is the VP-on-a-
+    # quantized-state feedback loop, not a model failure.
+    token_log = recs[0]["log"]                     # per-step, first batch
+    with open(os.path.join(out_dir, "token_counts.json"), "w") as f:
+        json.dump(token_log, f, indent=2)
+    if token_log:
+        first = sum(token_log[0]["tokens"]) / len(token_log[0]["tokens"])
+        last = sum(token_log[-1]["tokens"]) / len(token_log[-1]["tokens"])
+        print(f"  mean tokens/image: {first:.1f} (t=1) -> {last:.1f} (t=0)")
+
+    if run["debug"]:
+        # Per-step trace of every batch -> one trajectory per image. The step
+        # grid is identical across batches, so transposing each batch's log
+        # and concatenating along the image axis is safe.
+        step_ts = [e["t"] for e in token_log]
+        traj = [[e["tokens"][k] for e in r["log"]]
+                for r in recs for k in range(len(r["final"]))]
+        final_tokens = [t for r in recs for t in r["final"]]
+        dense_tokens = [t for r in recs for t in r.get("dense_final", [])]
+        with open(os.path.join(out_dir, "token_traj.json"), "w") as f:
+            json.dump(dict(t=step_ts, traj=traj, final=final_tokens), f)
+        plot_path = os.path.join(out_dir, f"tokens_{cond}.png")
+        if plot_token_counts(traj, step_ts, cond, plot_path):
+            print(f"  wrote {plot_path}")
+        print(f"  final tokens: min {min(final_tokens)} "
+              f"max {max(final_tokens)} "
+              f"mean {sum(final_tokens) / len(final_tokens):.1f} "
+              f"(dense {DENSE_TOKENS})")
+        if dense_tokens:
+            mt = sum(final_tokens) / len(final_tokens)
+            md = sum(dense_tokens) / len(dense_tokens)
+            print(f"  dense control: mean {md:.1f} tokens "
+                  f"({mt / md:.2f}x compression in the adaptive run)")
+
+    fid = None
+    if args.fid:
+        if run["debug"]:
+            raise RuntimeError(
+                f"[{cond}] was generated with --debug; its folder also holds "
+                "_tree/_dense PNGs, which clean-fid would score too.")
+        if n_images < 2048:
+            # Fewer samples than Inception feature dims -> singular covariance.
+            raise RuntimeError(f"[{cond}] FID needs >= 2048 images, "
+                               f"run has {n_images}")
+        fid = _compute_fid(out_dir, n_images)
+        print(f"  FID = {fid:.4f}")
+    return fid, run
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--condition", required=True,
+    ap.add_argument("--condition", required=True, nargs="+",
                     choices=list(CONDITIONS) + ["all"])
     ap.add_argument("--n-images", type=int, default=64)
-    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--batch-size", type=int, default=16,
+                    help="part of the run record: images are bit-"
+                         "reproducible only for a fixed batch size")
     ap.add_argument("--num-steps", type=int, default=16)
     ap.add_argument("--cfg-scale", type=float, default=4.0)
     ap.add_argument("--step", type=int, default=8000,
@@ -645,152 +938,61 @@ def main():
     ap.add_argument("--dataset", default=DATASET_ROOT)
     ap.add_argument("--debug", action="store_true",
                     help="also write *_tree.png overlays of the final-step "
-                         "quadtree and a per-condition token-count plot")
+                         "quadtree, a dense control and a per-condition "
+                         "token-count plot")
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="split the run into this many independent processes")
+    ap.add_argument("--shard-id", type=int, default=0,
+                    help="which shard this process generates (0-based)")
+    ap.add_argument("--merge", action="store_true",
+                    help="don't generate: verify finished runs and combine "
+                         "their per-batch stats")
+    ap.add_argument("--fid", action="store_true",
+                    help="with --merge: score each run with clean-fid "
+                         "(reference from FID_REF_NAME / FID_MODE)")
     args = ap.parse_args()
+    if not 0 <= args.shard_id < args.num_shards:
+        ap.error("need 0 <= --shard-id < --num-shards")
+    if args.fid and not args.merge:
+        ap.error("--fid only works together with --merge")
+
+    conds = list(CONDITIONS) if "all" in args.condition else args.condition
+
+    if args.merge:
+        results = {}
+        for cond in conds:
+            fid, run = merge(cond, args)
+            if fid is not None:
+                results[cond] = dict(fid=fid, run=run)
+        if results:
+            path = os.path.join(args.out, "fid_results.json")
+            existing = {}
+            if os.path.isfile(path):
+                with open(path) as f:
+                    existing = json.load(f)
+            existing.update(results)
+            with open(path, "w") as f:
+                json.dump(existing, f, indent=2)
+            print(f"\n{'=' * 60}\nFID results:")
+            for cond, r in results.items():
+                print(f"  {cond:10s} FID = {r['fid']:.4f}")
+            print(f"Saved {path}")
+        return
+
+    # Same inputs must give the same pixels across processes and reruns. With
+    # benchmark mode on, cuDNN can pick a different conv algorithm per process
+    # (VAE decode), which changes results in the last bits.
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    ema = not args.no_ema
-    conds = list(CONDITIONS) if args.condition == "all" else [args.condition]
-
-    print(f"Device: {device}  EMA: {ema}  steps: {args.num_steps}  "
-          f"CFG: {args.cfg_scale}")
+    print(f"Device: {device}  EMA: {not args.no_ema}  steps: {args.num_steps}"
+          f"  CFG: {args.cfg_scale}  shard: {args.shard_id}/{args.num_shards}")
 
     vae = AutoencoderKL.from_pretrained(VAE_PATH).to(device).eval()
 
-    # Shared across conditions so every arm generates the SAME class labels —
-    # FID is computed per condition, but matched labels make the sample grids
-    # directly comparable by eye.
-    g_lab = torch.Generator(device="cpu").manual_seed(args.seed)
-    all_labels = torch.randint(0, NUM_CLASSES, (args.n_images,),
-                               generator=g_lab)
-
     for cond in conds:
-        spec = CONDITIONS[cond]
-        print(f"\n{'=' * 60}\nCondition: {cond}  "
-              f"({spec['project']}, tree={spec['tree']})")
-
-        model, comp = load_arm(cond, args.step, ema, device)
-        vp = load_variance_predictor(device) if spec["tree"] == "vp" else None
-        prior = load_prior(args.prior_step, ema, device) \
-            if spec["tree"] == "prior" else None
-
-        latent_files = None
-        if spec["tree"] == "gt":
-            latent_files = _discover_latents(args.dataset)
-            if not latent_files:
-                raise RuntimeError(f"no latents under {args.dataset}")
-            print(f"  GT trees from {len(latent_files)} train latents")
-
-        out_dir = os.path.join(args.out, cond)
-        os.makedirs(out_dir, exist_ok=True)
-        token_log = []         # per-step trace of the first batch (as before)
-        final_tokens = []      # tokens at the last step, per image
-        traj = []              # per-image token trajectory, one list per image
-        dense_tokens = []      # tokens in the dense control (debug only)
-        step_ts = []           # t value at each step (shared by all images)
-
-        done = 0
-        while done < args.n_images:
-            bs = min(args.batch_size, args.n_images - done)
-            labels = all_labels[done:done + bs].to(device)
-            gen = torch.Generator(device=device).manual_seed(args.seed + done)
-
-            gt_latents = prior_plans = None
-            if spec["tree"] == "gt":
-                idx = torch.randint(0, len(latent_files), (bs,),
-                                    generator=g_lab).tolist()
-                gt_latents = torch.stack([
-                    _center_crop(load_latent(latent_files[j])).float()
-                    for j in idx]).to(device)
-            elif spec["tree"] == "prior":
-                # Sampled ONCE per image, before the loop. The schedule only
-                # coarsens this fixed tree per step; it never re-samples.
-                from quadtree_prior.sample import sample_plans
-                # plan_device matters: plan_to_masks builds its masks on the
-                # device of the plan TENSORS (levels.device), ignoring the
-                # device arg threaded through _batch_masks. CPU plans would
-                # therefore hand the decoder CPU masks against CUDA tokens.
-                prior_plans, _ = sample_plans(prior, labels, device=device,
-                                              plan_device=device)
-
-            batch_log = []
-            out = sample_batch(
-                cond, model, comp, labels, vp=vp, gt_latents=gt_latents,
-                prior_plans=prior_plans, num_steps=args.num_steps,
-                cfg_scale=args.cfg_scale, device=device, generator=gen,
-                log=batch_log, return_last_plans=True)
-            x, last_plans = out
-            final_tokens.extend(int(p["sizes"].shape[0]) for p in last_plans)
-
-            # Per-step trace for THIS batch -> one trajectory per image. The
-            # step grid is identical across batches, so transposing each
-            # batch's log and concatenating along the image axis is safe.
-            if done == 0:
-                token_log = batch_log                  # per-step, first batch
-                step_ts = [e["t"] for e in batch_log]
-            for i in range(bs):
-                traj.append([e["tokens"][i] for e in batch_log])
-
-            imgs = _to_images(vae, x)
-            for k in range(bs):
-                Image.fromarray(imgs[k]).save(
-                    os.path.join(out_dir, f"{done + k:06d}.png"))
-                if args.debug:
-                    Image.fromarray(
-                        draw_quadtree(imgs[k], last_plans[k])).save(
-                        os.path.join(out_dir, f"{done + k:06d}_tree.png"))
-
-            # --- dense control -------------------------------------------
-            # Same seed, same labels, same GT latents / prior trees: the ONLY
-            # difference is the tree. Pairs <id>.png and <id>_dense.png are
-            # therefore directly comparable, and isolate what the adaptive
-            # tree costs against no compression at all.
-            if args.debug:
-                gen_d = torch.Generator(device=device).manual_seed(
-                    args.seed + done)
-                x_d, dense_plans = sample_batch(
-                    cond, model, comp, labels, vp=vp, gt_latents=gt_latents,
-                    prior_plans=prior_plans, num_steps=args.num_steps,
-                    cfg_scale=args.cfg_scale, device=device, generator=gen_d,
-                    return_last_plans=True, dense=True)
-                imgs_d = _to_images(vae, x_d)
-                for k in range(bs):
-                    Image.fromarray(imgs_d[k]).save(
-                        os.path.join(out_dir, f"{done + k:06d}_dense.png"))
-                dense_tokens.extend(
-                    int(p["sizes"].shape[0]) for p in dense_plans)
-
-            done += bs
-            print(f"  {done}/{args.n_images}", flush=True)
-
-        # Token counts per step: the cheapest way to see the tree behaving —
-        # a baseline run that ratchets monotonically coarser is the VP-on-a-
-        # quantized-state feedback loop, not a model failure.
-        with open(os.path.join(out_dir, "token_counts.json"), "w") as f:
-            json.dump(token_log, f, indent=2)
-        if token_log:
-            first = sum(token_log[0]["tokens"]) / len(token_log[0]["tokens"])
-            last = sum(token_log[-1]["tokens"]) / len(token_log[-1]["tokens"])
-            print(f"  mean tokens/image: {first:.1f} (t=1) -> {last:.1f} (t=0)")
-
-        if args.debug and final_tokens:
-            with open(os.path.join(out_dir, "token_traj.json"), "w") as f:
-                json.dump(dict(t=step_ts, traj=traj, final=final_tokens), f)
-            plot_path = os.path.join(out_dir, f"tokens_{cond}.png")
-            if plot_token_counts(traj, step_ts, cond, plot_path):
-                print(f"  wrote {plot_path}")
-            print(f"  final tokens: min {min(final_tokens)} "
-                  f"max {max(final_tokens)} "
-                  f"mean {sum(final_tokens) / len(final_tokens):.1f} "
-                  f"(dense {DENSE_TOKENS})")
-            if dense_tokens:
-                mt = sum(final_tokens) / len(final_tokens)
-                md = sum(dense_tokens) / len(dense_tokens)
-                print(f"  dense control: mean {md:.1f} tokens "
-                      f"({mt / md:.2f}x compression in the adaptive run)")
-
-        del model, comp, vp, prior
-        torch.cuda.empty_cache()
+        generate(cond, args, vae, device)
 
     print(f"\nDone. Samples under {args.out}")
 
