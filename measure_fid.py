@@ -46,20 +46,23 @@ sys.path.insert(0, str(Path(__file__).parent))
 import generate_images as gi
 from generate_images import (
     BATCH_SIZE,
-    CFG_SCALE,
     C_IN,
     DEVICE,
     NUM_CLASSES,
     PATCH_SIZE,
     TARGET_LEN_PIX,
     VAE_SCALE,
+    build_upsampler_inputs,
     euler_sample_fr,
     load_model,
     make_grid_and_mask,
     model_cfg_for,
 )
 from fit.noise_field_sampler.noise_field_generator import sample_noise_fields_2d
-from fit.noise_field_sampler.noise_field_sampler import sample as noise_field_sample
+from fit.noise_field_sampler.noise_field_sampler import (
+    sample as noise_field_sample,
+    sample_upsampler as noise_field_sample_upsampler,
+)
 from fit.utils.utils import patchify, unpatchify
 
 # ─────────────────────────────── CONFIG ─────────────────────────────────────
@@ -67,21 +70,32 @@ from fit.utils.utils import patchify, unpatchify
 # Noise-field schedules to evaluate, by index in generate_images._make_schedules().
 # (Values inlined here so this script does not depend on that dict being enabled.)
 NOISE_FIELD_SCHEDULES = {
-    19: [1, 4, 7, 10, 13, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
-    29: [6, 8, 10, 12, 14, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
-    33: [11, 12, 13, 14, 15, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
-    34: [16] * 16,
+    0: [16] * 16,
+    1: [1, 1, 2, 5, 8, 11, 14, 15, 16, 16, 16, 16, 16, 16, 16, 16]
 }
 
 # Number of generated images per (checkpoint, sampler). For a meaningful FID
 # this should be large (e.g. 10000-50000); keep it small only for smoke tests.
+# Below MIN_IMAGES_FOR_FID only the PNGs are written and FID is skipped.
 N_IMAGES = 10000
+
+# FID needs more samples than Inception's 2048 feature dims, otherwise the
+# covariance is singular and clean-fid fails or returns a meaningless number.
+MIN_IMAGES_FOR_FID = 2048
 
 # Euler steps for the standard full-res sampler.
 N_STEPS = 16
 
 # Global seed for reproducibility.
 GLOBAL_SEED = 42
+
+# Classifier-free guidance scale.
+CFG_SCALE = 1.5
+
+# Subset of samplers to run (e.g. ["euler_fr"]).
+# Empty → run euler_fr plus every schedule in NOISE_FIELD_SCHEDULES.
+# A checkpoint entry's own `samplers` list takes precedence over this.
+SAMPLERS_FILTER = ["noise_field_000", "noise_field_001"]
 
 # clean-fid custom reference. clean-fid ships no ImageNet reference, so we
 # build one once (cached by clean-fid under this name) from real ImageNet-256
@@ -136,11 +150,18 @@ if os.environ.get("FID_CLUSTER") == "1":
             loss_type="baseline",
         ),
         dict(
-        name="loss_a_8k_ema",
-        dir="/content/drive/MyDrive/FiT/inference_weights/checkpoint-8000",
-        loss_type="A",
-        use_ema=True,
-    ),
+            name="loss_a_8k_ema",
+            dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_a/checkpoints/checkpoint-8000",
+            loss_type="A",
+            use_ema=True,
+        ),
+        # Loss C → noise-field schedules run through the learned upsampler.
+        dict(
+            name="loss_c_20k_ema",
+            dir="/visinf/projects_students/mb_mvigel/workdir/fitv2_xl_cluster_c/checkpoints/save-checkpoint-20000",
+            loss_type="C",
+            use_ema=True,
+        ),
     ]
 else:
     CHECKPOINTS = gi.CHECKPOINTS
@@ -403,9 +424,44 @@ def _gen_euler_fr(model, vae, y, H_fr, W_fr, dtype, seed) -> torch.Tensor:
     return _decode_to_uint8(vae, x1_sp)
 
 
-def _gen_noise_field(model, vae, y, grid_sizes, dtype, seed) -> torch.Tensor:
+def _gen_noise_field(model, vae, y, grid_sizes, dtype, seed,
+                     loss_type, H_fr, W_fr) -> torch.Tensor:
     bs = y.shape[0]
     y_null = torch.full_like(y, NUM_CLASSES)
+
+    if loss_type == "C":
+        # Learned-upsampler model (mirrors generate_images.py): the integration
+        # state stays full-res; the schedule size only sets the resolution of
+        # the low-res conditioning input, and the model always returns a
+        # full-res velocity.
+        y_full = torch.cat([y, y_null], 0)
+
+        def model_fn_up(x_lr_sp, x_fr_sp, t, k):
+            k_grid = k // PATCH_SIZE
+            x_lr2 = torch.cat([x_lr_sp, x_lr_sp], 0)
+            x_fr2 = torch.cat([x_fr_sp, x_fr_sp], 0)
+            kw = build_upsampler_inputs(
+                x_lr2, x_fr2, y_full, k_grid, H_fr, W_fr, DEVICE, dtype
+            )
+            n_pack = x_lr2.shape[0]
+            t_pack = t[:1].repeat(1, n_pack)
+            v = model(
+                kw['x'], t_pack, kw['y'], kw['grid'], kw['mask'],
+                kw['size'], doc_ids=kw['doc_ids'], block_mask=kw['block_mask'],
+                x_fullres=kw['x_fullres'], grid_fullres=kw['grid_fullres'],
+                mask_fullres=kw['mask_fullres'], size_fullres=kw['size_fullres'],
+            )
+            v_cond, v_uncond = v.chunk(2, dim=0)
+            v_pred = v_uncond + CFG_SCALE * (v_cond - v_uncond)
+            return unpatchify(v_pred, (H_fr * PATCH_SIZE, W_fr * PATCH_SIZE), PATCH_SIZE)
+
+        torch.manual_seed(seed)
+        x1_sp = noise_field_sample_upsampler(
+            model_fn_up,
+            scale_schedule=[g * PATCH_SIZE for g in grid_sizes],
+            b=bs, d=C_IN, device=DEVICE, dtype=dtype,
+        )
+        return _decode_to_uint8(vae, x1_sp)
 
     def model_fn(x_sp: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         H_g = x_sp.shape[-2] // PATCH_SIZE
@@ -562,9 +618,13 @@ def main():
                 # Seed keyed to the absolute (global) image index so every
                 # image's noise field is identical regardless of producing rank.
                 return _gen_noise_field(model, vae, y, _gs, dtype,
-                                        GLOBAL_SEED + generated)
+                                        GLOBAL_SEED + generated,
+                                        loss_type, H_fr, W_fr)
 
             samplers.append((name, nf_batch))
+        sampler_filter = ckpt_cfg.get("samplers", SAMPLERS_FILTER)
+        if sampler_filter:
+            samplers = [(n, fn) for n, fn in samplers if n in sampler_filter]
 
         # --- Phase 1: every rank generates its shard of PNGs for each sampler.
         sampler_dirs = {}
@@ -597,6 +657,10 @@ def main():
                         f"but found {n_png} in {out_dir}. A generation shard likely "
                         f"failed; refusing to compute FID on an incomplete set."
                     )
+                if N_IMAGES < MIN_IMAGES_FOR_FID:
+                    log(f"    [{name}] {N_IMAGES} PNGs in {out_dir} "
+                        f"(< {MIN_IMAGES_FOR_FID}, FID skipped)")
+                    continue
                 fid = _compute_fid_dir(out_dir, num_gen=N_IMAGES)
                 results[ckpt_name][name] = fid
                 log(f"    [{name}] FID = {fid:.4f}")
