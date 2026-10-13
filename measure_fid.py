@@ -53,7 +53,6 @@ from generate_images import (
     TARGET_LEN_PIX,
     VAE_SCALE,
     build_upsampler_inputs,
-    euler_sample_fr,
     load_model,
     make_grid_and_mask,
     model_cfg_for,
@@ -96,6 +95,11 @@ CFG_SCALE = 1.5
 # Empty → run euler_fr plus every schedule in NOISE_FIELD_SCHEDULES.
 # A checkpoint entry's own `samplers` list takes precedence over this.
 SAMPLERS_FILTER = ["noise_field_000", "noise_field_001"]
+
+# Skip generation and only score PNGs already in OUTPUT_DIR/<ckpt>/<sampler>/
+# from an earlier run (same OUTPUT_DIR, N_IMAGES, checkpoints and samplers).
+# Models are not loaded; each dir must still hold exactly N_IMAGES PNGs.
+SKIP_GENERATION = False
 
 # clean-fid custom reference. clean-fid ships no ImageNet reference, so we
 # build one once (cached by clean-fid under this name) from real ImageNet-256
@@ -404,6 +408,49 @@ def _decode_to_uint8(vae, x1_sp: torch.Tensor) -> torch.Tensor:
     return imgs.permute(0, 2, 3, 1).to(torch.uint8).cpu()
 
 
+@torch.no_grad()
+def euler_sample_fr(
+    model,
+    z: torch.Tensor,       # (B, N, C*p*p) full-res noise tokens
+    y: torch.Tensor,       # (B,) class labels
+    H_fr: int, W_fr: int,
+    n_steps: int,
+    cfg_scale: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Standard flow-matching Euler ODE at full resolution. x_t = (1-t)*z + t*x1.
+
+    Formerly generate_images.euler_sample_fr (removed there in 81c1a53).
+    """
+    p = PATCH_SIZE
+    B = y.shape[0]
+    y_null = torch.full_like(y, NUM_CLASSES)
+    grid, mask, size = make_grid_and_mask(H_fr, W_fr, B, device, dtype)
+
+    x = z
+    ts = torch.linspace(0.0, 1.0, n_steps + 1, device=device, dtype=dtype)
+
+    for i in range(n_steps):
+        t_cur = ts[i]
+        dt    = ts[i + 1] - t_cur
+        t_b   = t_cur.expand(B).to(dtype)
+
+        v = model(
+            torch.cat([x, x], 0),
+            torch.cat([t_b, t_b], 0),
+            torch.cat([y, y_null], 0),
+            torch.cat([grid, grid], 0),
+            torch.cat([mask, mask], 0),
+            torch.cat([size, size], 0),
+        )
+        v_cond, v_uncond = v.chunk(2, dim=0)
+        v_pred = v_uncond + cfg_scale * (v_cond - v_uncond)
+        x = x + dt * v_pred
+
+    return unpatchify(x, (H_fr * p, W_fr * p), p)
+
+
 def _gen_euler_fr(model, vae, y, H_fr, W_fr, dtype, seed) -> torch.Tensor:
     bs = y.shape[0]
     # Use the full-resolution noise field as the initial noise so euler_fr is
@@ -594,12 +641,15 @@ def main():
         log(f"\n{'='*60}")
         log(f"Checkpoint: {ckpt_name}  loss={loss_type}")
         log(f"  {ckpt_path}")
-        if not os.path.isfile(ckpt_path):
+        if SKIP_GENERATION:
+            model, dtype = None, None
+            log("  [generation skipped] scoring existing PNGs")
+        elif not os.path.isfile(ckpt_path):
             log("  [skip] file not found")
             continue
-
-        model = load_model(ckpt_path, model_cfg_for(loss_type), device)
-        dtype = next(model.parameters()).dtype
+        else:
+            model = load_model(ckpt_path, model_cfg_for(loss_type), device)
+            dtype = next(model.parameters()).dtype
         results[ckpt_name] = {}
 
         # Build the list of (sampler_name, per-batch generator) to run.
@@ -631,6 +681,8 @@ def main():
         for name, gen_batch in samplers:
             out_dir = os.path.join(OUTPUT_DIR, ckpt_name, name)
             sampler_dirs[name] = out_dir
+            if SKIP_GENERATION:
+                continue
             if is_main:
                 os.makedirs(out_dir, exist_ok=True)
             if _is_dist():

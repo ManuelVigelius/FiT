@@ -13,7 +13,10 @@ All configuration lives in the CONFIG block below — no CLI arguments needed.
 
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+# Default to GPU 3 when run standalone, but never override a mask set by the
+# caller: measure_fid.py imports this module under torchrun, and clobbering
+# CUDA_VISIBLE_DEVICES there breaks every rank's device index.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3")
 
 import json
 import math
@@ -282,7 +285,9 @@ def build_upsampler_inputs(x_lr_sp, x_fr_sp, y_full, k_grid, H_fr, W_fr, device,
 
     def doc_mask_mod(b, h, q_idx, kv_idx):
         return doc_ids[b, q_idx] == doc_ids[b, kv_idx]
-    block_mask = create_block_mask(doc_mask_mod, 1, None, N_total, N_total, device=device)
+    # _compile=True builds the mask block-wise instead of materializing N×N.
+    block_mask = create_block_mask(doc_mask_mod, 1, None, N_total, N_total,
+                                   device=device, _compile=True)
 
     # --- dense full-res inputs ---
     x_fr_tok = patchify(x_fr_sp, PATCH_SIZE)          # (n_pack, N_fr, p**2*C)

@@ -8,6 +8,32 @@ from fit.model.rope import rotate_half
 from fit.model.utils import modulate
 from fit.model.norms import create_norm
 
+
+_compiled_flex_attention = None
+
+# Smaller tiles than the default (128x64, multi-stage) so the kernel fits in the
+# lab GPUs' 99KB of shared memory; the default needed ~177KB with head_dim 72.
+# Both sizes divide the block mask's default BLOCK_SIZE of 128.
+_FLEX_KERNEL_OPTIONS = {"BLOCK_M": 64, "BLOCK_N": 32, "num_stages": 1, "num_warps": 4}
+
+
+def _inference_flex_attention(q, k, v, block_mask, scale):
+    """flex_attention via a compiled kernel, for use outside torch.compile.
+
+    Called eagerly, flex_attention falls back to an unfused implementation that
+    materializes the full (H, N, N) score matrix — quadratic in the packed
+    length, i.e. in the number of images per pack. The compiled kernel skips
+    masked blocks and keeps memory linear. Compiled lazily on first use.
+    """
+    global _compiled_flex_attention
+    if _compiled_flex_attention is None:
+        from torch.nn.attention.flex_attention import flex_attention
+        _compiled_flex_attention = torch.compile(flex_attention)
+    return _compiled_flex_attention(
+        q, k, v, block_mask=block_mask, scale=scale,
+        kernel_options=_FLEX_KERNEL_OPTIONS,
+    )
+
 #################################################################################
 #           Embedding Layers for Patches, Timesteps and Class Labels            #
 #################################################################################
@@ -212,8 +238,14 @@ class Attention(nn.Module):
             # Packed / document-masking path via FlexAttention.
             # block_mask is precomputed outside the compiled region to avoid
             # triggering Inductor recompilations on variable sequence lengths.
-            from torch.nn.attention.flex_attention import flex_attention
-            x = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
+            # Inference (no grad) uses the compiled kernel; training keeps the
+            # existing path (compiled with the whole model, or eager where
+            # backward kernels exceed shared memory — see cluster_train_quadtree.sh).
+            if not torch.is_grad_enabled() and not torch.compiler.is_compiling():
+                x = _inference_flex_attention(q, k, v, block_mask, self.scale)
+            else:
+                from torch.nn.attention.flex_attention import flex_attention
+                x = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
         else:
             # Original padding-mask path (used when doc_ids is not provided,
             # e.g. during inference with a single image).
